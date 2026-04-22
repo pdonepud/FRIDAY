@@ -1,9 +1,18 @@
 """
-FRIDAY Config
--------------
-Fill in your API keys and personal settings.
-Leave keys as empty strings for now if you don't have them yet —
-Phase 1 (greeting test) doesn't need any of them.
+config.example.py — Template for FRIDAY's configuration.
+
+HOW TO USE:
+    1. Copy this file to `config.py` (which is gitignored).
+         Windows PowerShell:  Copy-Item config.example.py config.py
+         Mac/Linux:           cp config.example.py config.py
+    2. Fill in your API keys in the new config.py.
+    3. Never commit config.py — it's in .gitignore for a reason.
+
+Get your free API keys:
+    Gemini:        https://aistudio.google.com
+    NewsAPI:       https://newsapi.org
+    Alpha Vantage: https://alphavantage.co
+    Porcupine:     https://console.picovoice.ai  (optional, for voice wake)
 """
 
 # ========== API KEYS ==========

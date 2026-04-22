@@ -96,10 +96,14 @@ venv\Scripts\activate
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Configure your keys
-# Open config.py and fill in your API keys and personal info
+# 4. Set up your config file
+# Windows:
+Copy-Item config.example.py config.py
+# Mac/Linux:
+# cp config.example.py config.py
+# 5. Open config.py and fill in your API keys
 
-# 5. Launch
+# 6. Launch
 python friday.py
 ```
 

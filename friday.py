@@ -2,22 +2,27 @@
 FRIDAY — Personal AI Assistant
 Entry point.
 
-Phase 1: just greets you out loud on launch.
-Later phases will add scheduling, dashboard, hotkeys, etc.
-
 Usage:
-    python friday.py          # Normal launch
-    python friday.py --now    # (Future) force-run daily briefing
+    python friday.py                          # Normal launch with greeting
+    python friday.py --ask "your question"    # Quick Q&A mode
+    python friday.py --now                    # Force-run daily briefing (Phase 5)
 """
 
 import argparse
 import sys
 
 from modules.greeting import greet
+from modules.qa import answer
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="FRIDAY — Personal AI Assistant")
+    parser.add_argument(
+        "--ask",
+        type=str,
+        default=None,
+        help="Quick Q&A mode: ask FRIDAY a question and exit.",
+    )
     parser.add_argument(
         "--now",
         action="store_true",
@@ -28,6 +33,14 @@ def main() -> int:
     print("=" * 50)
     print("  FRIDAY  —  booting up")
     print("=" * 50)
+
+    if sys.platform == "win32":
+        sys.stdout.reconfigure(encoding="utf-8")
+
+    # Quick Q&A mode — skip the greeting and answer immediately.
+    if args.ask:
+        answer(args.ask)
+        return 0
 
     # Launch greeting
     greet()
