@@ -1,0 +1,12 @@
+requests
+edge-tts
+pygame
+plyer
+keyboard
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+
+# Optional — uncomment if you want voice wake word:
+# pvporcupine
+# pyaudio
