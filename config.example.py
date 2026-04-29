@@ -34,7 +34,11 @@ LONGITUDE = -121.6555
 
 # ========== WATCHLIST ==========
 STOCK_TICKERS = ["AAPL", "TSLA", "NVDA", "MSFT"]
-NEWS_TOPICS   = ["technology", "AI", "markets"]
+NEWS_TOPICS   = [
+    "technology",
+    '"artificial intelligence"',  # quoted to force exact phrase, drops PyPI/crypto noise
+    "stock market",
+]
 
 # ========== VOICE ==========
 # edge-tts voice. Full list: `edge-tts --list-voices`
