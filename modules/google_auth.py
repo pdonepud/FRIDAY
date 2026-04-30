@@ -24,10 +24,11 @@ Test directly:
     python modules/google_auth.py
 """
 
+import logging
 import os
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -36,6 +37,9 @@ from googleapiclient.discovery import build
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Silences "file_cache is unavailable when using oauth2client >= 4.0.0".
+logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
+
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CREDENTIALS_FILE = _PROJECT_ROOT / "credentials.json"
@@ -43,6 +47,10 @@ _TOKEN_FILE = _PROJECT_ROOT / "token.json"
 
 # Read-only is the safe minimum — FRIDAY should never mutate the calendar.
 _SCOPES: List[str] = ["https://www.googleapis.com/auth/calendar.readonly"]
+
+# Per-process service cache. Keeps the [auth] log lines down to one per run
+# even when many callers (today, next event, week, briefing) ask for it.
+_service_cache: Optional[object] = None
 
 
 def _load_cached_credentials() -> Credentials:
@@ -78,13 +86,19 @@ def get_calendar_service():
     """
     Return an authorized Google Calendar v3 service object.
 
-    Handles all three credential states (cached / refreshable / fresh-flow)
-    and caches the resulting token to disk so subsequent calls are silent.
+    Handles all three credential states (cached / refreshable / fresh-flow),
+    caches the resulting token to disk so subsequent runs are silent, and
+    caches the built service in-memory so subsequent calls in the same
+    process don't repeat the auth log lines or rebuild the client.
 
     Raises:
         FileNotFoundError: if a fresh OAuth flow is needed but credentials.json
             is missing from the project root.
     """
+    global _service_cache
+    if _service_cache is not None:
+        return _service_cache
+
     creds: Credentials = None  # type: ignore[assignment]
 
     if _TOKEN_FILE.exists():
@@ -100,7 +114,8 @@ def get_calendar_service():
         creds = _run_oauth_flow()
         _save_credentials(creds)
 
-    return build("calendar", "v3", credentials=creds)
+    _service_cache = build("calendar", "v3", credentials=creds)
+    return _service_cache
 
 
 if __name__ == "__main__":
