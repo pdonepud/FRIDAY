@@ -12,9 +12,12 @@ Test directly:
     python modules/briefing.py
 """
 
+import json
 import os
 import sys
+import time
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Optional
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -46,6 +49,59 @@ HARD RULES:
 """
 
 _FALLBACK = "Sorry {user_name}, I couldn't pull your briefing together this morning."
+
+
+def _load_cache() -> Optional[Dict]:
+    """
+    Load cached briefing data if it exists.
+
+    Returns:
+        Dict with 'generated_at', 'text', 'word_count' keys, or None if cache
+        doesn't exist or is corrupted.
+    """
+    try:
+        cache_file = Path(__file__).resolve().parent.parent / "data" / "briefing_cache.json"
+        if not cache_file.exists():
+            return None
+
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Validate required keys
+        if not all(key in data for key in ["generated_at", "text", "word_count"]):
+            return None
+
+        return data
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return None
+
+
+def _save_cache(text: str, word_count: int) -> None:
+    """
+    Save briefing text to cache with current timestamp.
+
+    Args:
+        text: The briefing text to cache
+        word_count: Number of words in the briefing
+    """
+    try:
+        cache_file = Path(__file__).resolve().parent.parent / "data" / "briefing_cache.json"
+
+        # Ensure data/ directory exists
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+
+        cache_data = {
+            "generated_at": time.time(),
+            "text": text,
+            "word_count": word_count
+        }
+
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, indent=2)
+
+    except Exception:
+        # Silently skip cache write failures
+        pass
 
 
 def _gather_context() -> Dict:
@@ -196,17 +252,33 @@ def _format_context_for_gemini(ctx: Dict) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def generate_briefing(speak_aloud: bool = False) -> str:
+def generate_briefing(speak_aloud: bool = False, force: bool = False) -> str:
     """
     Build the day's briefing and return it as spoken-ready prose.
 
     Args:
         speak_aloud: if True, pipes the result through TTS via modules.voice.
+        force: if True, bypass cache and force fresh generation.
 
     Returns:
         The briefing text. On any uncaught failure, returns a polite fallback —
         this function never raises.
     """
+    # Check cache first (unless force=True)
+    if not force:
+        cache = _load_cache()
+        if cache:
+            age_seconds = time.time() - cache["generated_at"]
+            if age_seconds < 900:  # 15 minutes TTL
+                age_minutes = int(age_seconds // 60)
+                print(f"[briefing] Cache hit ({age_minutes}m old) — skipping Gemini")
+
+                if speak_aloud:
+                    from modules.voice import speak
+                    speak(cache["text"])
+
+                return cache["text"]
+
     try:
         ctx = _gather_context()
         formatted = _format_context_for_gemini(ctx)
@@ -216,6 +288,9 @@ def generate_briefing(speak_aloud: bool = False) -> str:
         word_count = len(text.split())
         print(f"[briefing] Generated {word_count} words.")
 
+        # Save to cache
+        _save_cache(text, word_count)
+
         if speak_aloud:
             from modules.voice import speak
             speak(text)
@@ -223,6 +298,21 @@ def generate_briefing(speak_aloud: bool = False) -> str:
         return text
     except Exception as e:
         print(f"[briefing] Failure: {type(e).__name__}: {e}")
+
+        # Fall back to stale cache if available
+        cache = _load_cache()
+        if cache:
+            age_seconds = time.time() - cache["generated_at"]
+            age_minutes = int(age_seconds // 60)
+            print(f"[briefing] Gemini failed, using stale cache ({age_minutes}m old)")
+
+            if speak_aloud:
+                from modules.voice import speak
+                speak(cache["text"])
+
+            return cache["text"]
+
+        # No cache available, return fallback
         return _FALLBACK.format(user_name=USER_NAME)
 
 
@@ -236,3 +326,10 @@ if __name__ == "__main__":
     print(text)
     print()
     print(f"[words: {len(text.split())}]")
+
+    print()
+    print("=== Run 2 (should be cached) ===")
+    text2 = generate_briefing(speak_aloud=False)
+    print(text2[:80] + "...")
+    print(f"[words: {len(text2.split())}]")
+    print(f"Same text? {text == text2}")
