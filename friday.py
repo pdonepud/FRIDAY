@@ -7,13 +7,14 @@ Usage:
     python friday.py --ask "your question"    # Quick Q&A mode
     python friday.py --calendar               # Speak today's schedule
     python friday.py --next                   # Speak the next upcoming event
-    python friday.py --now                    # Force-run daily briefing (Phase 5)
+    python friday.py --now                    # Run the daily briefing
 """
 
 import argparse
 import sys
 from datetime import datetime
 
+from modules.briefing import generate_briefing
 from modules.calendar_api import describe_today, get_next_event
 from modules.greeting import greet
 from modules.qa import answer
@@ -59,7 +60,7 @@ def main() -> int:
     parser.add_argument(
         "--now",
         action="store_true",
-        help="Force-run the daily briefing immediately (not wired up yet).",
+        help="Run the daily briefing immediately and speak it.",
     )
     if sys.platform == "win32":
         sys.stdout.reconfigure(encoding="utf-8")
@@ -91,11 +92,17 @@ def main() -> int:
         speak(line)
         return 0
 
+    if args.now:
+        print("[FRIDAY] Pulling your briefing together...")
+        text = generate_briefing(speak_aloud=False)
+        print()
+        print(text)
+        print()
+        speak(text)
+        return 0
+
     # Launch greeting
     greet()
-
-    if args.now:
-        print("[friday] --now flag detected. Daily briefing not wired up yet (Phase 5).")
 
     print("[friday] Phase 1 complete. Greeting delivered.")
     print("[friday] (Later phases will keep the app running — for now it exits.)")
