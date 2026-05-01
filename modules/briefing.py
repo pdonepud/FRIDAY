@@ -25,7 +25,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import USER_NAME
 from modules.calendar_api import get_next_event, get_today
 from modules.gemini import ask
-from modules.news import get_all_headlines
+from modules.news import get_balanced_headlines
 from modules.stocks import get_watchlist
 from modules.weather import get_weather
 
@@ -35,11 +35,16 @@ _BRIEFING_SYSTEM = """You are FRIDAY, {user_name}'s personal AI assistant in the
 You are about to deliver {user_name}'s morning briefing. They will hear this spoken aloud, not read it.
 
 HARD RULES:
-- Word count must land between 110 and 150. Under 110 is too short — that's not a 60-second briefing. Over 150 is bloat. Aim for 130.
+- Be thorough, not brief. Aim for 250–350 words. The user can interrupt with Escape when they've heard enough — your job is to give a complete picture, not race to the end.
+- Politics gets 3–4 sentences with context: what happened, why it matters, who's affected. Don't just headline-drop.
+- World news gets 3–4 sentences with context. Same rule — explain the stakes.
+- Markets: each watchlist mover gets a "why" if you can infer one from the news, not just a percentage. "AMD up six percent on Aramco infrastructure deal" beats "AMD up six percent." If you cannot infer the why from the data, just give the move.
+- Tech and weather and calendar each get one to two sentences. They're scaffolding, not the main event.
 - Every sentence carries new information. No restating, no warming up, no "as I mentioned." If a sentence doesn't add a fact or a take, cut it.
+- Cover at least one political story and one world-news story. These are non-negotiable — {user_name} explicitly wants country and global news in the briefing.
 - Pure spoken English. NO bullets, NO headers, NO markdown, NO formatting symbols.
 - Open with a one-sentence greeting that mentions the time of day naturally (morning/afternoon/evening based on the time given).
-- Then weave the data into a flowing monologue: weather → calendar → markets → news. Don't list — connect. Use phrases like "On the markets..." or "Headline-wise..." to transition.
+- Then weave the data into a flowing monologue: weather → calendar → markets → politics → world → tech. Don't list — connect with phrases like "On the Hill..." for politics, "Overseas..." for world news, "On the markets..." for stocks, "In tech..." for tech. Each transition feels natural, not segmented.
 - Be witty and confident. Dry humor lands. Avoid hype words ("exciting!", "amazing!", "fantastic!").
 - End with ONE short forward-looking line. It should feel like a friend, not a productivity coach. Avoid corporate filler like "Let's make it a productive one" or "Have a great day." Examples that work: "Let's get after it." / "Solid lineup, {user_name}." / "Worth showing up for." / "Coffee first." / "On you, {user_name}." Vary it across briefings.
 - Round all numbers. "Sixty-eight degrees" not "sixty-seven point five". "Up two percent" not "+2.32%".
@@ -49,6 +54,13 @@ HARD RULES:
 """
 
 _FALLBACK = "Sorry {user_name}, I couldn't pull your briefing together this morning."
+
+BRIEFING_QUOTAS = {
+    "politics": 2,
+    "world": 1,
+    "markets": 1,
+    "tech": 1,
+}
 
 
 def _load_cache() -> Optional[Dict]:
@@ -145,7 +157,7 @@ def _gather_context() -> Dict:
         statuses.append("stocks=skipped")
 
     try:
-        ctx["headlines"] = get_all_headlines(max_total=5)
+        ctx["headlines"] = get_balanced_headlines(BRIEFING_QUOTAS)
         statuses.append("news=ok")
     except Exception as e:
         print(f"[briefing] News failed: {e}")
@@ -245,9 +257,9 @@ def _format_context_for_gemini(ctx: Dict) -> str:
     if headlines:
         lines.append("Top news:")
         for h in headlines:
-            topic = (h.get("topic") or "").strip('"')
-            topic_suffix = f" ({topic})" if topic else ""
-            lines.append(f"- {h['title']}{topic_suffix}")
+            category = h.get("category", "unknown")
+            source = f" ({h['source']})" if h.get("source") else ""
+            lines.append(f"- [{category}] {h['title']}{source}")
 
     return "\n".join(lines).rstrip() + "\n"
 

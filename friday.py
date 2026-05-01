@@ -18,7 +18,7 @@ from modules.briefing import generate_briefing
 from modules.calendar_api import describe_today, get_next_event
 from modules.greeting import greet
 from modules.qa import answer
-from modules.voice import speak
+from modules.voice import speak, speak_interruptible
 
 
 def _format_when(start: datetime) -> str:
@@ -98,7 +98,9 @@ def main() -> int:
         print()
         print(text)
         print()
-        speak(text)
+        completed = speak_interruptible(text)
+        if not completed:
+            print("[FRIDAY] Briefing stopped — got it.")
         return 0
 
     # Launch greeting
