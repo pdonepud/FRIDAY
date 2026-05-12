@@ -34,10 +34,57 @@ LONGITUDE = -121.6555
 
 # ========== WATCHLIST ==========
 STOCK_TICKERS = ["AAPL", "TSLA", "NVDA", "MSFT"]
-NEWS_TOPICS   = [
-    "technology",
-    '"artificial intelligence"',  # quoted to force exact phrase, drops PyPI/crypto noise
-    "stock market",
+
+# ========== NEWS TOPICS ==========
+# Each entry: a labeled news topic with optional source whitelisting.
+#   - "label":     short name for logging/cache key/debugging
+#   - "category":  used by the briefing to balance coverage. Options:
+#                  "tech", "markets", "politics", "world"
+#   - "q":         NewsAPI query string. Quote phrases for exact match.
+#                  Use AND/OR for boolean logic.
+#   - "domains":   comma-separated NewsAPI domains to restrict sources.
+#                  Empty string = no restriction. Common mainstream domains:
+#                  reuters.com, apnews.com, washingtonpost.com,
+#                  bbc.com, bloomberg.com, cnbc.com, axios.com,
+#                  theverge.com, techcrunch.com, arstechnica.com,
+#                  nytimes.com
+NEWS_TOPICS = [
+    {
+        "label": "tech",
+        "category": "tech",
+        "q": "technology",
+        "domains": "techcrunch.com,arstechnica.com,theverge.com,reuters.com",
+    },
+    {
+        "label": "ai",
+        "category": "tech",
+        "q": '"artificial intelligence"',
+        "domains": "",  # broader sourcing — AI coverage varies a lot
+    },
+    {
+        "label": "markets",
+        "category": "markets",
+        "q": "stock market",
+        "domains": "bloomberg.com,reuters.com,cnbc.com",
+    },
+    {
+        "label": "us_politics",
+        "category": "politics",
+        "q": "Congress OR Senate OR \"White House\" OR \"Supreme Court\"",
+        "domains": "reuters.com,apnews.com,washingtonpost.com,axios.com",
+    },
+    {
+        "label": "trump",
+        "category": "politics",
+        "q": '"Trump" AND (executive OR administration OR signs OR announces OR order)',
+        "domains": "reuters.com,apnews.com,washingtonpost.com",
+    },
+    {
+        "label": "world",
+        "category": "world",
+        "q": '"foreign policy" OR Russia OR China OR Israel OR Ukraine',
+        "domains": "reuters.com,bbc.com,apnews.com",
+    },
 ]
 
 # ========== VOICE ==========

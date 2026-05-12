@@ -5,6 +5,9 @@ credentials.json
 *.env
 .env
 
+# === Internal Documentation ===
+CLAUDE.md
+
 # === Python ===
 __pycache__/
 *.py[cod]

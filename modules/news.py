@@ -41,7 +41,17 @@ def _load_cache() -> Dict[str, Dict]:
         return {}
     try:
         with _CACHE_FILE.open("r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+
+        # If the cache uses old query-string keys instead of labels, scrap it.
+        expected_labels = {t["label"] for t in NEWS_TOPICS}
+        cached_labels = set(data.keys())
+        # If no overlap, this is the old format — nuke and start fresh.
+        if cached_labels and not (cached_labels & expected_labels):
+            _CACHE_FILE.unlink()
+            return {}
+
+        return data
     except (OSError, json.JSONDecodeError):
         return {}
 
@@ -56,27 +66,35 @@ def _is_fresh(cached: Optional[Dict], now: float) -> bool:
     return bool(cached) and (now - cached.get("fetched_at", 0)) < _CACHE_TTL_SECONDS
 
 
-def _fetch_from_api(topic: str) -> Optional[List[Dict]]:
+def _fetch_from_api(topic: Dict) -> Optional[List[Dict]]:
     """
     Hit NewsAPI /v2/everything for one topic.
+
+    Args:
+        topic: Dict with "label", "q", "domains", "category" fields
 
     Returns a list of cleaned article dicts on success, None on API-level
     failure (status=error). Raises on network errors.
     """
     params = {
-        "q":        topic,
+        "q":        topic["q"],
         "language": "en",
         "sortBy":   "publishedAt",
         "searchIn": "title,description",
         "pageSize": _PAGE_SIZE,
         "apiKey":   NEWSAPI_KEY,
     }
+
+    # Add domains filter if specified
+    if topic["domains"]:
+        params["domains"] = topic["domains"]
+
     response = requests.get(_ENDPOINT, params=params, timeout=_TIMEOUT_SECONDS)
     response.raise_for_status()
     data = response.json()
 
     if data.get("status") == "error":
-        print(f"[news] NewsAPI error for {topic}: {data.get('message')}")
+        print(f"[news] NewsAPI error for {topic['label']}: {data.get('message')}")
         return None
 
     articles = data.get("articles", [])
@@ -87,35 +105,41 @@ def _fetch_from_api(topic: str) -> Optional[List[Dict]]:
             "source":      (a.get("source") or {}).get("name") or "",
             "url":         a.get("url") or "",
             "description": a.get("description") or "",
+            "category":    topic["category"],
+            "topic_label": topic["label"],
         })
     return cleaned
 
 
-def get_headlines(topic: str) -> List[Dict]:
+def get_headlines(topic: Dict) -> List[Dict]:
     """
     Return up to 5 headlines for one topic, cache-aware.
+
+    Args:
+        topic: Dict with "label", "q", "domains", "category" fields
 
     On cache hit (within TTL): returns cached articles with stale=False.
     On API success: refreshes cache, returns articles with stale=False.
     On API failure: falls back to stale cache (stale=True), or [] if no cache.
     """
     cache = _load_cache()
-    cached = cache.get(topic)
+    label = topic["label"]
+    cached = cache.get(label)
     now = time.time()
 
     if _is_fresh(cached, now):
-        print(f"[news] Cache hit: {topic}")
+        print(f"[news] Cache hit: {label}")
         return [{**a, "stale": False} for a in cached["articles"]]
 
-    print(f"[news] Fetching: {topic}")
+    print(f"[news] Fetching: {label}")
     try:
         fresh = _fetch_from_api(topic)
     except (requests.Timeout, requests.RequestException) as e:
-        print(f"[news] API error for {topic}: {e}")
+        print(f"[news] API error for {label}: {e}")
         fresh = None
 
     if fresh is not None:
-        cache[topic] = {"fetched_at": now, "articles": fresh}
+        cache[label] = {"fetched_at": now, "articles": fresh}
         _save_cache(cache)
         return [{**a, "stale": False} for a in fresh]
 
@@ -151,16 +175,17 @@ def get_all_headlines(max_total: int = 8) -> List[Dict]:
     for topic in NEWS_TOPICS:
         articles = get_headlines(topic)
         for a in articles:
-            a["topic"] = topic
-        by_topic[topic] = articles
+            a["topic"] = topic["label"]  # Use label instead of full topic dict
+        by_topic[topic["label"]] = articles
 
     # Round-robin: t1[0], t2[0], t3[0], t1[1], t2[1], ...
     interleaved: List[Dict] = []
     longest = max((len(v) for v in by_topic.values()), default=0)
     for i in range(longest):
         for topic in NEWS_TOPICS:
-            if i < len(by_topic[topic]):
-                interleaved.append(by_topic[topic][i])
+            label = topic["label"]
+            if i < len(by_topic[label]):
+                interleaved.append(by_topic[label][i])
 
     deduped: List[Dict] = []
     seen_tokens: List[set] = []
@@ -174,6 +199,36 @@ def get_all_headlines(max_total: int = 8) -> List[Dict]:
             break
 
     return deduped
+
+
+def get_balanced_headlines(quotas: Dict[str, int]) -> List[Dict]:
+    """
+    Return articles balanced by category according to quotas dict.
+    e.g. quotas={"politics": 2, "world": 1, "markets": 1, "tech": 1}
+
+    Pulls all topics (cache-aware), groups by category, takes the top-N
+    per category according to the quotas, dedupes across categories,
+    and returns a flat list. If a category has fewer articles than its
+    quota, just returns what it has — no error.
+    """
+    # Get the deduped pool of all articles
+    all_articles = get_all_headlines(max_total=999)
+
+    # Group by category
+    by_category: Dict[str, List[Dict]] = {}
+    for article in all_articles:
+        category = article.get("category", "unknown")
+        if category not in by_category:
+            by_category[category] = []
+        by_category[category].append(article)
+
+    # Take up to quota from each category
+    result: List[Dict] = []
+    for category, quota in quotas.items():
+        if category in by_category:
+            result.extend(by_category[category][:quota])
+
+    return result
 
 
 def _clean_for_speech(title: str) -> str:
@@ -208,7 +263,7 @@ if __name__ == "__main__":
     cache_at_start = _load_cache()
     start_time = time.time()
     fresh_count = sum(
-        1 for t in NEWS_TOPICS if _is_fresh(cache_at_start.get(t), start_time)
+        1 for t in NEWS_TOPICS if _is_fresh(cache_at_start.get(t["label"]), start_time)
     )
 
     print("=== Top Headlines ===")
@@ -218,7 +273,7 @@ if __name__ == "__main__":
     any_stale = False
     for topic in NEWS_TOPICS:
         articles = get_headlines(topic)
-        print(f"[{topic}]")
+        print(f"[{topic['label']}] (category: {topic['category']})")
         if not articles:
             print("  (no articles)")
         for i, a in enumerate(articles, 1):
