@@ -38,3 +38,8 @@ desktop.ini
 build/
 dist/
 *.egg-info/
+
+# === Tauri / Node build artifacts ===
+ui/node_modules/
+ui/src-tauri/target/
+ui/dist/
