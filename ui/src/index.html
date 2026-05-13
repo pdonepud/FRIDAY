@@ -6,10 +6,21 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <div id="boot">
-    <h1>F.R.I.D.A.Y</h1>
-    <p>System online.</p>
+  <!-- Boot sequence — visible on launch, fades out -->
+  <div id="boot" class="boot-active">
+    <h1 id="boot-title">
+      <span>F</span><span>.</span><span>R</span><span>.</span><span>I</span><span>.</span><span>D</span><span>.</span><span>A</span><span>.</span><span>Y</span>
+    </h1>
+    <p id="boot-status">INITIALIZING SYSTEMS</p>
   </div>
+
+  <!-- Main dashboard — hidden during boot, revealed after -->
+  <main id="app" class="app-hidden">
+    <div class="placeholder">
+      <p>Dashboard loading point — wired up in Phase 13.3.B</p>
+    </div>
+  </main>
+
   <script src="main.js"></script>
 </body>
 </html>

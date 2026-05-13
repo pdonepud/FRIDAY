@@ -1,4 +1,5 @@
 * { margin: 0; padding: 0; box-sizing: border-box; }
+
 html, body {
   height: 100%;
   background: #050810;
@@ -6,21 +7,94 @@ html, body {
   font-family: 'Segoe UI', sans-serif;
   overflow: hidden;
 }
+
+/* ========== BOOT SEQUENCE ========== */
 #boot {
-  height: 100%;
+  position: fixed;
+  inset: 0;
   display: flex;
   flex-direction: column;
   justify-content: center;
   align-items: center;
-  gap: 1rem;
+  gap: 1.5rem;
+  z-index: 100;
+  transition: opacity 0.5s ease-out;
 }
-#boot h1 {
-  font-size: 4rem;
+
+#boot.boot-fading {
+  opacity: 0;
+}
+
+#boot.boot-hidden {
+  display: none;
+}
+
+#boot-title {
+  font-size: 5rem;
   letter-spacing: 0.5rem;
-  text-shadow: 0 0 20px #5cdfff;
+  font-weight: 300;
+  display: flex;
 }
-#boot p {
-  font-size: 1rem;
-  opacity: 0.7;
+
+#boot-title span {
+  opacity: 0;
+  text-shadow: 0 0 30px #5cdfff;
+  animation: letterReveal 0.4s ease-out forwards;
+}
+
+/* Stagger each letter with animation-delay */
+#boot-title span:nth-child(1)  { animation-delay: 0.0s; }
+#boot-title span:nth-child(2)  { animation-delay: 0.12s; }
+#boot-title span:nth-child(3)  { animation-delay: 0.24s; }
+#boot-title span:nth-child(4)  { animation-delay: 0.36s; }
+#boot-title span:nth-child(5)  { animation-delay: 0.48s; }
+#boot-title span:nth-child(6)  { animation-delay: 0.60s; }
+#boot-title span:nth-child(7)  { animation-delay: 0.72s; }
+#boot-title span:nth-child(8)  { animation-delay: 0.84s; }
+#boot-title span:nth-child(9)  { animation-delay: 0.96s; }
+#boot-title span:nth-child(10) { animation-delay: 1.08s; }
+#boot-title span:nth-child(11) { animation-delay: 1.20s; }
+
+@keyframes letterReveal {
+  0%   { opacity: 0; transform: translateY(-10px); text-shadow: 0 0 60px #5cdfff; }
+  60%  { opacity: 1; transform: translateY(0); text-shadow: 0 0 60px #5cdfff; }
+  100% { opacity: 1; transform: translateY(0); text-shadow: 0 0 30px #5cdfff; }
+}
+
+#boot-status {
+  font-size: 0.9rem;
+  letter-spacing: 0.3rem;
+  opacity: 0;
+  color: #5cdfff;
+  transition: opacity 0.3s ease-in-out;
+  font-weight: 300;
+}
+
+#boot-status.visible {
+  opacity: 0.8;
+}
+
+/* ========== MAIN APP ========== */
+#app {
+  position: fixed;
+  inset: 0;
+  opacity: 0;
+  transition: opacity 0.6s ease-in;
+  padding: 2rem;
+}
+
+#app.app-visible {
+  opacity: 1;
+}
+
+#app.app-hidden {
+  pointer-events: none;
+}
+
+.placeholder {
+  color: #7d8590;
+  text-align: center;
+  padding-top: 40vh;
+  font-size: 0.9rem;
   letter-spacing: 0.2rem;
 }
