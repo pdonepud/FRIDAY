@@ -4,8 +4,8 @@ dashboard.py — FRIDAY's tkinter dashboard.
 Dark-mode at-a-glance window: header (greeting / time / weather), today's
 events, watchlist, top headlines, and action buttons.
 
-Step 6.1: skeleton with hardcoded placeholder data. Real data wiring lands
-in step 6.2.
+Live-updating clock in the header ticks every second; the Refresh button
+re-fetches every data source and rebuilds the panels.
 
 Run standalone:
     python modules/dashboard.py
@@ -14,10 +14,17 @@ Run standalone:
 import os
 import sys
 import tkinter as tk
+from datetime import datetime
 from tkinter import ttk
 from typing import List, Dict
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import USER_NAME
+from modules.weather import get_weather
+from modules.calendar_api import get_today
+from modules.stocks import get_watchlist
+from modules.news import get_balanced_headlines
 
 
 # ========== COLOR PALETTE (GitHub dark) ==========
@@ -42,7 +49,9 @@ _CATEGORY_COLORS = {
 _FLAT_THRESHOLD_PCT = 0.2  # |change_pct| below this counts as flat
 
 
-# ========== PLACEHOLDER DATA (step 6.1) ==========
+# ========== PLACEHOLDER DATA ==========
+# NOTE: Placeholders retained for testing offline / when APIs are down.
+# The dashboard normally uses live data via _get_*_data() helpers.
 PLACEHOLDER_GREETING = "Good evening, Preetam"
 PLACEHOLDER_TIME = "7:42 PM"
 PLACEHOLDER_WEATHER = "58°F overcast"
@@ -64,6 +73,90 @@ PLACEHOLDER_HEADLINES = [
     {"category": "world",    "title": "Ukraine ventilator scandal", "source": "BBC"},
     {"category": "tech",     "title": "Apple announces M5 chip", "source": "The Verge"},
 ]
+
+
+# ========== DATA GATHERING ==========
+# Each helper wraps a data source in try/except so one outage can't take
+# down the whole window. Returns the shape the matching _build_*_panel
+# expects, or a safe empty fallback.
+
+def _fmt_clock(dt: datetime) -> str:
+    """12-hour clock with no leading zero, e.g. '7:42 PM' (cross-platform)."""
+    if sys.platform == "win32":
+        return dt.strftime("%#I:%M %p")
+    return dt.strftime("%-I:%M %p")
+
+
+def _get_header_data() -> Dict:
+    """Returns {greeting, time_str, weather}. Falls back to safe defaults on failure."""
+    now = datetime.now()
+    hour = now.hour
+    if hour < 12:
+        greeting = f"Good morning, {USER_NAME}"
+    elif hour < 17:
+        greeting = f"Good afternoon, {USER_NAME}"
+    elif hour < 22:
+        greeting = f"Good evening, {USER_NAME}"
+    else:
+        greeting = f"It's late, {USER_NAME}"
+
+    time_str = _fmt_clock(now)
+
+    try:
+        w = get_weather()
+        weather = f"{round(w['temp_f'])}°F {w['conditions']}"
+    except Exception as e:
+        print(f"[dashboard] Weather failed: {e}")
+        weather = "weather unavailable"
+
+    return {"greeting": greeting, "time_str": time_str, "weather": weather}
+
+
+def _get_events_data() -> List[Dict]:
+    """Returns list of {time, title, all_day} dicts for today."""
+    try:
+        events = get_today()
+    except Exception as e:
+        print(f"[dashboard] Events failed: {e}")
+        return []
+
+    result: List[Dict] = []
+    for e in events:
+        if e["all_day"]:
+            result.append({"time": "", "title": e["title"], "all_day": True})
+        else:
+            result.append({
+                "time": _fmt_clock(e["start"]),
+                "title": e["title"],
+                "all_day": False,
+            })
+    return result
+
+
+def _get_stocks_data() -> List[Dict]:
+    """Returns list of {ticker, price, change_pct} dicts."""
+    try:
+        watchlist = get_watchlist()
+        return [
+            {"ticker": s["ticker"], "price": s["price"], "change_pct": s["change_pct"]}
+            for s in watchlist
+        ]
+    except Exception as e:
+        print(f"[dashboard] Stocks failed: {e}")
+        return []
+
+
+def _get_headlines_data() -> List[Dict]:
+    """Returns list of {category, title, source} dicts. Top 5 from balanced selection."""
+    try:
+        articles = get_balanced_headlines({"politics": 2, "world": 1, "markets": 1, "tech": 1})
+        return [
+            {"category": a["category"], "title": a["title"], "source": a["source"]}
+            for a in articles[:5]
+        ]
+    except Exception as e:
+        print(f"[dashboard] News failed: {e}")
+        return []
 
 
 # ========== HELPERS ==========
@@ -99,7 +192,9 @@ def _arrow_and_color(change_pct: float):
 
 
 # ========== PANEL BUILDERS ==========
-def _build_header(parent: tk.Misc, greeting: str, time_str: str, weather: str) -> tk.Frame:
+def _build_header(parent: tk.Misc, greeting: str, time_str: str, weather: str):
+    """Build the header frame. Returns (frame, clock_label) so the live-clock
+    updater can target the time label directly."""
     frame = _panel(parent)
 
     inner = tk.Frame(frame, bg=PANEL)
@@ -115,10 +210,13 @@ def _build_header(parent: tk.Misc, greeting: str, time_str: str, weather: str) -
         font=("Segoe UI", 14),
     ).pack(side=tk.LEFT)
 
-    tk.Label(
+    # Fixed width keeps the layout stable when minute/hour digits change
+    # (e.g. "9:59 AM" → "10:00 AM" should not jiggle the weather text).
+    clock_label = tk.Label(
         inner, text=time_str, bg=PANEL, fg=TEXT,
-        font=("Segoe UI", 14),
-    ).pack(side=tk.LEFT)
+        font=("Segoe UI", 14), width=8, anchor="w",
+    )
+    clock_label.pack(side=tk.LEFT)
 
     tk.Label(
         inner, text="  ·  ", bg=PANEL, fg=TEXT_DIM,
@@ -130,7 +228,7 @@ def _build_header(parent: tk.Misc, greeting: str, time_str: str, weather: str) -
         font=("Segoe UI", 14),
     ).pack(side=tk.LEFT)
 
-    return frame
+    return frame, clock_label
 
 
 def _build_today_panel(parent: tk.Misc, events: List[Dict]) -> tk.Frame:
@@ -140,7 +238,7 @@ def _build_today_panel(parent: tk.Misc, events: List[Dict]) -> tk.Frame:
 
     if not events:
         tk.Label(
-            frame, text="No events today.", bg=PANEL, fg=TEXT_DIM,
+            frame, text="Nothing scheduled today.", bg=PANEL, fg=TEXT_DIM,
             font=("Segoe UI", 11), anchor="w",
         ).pack(fill="x", padx=16, pady=(0, 12))
         return frame
@@ -179,7 +277,7 @@ def _build_watchlist_panel(parent: tk.Misc, stocks: List[Dict]) -> tk.Frame:
 
     if not stocks:
         tk.Label(
-            frame, text="No tickers configured.", bg=PANEL, fg=TEXT_DIM,
+            frame, text="Watchlist unavailable.", bg=PANEL, fg=TEXT_DIM,
             font=("Segoe UI", 11), anchor="w",
         ).pack(fill="x", padx=16, pady=(0, 12))
         return frame
@@ -222,7 +320,7 @@ def _build_news_panel(parent: tk.Misc, headlines: List[Dict]) -> tk.Frame:
 
     if not headlines:
         tk.Label(
-            frame, text="No headlines available.", bg=PANEL, fg=TEXT_DIM,
+            frame, text="No headlines.", bg=PANEL, fg=TEXT_DIM,
             font=("Segoe UI", 11), anchor="w",
         ).pack(fill="x", padx=16, pady=(0, 12))
         return frame
@@ -285,6 +383,65 @@ def _build_button_bar(parent: tk.Misc, on_refresh, on_briefing) -> tk.Frame:
     return frame
 
 
+# ========== LIVE UPDATES ==========
+def _tick_clock(state: Dict):
+    """Update the clock label every second."""
+    if state.get("clock_label") is not None:
+        try:
+            state["clock_label"].config(text=_fmt_clock(datetime.now()))
+        except tk.TclError:
+            # Widget was destroyed (window closing) — stop scheduling.
+            return
+    state["root"].after(1000, lambda: _tick_clock(state))
+
+
+def _refresh_dashboard(state: Dict):
+    """Re-fetch every source and rebuild the data panels (and the header)."""
+    print("[dashboard] Refreshing...")
+
+    # Destroy the existing panels before rebuilding.
+    for key in ("header", "today_panel", "watchlist_panel", "news_panel"):
+        widget = state.get(key)
+        if widget is not None:
+            widget.destroy()
+
+    # Re-fetch every source.
+    header_data = _get_header_data()
+    events_data = _get_events_data()
+    stocks_data = _get_stocks_data()
+    headlines_data = _get_headlines_data()
+
+    # Header: rebuild and slot above the middle row.
+    header, clock_label = _build_header(
+        state["root"],
+        header_data["greeting"],
+        header_data["time_str"],
+        header_data["weather"],
+    )
+    header.pack(fill="x", padx=16, pady=(16, 8), before=state["middle"])
+    state["header"] = header
+    state["clock_label"] = clock_label
+
+    # Middle row: today + watchlist live inside the existing `middle` frame.
+    today_panel = _build_today_panel(state["middle"], events_data)
+    today_panel.pack(side=tk.LEFT, fill="both", expand=True, padx=(0, 8))
+    state["today_panel"] = today_panel
+
+    watchlist_panel = _build_watchlist_panel(state["middle"], stocks_data)
+    watchlist_panel.pack(side=tk.LEFT, fill="both", expand=True, padx=(8, 0))
+    state["watchlist_panel"] = watchlist_panel
+
+    # News: full-width below middle, above the button bar.
+    news_panel = _build_news_panel(state["root"], headlines_data)
+    news_panel.pack(
+        fill="both", expand=True, padx=16, pady=8,
+        before=state["button_bar"],
+    )
+    state["news_panel"] = news_panel
+
+    print("[dashboard] Refresh complete.")
+
+
 # ========== ENTRY POINT ==========
 def launch_dashboard():
     root = tk.Tk()
@@ -300,27 +457,57 @@ def launch_dashboard():
     y = (root.winfo_screenheight() - h) // 2
     root.geometry(f"{w}x{h}+{x}+{y}")
 
-    header = _build_header(root, PLACEHOLDER_GREETING, PLACEHOLDER_TIME, PLACEHOLDER_WEATHER)
+    print("[dashboard] Loading data...")
+    header_data = _get_header_data()
+    events_data = _get_events_data()
+    stocks_data = _get_stocks_data()
+    headlines_data = _get_headlines_data()
+    print("[dashboard] Data loaded — launching window.")
+
+    state: Dict = {
+        "root": root,
+        "header": None,
+        "middle": None,
+        "today_panel": None,
+        "watchlist_panel": None,
+        "news_panel": None,
+        "button_bar": None,
+        "clock_label": None,
+    }
+
+    header, clock_label = _build_header(
+        root, header_data["greeting"], header_data["time_str"], header_data["weather"]
+    )
     header.pack(fill="x", padx=16, pady=(16, 8))
+    state["header"] = header
+    state["clock_label"] = clock_label
 
     middle = tk.Frame(root, bg=BG)
     middle.pack(fill="both", expand=False, padx=16, pady=8)
+    state["middle"] = middle
 
-    today_panel = _build_today_panel(middle, PLACEHOLDER_EVENTS)
+    today_panel = _build_today_panel(middle, events_data)
     today_panel.pack(side=tk.LEFT, fill="both", expand=True, padx=(0, 8))
+    state["today_panel"] = today_panel
 
-    watchlist_panel = _build_watchlist_panel(middle, PLACEHOLDER_STOCKS)
+    watchlist_panel = _build_watchlist_panel(middle, stocks_data)
     watchlist_panel.pack(side=tk.LEFT, fill="both", expand=True, padx=(8, 0))
+    state["watchlist_panel"] = watchlist_panel
 
-    news_panel = _build_news_panel(root, PLACEHOLDER_HEADLINES)
+    news_panel = _build_news_panel(root, headlines_data)
     news_panel.pack(fill="both", expand=True, padx=16, pady=8)
+    state["news_panel"] = news_panel
 
     button_bar = _build_button_bar(
         root,
-        on_refresh=lambda: print("[dashboard] Refresh clicked"),
+        on_refresh=lambda: _refresh_dashboard(state),
         on_briefing=lambda: print("[dashboard] Run Briefing clicked"),
     )
     button_bar.pack(fill="x", padx=16, pady=(8, 16))
+    state["button_bar"] = button_bar
+
+    # Kick off the live clock — it self-schedules every second.
+    _tick_clock(state)
 
     root.mainloop()
 
