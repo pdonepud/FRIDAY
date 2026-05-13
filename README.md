@@ -51,26 +51,27 @@ It's built for people who want a real productivity co-pilot — not a chatbot in
 
 ## Demo
 
-> *Demo GIF / screenshot coming once the dashboard ships in Phase 6.*
+> *Demo GIF / screenshot coming once the Tauri UI is wired to live data (Phase 13).*
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology |
-|------|------|
-| Language | Python 3.11+ |
-| AI / LLM | Google Gemini API |
-| Voice Synthesis | edge-tts (Microsoft Neural Voices) |
-| Audio Playback | pygame |
-| UI | tkinter |
-| Notifications | plyer |
-| Global Hotkeys | keyboard |
-| Wake Word *(optional)* | pvporcupine + pyaudio |
-| Calendar | Google Calendar API |
-| News | NewsAPI |
-| Stocks | Alpha Vantage |
-| Weather | Open-Meteo (no key required) |
+| Layer | Technology | Notes |
+|------|------|------|
+| Language | Python 3.11+ | |
+| AI / LLM | Google Gemini API | `gemini-2.5-flash-lite` via REST (no SDK) |
+| Voice Synthesis | edge-tts (Microsoft Neural Voices) | Free, no API key |
+| Audio Playback | pygame | |
+| HTTP API | FastAPI + uvicorn | Exposes the Python modules to the Tauri UI |
+| UI | Tauri + Vanilla JS/HTML/CSS | Native desktop shell with web frontend — enables animations and rich visuals tkinter can't do |
+| Notifications | plyer | |
+| Global Hotkeys | keyboard | |
+| Wake Word *(optional)* | pvporcupine + pyaudio | |
+| Calendar | Google Calendar API | Read-only OAuth scope |
+| News | NewsAPI | Free tier, source whitelisting via domains filter |
+| Stocks | yfinance (Yahoo Finance) | No API key required, no daily rate limit, real-time data during market hours |
+| Weather | Open-Meteo | No API key required |
 
 ---
 
@@ -119,7 +120,7 @@ All settings live in `config.py`:
 # API Keys
 GEMINI_API_KEY   = "your-gemini-key"
 NEWSAPI_KEY      = "your-newsapi-key"
-ALPHAVANTAGE_KEY = "your-av-key"
+# Stocks now use yfinance — no API key required (Phase 5.8)
 
 # Watchlist
 STOCK_TICKERS = ["AAPL", "TSLA", "NVDA", "MSFT"]
@@ -135,9 +136,10 @@ VOICE = "en-US-JennyNeural"
 |--------|-----|------|
 | Google Gemini | [aistudio.google.com](https://aistudio.google.com) | Free, no card required |
 | NewsAPI | [newsapi.org](https://newsapi.org) | Free tier |
-| Alpha Vantage | [alphavantage.co](https://alphavantage.co) | Free tier |
 | Google Calendar | [console.cloud.google.com](https://console.cloud.google.com) | Free (OAuth, not API key) |
 | Porcupine *(optional)* | [console.picovoice.ai](https://console.picovoice.ai) | Free, for voice wake word |
+
+> Stocks (yfinance) and Weather (Open-Meteo) require no API key.
 
 > Without Porcupine, FRIDAY uses `Ctrl+Alt+F` as the wake trigger instead of voice activation.
 
@@ -151,15 +153,15 @@ FRIDAY/
 ├── config.py                  # API keys & personal settings
 ├── requirements.txt
 │
-├── modules/
-│   ├── voice.py               # edge-tts wrapper
+├── modules/                   # Pure-Python backend, each module testable standalone
+│   ├── voice.py               # edge-tts wrapper (+ interruptible playback)
 │   ├── greeting.py            # Randomized startup lines
-│   ├── gemini.py              # Gemini API wrapper
-│   ├── calendar_api.py        # Google Calendar integration
-│   ├── news.py                # NewsAPI integration
-│   ├── stocks.py              # Alpha Vantage integration
+│   ├── gemini.py              # Gemini API wrapper (REST, no SDK)
+│   ├── calendar_api.py        # Google Calendar integration (read-only)
+│   ├── news.py                # NewsAPI integration with source whitelisting
+│   ├── stocks.py              # Watchlist quotes via yfinance
 │   ├── weather.py             # Open-Meteo integration
-│   ├── briefing.py            # Daily briefing orchestrator
+│   ├── briefing.py            # Daily briefing orchestrator (Gemini)
 │   ├── reminders.py           # Context-aware reminders
 │   ├── focus_mode.py          # Pomodoro + site blocker
 │   ├── clipboard_ai.py        # Clipboard AI handler
@@ -168,7 +170,15 @@ FRIDAY/
 │   ├── nudges.py              # Hydration/posture nudges
 │   ├── music.py               # Weather-reactive music
 │   ├── hotkeys.py             # Global hotkey handlers
-│   └── dashboard.py           # tkinter UI
+│   └── dashboard.py           # tkinter UI — deprecated, replaced by Phase 13
+│                              #   (retained in git history at commit 690920c)
+│
+├── server/                    # FastAPI HTTP layer exposing modules to the Tauri UI
+│   └── api.py
+│
+├── ui/                        # Tauri shell + web frontend
+│   ├── src/                   # HTML/CSS/JS (the UI itself)
+│   └── src-tauri/             # Tauri/Rust shell (auto-generated)
 │
 ├── data/                      # JSON state (sleep, mood, history)
 ├── music/                     # Your .mp3 files
@@ -177,6 +187,14 @@ FRIDAY/
 │   └── sunny/
 └── assets/
 ```
+
+### Three-layer split
+
+FRIDAY is split into three layers, each independently runnable:
+
+1. **Backend modules (`modules/`)** — pure Python: gemini, calendar, news, stocks, weather, briefing, voice. Each runs standalone with `python modules/<name>.py`.
+2. **HTTP API (`server/api.py`)** — FastAPI server exposing the modules as REST endpoints on `127.0.0.1:8765`.
+3. **Desktop UI (`ui/`)** — Tauri shell (Rust + WebView) rendering an HTML/CSS/JS frontend that fetches from the API. Replaces the deprecated tkinter dashboard.
 
 ### Design Principles
 
@@ -192,11 +210,20 @@ FRIDAY/
 ### Daily Commands
 
 ```bash
-# Normal launch — starts scheduler, greeting, dashboard
+# Normal launch — voice greeting
 python friday.py
 
-# Force-run daily briefing immediately (for testing)
+# Force-run daily briefing immediately (interruptible with ESC)
 python friday.py --now
+
+# Ask anything
+python friday.py --ask "What's the weather like?"
+
+# Today's calendar events
+python friday.py --calendar
+
+# Next upcoming event
+python friday.py --next
 
 # Log last night's sleep
 python modules/sleep_log.py log
@@ -219,17 +246,22 @@ python modules/sleep_log.py log
 Built in testable phases. Each phase runs on its own before the next is stacked.
 
 - [x] **Phase 1** — Project skeleton + config + voice greeting
-- [ ] **Phase 2** — Gemini wrapper + basic Q&A
-- [ ] **Phase 3** — Weather, stocks, and news modules
-- [ ] **Phase 4** — Google Calendar integration
-- [ ] **Phase 5** — Daily briefing (ties it all together)
-- [ ] **Phase 6** — tkinter dashboard UI
+- [x] **Phase 2** — Gemini wrapper + basic Q&A
+- [x] **Phase 3** — Weather, stocks, and news modules
+- [x] **Phase 4** — Google Calendar integration
+- [x] **Phase 5** — Daily briefing (ties it all together)
+- [x] **Phase 5.8** — Stocks moved to yfinance (no API key, no daily cap)
+- [x] **Phase 6** — tkinter dashboard UI *(deprecated — replaced by Phase 13)*
 - [ ] **Phase 7** — Global hotkeys + clipboard AI
 - [ ] **Phase 8** — Focus mode + Pomodoro
 - [ ] **Phase 9** — Sleep + mood tracker
 - [ ] **Phase 10** — Nudges + away mode + weather-reactive music
 - [ ] **Phase 11** — Meeting prep cards + end-of-day wrap
 - [ ] **Phase 12** — Polish + optional voice wake word
+- [ ] **Phase 13** — Tauri UI rewrite *(in progress)*
+  - [x] 13.1 — Scaffold Tauri project, JARVIS boot screen renders
+  - [ ] 13.2 — FastAPI server exposing backend modules
+  - [ ] 13.3–13.10 — Wire data panels, animations, JARVIS visuals
 
 ---
 

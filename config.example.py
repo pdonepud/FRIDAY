@@ -11,14 +11,15 @@ HOW TO USE:
 Get your free API keys:
     Gemini:        https://aistudio.google.com
     NewsAPI:       https://newsapi.org
-    Alpha Vantage: https://alphavantage.co
     Porcupine:     https://console.picovoice.ai  (optional, for voice wake)
+
+Stocks use yfinance (no API key required) as of Phase 5.8.
 """
 
 # ========== API KEYS ==========
 GEMINI_API_KEY   = ""   # aistudio.google.com
 NEWSAPI_KEY      = ""   # newsapi.org
-ALPHAVANTAGE_KEY = ""   # alphavantage.co
+# ALPHAVANTAGE_KEY removed in Phase 5.8 — switched to yfinance (no key required)
 PORCUPINE_KEY    = ""   # picovoice.ai (optional)
 
 # Google Calendar uses credentials.json (OAuth), not an API key.

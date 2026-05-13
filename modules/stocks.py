@@ -2,8 +2,11 @@
 stocks.py — FRIDAY's market sense.
 
 Pulls current price + daily change for every ticker in config.STOCK_TICKERS
-from Alpha Vantage. Aggressively caches to stay under the free tier's
-25-calls-per-day cap.
+via the yfinance library (Yahoo Finance). No API key required, no daily cap.
+
+Cache TTL is dynamic: 60 seconds during market hours so prices stay fresh
+on the trading floor, 15 minutes outside market hours (prices don't move
+when the market is closed).
 
 Test directly:
     python modules/stocks.py
@@ -13,19 +16,19 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import requests
+import yfinance as yf
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import ALPHAVANTAGE_KEY, STOCK_TICKERS
+from config import STOCK_TICKERS
 
 
-_ENDPOINT = "https://www.alphavantage.co/query"
 _TIMEOUT_SECONDS = 15
-_CACHE_TTL_SECONDS = 15 * 60  # 15 minutes per ticker
-_API_DELAY_SECONDS = 1.2  # Alpha Vantage free tier: max 1 request per second
+_CACHE_TTL_OPEN_SECONDS = 60       # 1 minute during market hours
+_CACHE_TTL_CLOSED_SECONDS = 15 * 60  # 15 minutes when closed
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CACHE_FILE = _PROJECT_ROOT / "data" / "stocks_cache.json"
@@ -52,6 +55,22 @@ _GRAY  = "\033[90m"
 _RESET = "\033[0m"
 
 
+def _is_market_hours() -> bool:
+    """True if NYSE is currently open (rough check — ignores holidays)."""
+    now_utc = datetime.now(timezone.utc)
+    eastern = now_utc - timedelta(hours=5)  # Roughly EST; ignores DST nuance for a "good enough" check
+    if eastern.weekday() >= 5:  # Sat/Sun
+        return False
+    hour, minute = eastern.hour, eastern.minute
+    in_session = (hour > 9 or (hour == 9 and minute >= 30)) and hour < 16
+    return in_session
+
+
+def _get_cache_ttl() -> int:
+    """Cache lives 60s during market hours, 15min outside."""
+    return _CACHE_TTL_OPEN_SECONDS if _is_market_hours() else _CACHE_TTL_CLOSED_SECONDS
+
+
 def _load_cache() -> Dict[str, Dict]:
     if not _CACHE_FILE.exists():
         return {}
@@ -68,33 +87,32 @@ def _save_cache(cache: Dict[str, Dict]) -> None:
         json.dump(cache, f, indent=2)
 
 
-def _fetch_from_api(ticker: str) -> Optional[Dict]:
+def _fetch_from_yfinance(ticker: str) -> Optional[Dict]:
     """
-    Hit Alpha Vantage. Return raw quote dict on success, None on rate-limit
-    or empty response. Raises on network errors.
+    Fetch current price + day change for one ticker via yfinance.
+
+    Uses `Ticker.fast_info` instead of `.info` — fast_info is the lightweight
+    path for price/last-close lookups; `.info` pulls a big metadata blob and
+    is much slower.
+
+    Returns dict on success, None on failure.
     """
-    params = {"function": "GLOBAL_QUOTE", "symbol": ticker, "apikey": ALPHAVANTAGE_KEY}
-    response = requests.get(_ENDPOINT, params=params, timeout=_TIMEOUT_SECONDS)
-    response.raise_for_status()
-    data = response.json()
-
-    if "Information" in data or "Note" in data:
-        msg = data.get("Information") or data.get("Note")
-        print(f"[stocks] Alpha Vantage rate limit / notice for {ticker}: {msg}")
+    try:
+        t = yf.Ticker(ticker)
+        info = t.fast_info
+        price = float(info.last_price)
+        prev_close = float(info.previous_close)
+        change = price - prev_close
+        change_pct = (change / prev_close * 100) if prev_close else 0.0
+        return {
+            "price":      round(price, 2),
+            "change":     round(change, 2),
+            "change_pct": round(change_pct, 2),
+            "fetched_at": time.time(),
+        }
+    except Exception as e:
+        print(f"[stocks] yfinance error for {ticker}: {e}")
         return None
-
-    quote = data.get("Global Quote")
-    if not quote or "05. price" not in quote:
-        print(f"[stocks] Empty quote for {ticker}: {data}")
-        return None
-
-    pct_str = quote.get("10. change percent", "0%").rstrip("%")
-    return {
-        "price":      float(quote["05. price"]),
-        "change":     float(quote["09. change"]),
-        "change_pct": float(pct_str),
-        "fetched_at": time.time(),
-    }
 
 
 def get_quote(ticker: str) -> Optional[Dict]:
@@ -109,8 +127,9 @@ def get_quote(ticker: str) -> Optional[Dict]:
     cache = _load_cache()
     cached = cache.get(ticker)
     now = time.time()
+    ttl = _get_cache_ttl()
 
-    if cached and (now - cached.get("fetched_at", 0)) < _CACHE_TTL_SECONDS:
+    if cached and (now - cached.get("fetched_at", 0)) < ttl:
         print(f"[stocks] Cache hit: {ticker}")
         return {
             "ticker":     ticker,
@@ -121,11 +140,7 @@ def get_quote(ticker: str) -> Optional[Dict]:
         }
 
     print(f"[stocks] Fetching: {ticker}")
-    try:
-        fresh = _fetch_from_api(ticker)
-    except (requests.Timeout, requests.RequestException) as e:
-        print(f"[stocks] API error for {ticker}: {e}")
-        fresh = None
+    fresh = _fetch_from_yfinance(ticker)
 
     if fresh:
         cache[ticker] = fresh
@@ -138,7 +153,7 @@ def get_quote(ticker: str) -> Optional[Dict]:
             "stale":      False,
         }
 
-    # API failed — fall back to cached value if we have one, marked stale.
+    # Fetch failed — fall back to cached value if we have one, marked stale.
     if cached:
         return {
             "ticker":     ticker,
@@ -148,32 +163,14 @@ def get_quote(ticker: str) -> Optional[Dict]:
             "stale":      True,
         }
 
-    print(f"[stocks] No data available for {ticker} (cache miss + API failure).")
+    print(f"[stocks] No data available for {ticker} (cache miss + fetch failure).")
     return None
 
 
 def get_watchlist() -> List[Dict]:
-    """
-    Return quotes for every ticker in STOCK_TICKERS, skipping failures.
-
-    Throttles between API calls (cache hits don't sleep) so the free tier's
-    1-request-per-second limit isn't tripped.
-    """
+    """Return quotes for every ticker in STOCK_TICKERS, skipping failures."""
     quotes: List[Dict] = []
-    last_api_call = 0.0
-    cache = _load_cache()
-    now = time.time()
-
     for ticker in STOCK_TICKERS:
-        cached = cache.get(ticker)
-        will_hit_api = not cached or (now - cached.get("fetched_at", 0)) >= _CACHE_TTL_SECONDS
-
-        if will_hit_api:
-            elapsed = time.time() - last_api_call
-            if last_api_call and elapsed < _API_DELAY_SECONDS:
-                time.sleep(_API_DELAY_SECONDS - elapsed)
-            last_api_call = time.time()
-
         q = get_quote(ticker)
         if q is not None:
             quotes.append(q)
@@ -270,4 +267,4 @@ if __name__ == "__main__":
 
     if any_stale:
         print()
-        print("* = cached value (API unavailable)")
+        print("* = cached value (fetch unavailable)")
