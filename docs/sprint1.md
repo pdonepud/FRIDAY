@@ -11,7 +11,7 @@
 
 ## Goal
 
-Stand up the FRIDAY project skeleton and prove the assistant can speak. This sprint focuses on the boring-but-critical foundation: repo hygiene, a two-file config pattern (`config.py` gitignored + `config.example.py` committed) so future contributors have a template but no secrets ever leak, and a working text-to-speech pipeline that greets the user out loud.
+Stand up the FRIDAY project skeleton and prove the assistant can speak. This sprint focuses on the boring-but-critical foundation: repo hygiene, a two-file config pattern (`config.py` gitignored + `config.example.py` committed) so future contributors have a template while the risk of accidentally committing secrets is reduced, and a working text-to-speech pipeline that greets the user out loud.
 
 The point of shipping voice first is that FRIDAY is a voice-first product — everything downstream (briefings, Q&A, ambient nudges) leans on this layer, so it needed to work end-to-end before adding intelligence on top.
 
@@ -43,7 +43,7 @@ The point of shipping voice first is that FRIDAY is a voice-first product — ev
 
 ### Setup & Config (3 pts)
 
-*Repo hygiene, dependency management, and the two-file config pattern that keeps secrets out of git.*
+*Repo hygiene, dependency management, and the two-file config pattern that reduces the risk of accidentally committing secrets. (Key-rotation procedure for a leaked credential is planned for Sprint 7's security notes; the dual-config pattern is risk-reduction, not a guarantee.)*
 
 | Task | Estimate |
 |------|----------|

@@ -21,7 +21,7 @@ FRIDAY runs on a monthly sprint cadence. Sprints 1–4 were documented retrospec
 
 ## Related Docs
 
-- [CASE_STUDY.md](../CASE_STUDY.md) — Portfolio narrative (currently private)
+- `CASE_STUDY.md` — Portfolio narrative (kept local until Sprint 7 polish; will be published then)
 - [README.md](../README.md) — Setup, tech stack, roadmap
 - `decisions/` — Architecture Decision Records (planned Sprint 7)
 - `sprint_reports/` — Burnup charts (planned Sprint 7)
