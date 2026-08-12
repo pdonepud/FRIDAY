@@ -16,9 +16,27 @@
 
   <!-- Main dashboard — hidden during boot, revealed after -->
   <main id="app" class="app-hidden">
-    <div class="placeholder">
-      <p>Dashboard loading point — wired up in Phase 13.3.B</p>
-    </div>
+    <!-- Calendar panel — left side -->
+    <section class="panel panel-calendar" id="panel-calendar">
+      <header class="panel-header">
+        <span class="panel-label">TODAY</span>
+        <span class="panel-status" id="calendar-status">·</span>
+      </header>
+      <div class="panel-body" id="calendar-body">
+        <div class="panel-loading">Connecting...</div>
+      </div>
+    </section>
+
+    <!-- Weather panel — top right -->
+    <section class="panel panel-weather" id="panel-weather">
+      <header class="panel-header">
+        <span class="panel-label">WEATHER</span>
+        <span class="panel-status" id="weather-status">·</span>
+      </header>
+      <div class="panel-body" id="weather-body">
+        <div class="panel-loading">Connecting...</div>
+      </div>
+    </section>
   </main>
 
   <script src="main.js"></script>

@@ -16,7 +16,7 @@
         "fullscreen": false,
         "center": true,
         "visible": true,
-        "alwaysOnTop": true
+        "alwaysOnTop": false
       }
     ],
     "security": {
