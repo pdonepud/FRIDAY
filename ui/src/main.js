@@ -42,10 +42,16 @@ function startBootSequence() {
 
 // ========== FETCH HELPERS ==========
 async function fetchJSON(path) {
+  // 30-second timeout — prevents dashboard from freezing on a hung server.
+  // Without this, auto-refresh (every 5 min) can pile up pending requests indefinitely.
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30_000);
+
   try {
     const r = await fetch(`${API_BASE}${path}`, {
       method: "GET",
       headers: { "Accept": "application/json" },
+      signal: controller.signal,
     });
     if (!r.ok) {
       console.error(`[FRIDAY UI] ${path} returned ${r.status}`);
@@ -53,8 +59,14 @@ async function fetchJSON(path) {
     }
     return await r.json();
   } catch (err) {
-    console.error(`[FRIDAY UI] ${path} failed:`, err);
+    if (err.name === "AbortError") {
+      console.error(`[FRIDAY UI] ${path} timed out after 30s`);
+    } else {
+      console.error(`[FRIDAY UI] ${path} failed:`, err);
+    }
     return null;
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
@@ -83,12 +95,14 @@ async function renderWeatherPanel() {
     return;
   }
 
+  const conditions = escapeHtml(data.conditions || "Unknown");
+
   body.innerHTML = `
     <div class="weather-current">
       <span class="weather-temp">${formatTemp(data.temp_f)}</span>
       <span class="weather-unit">°F</span>
     </div>
-    <div class="weather-conditions">${data.conditions}</div>
+    <div class="weather-conditions">${conditions}</div>
     <div class="weather-meta">
       <div class="weather-meta-row"><span>Feels like</span><span class="weather-meta-value">${formatTemp(data.feels_like_f)}°</span></div>
       <div class="weather-meta-row"><span>Today's high/low</span><span class="weather-meta-value">${formatTemp(data.today_high_f)}° / ${formatTemp(data.today_low_f)}°</span></div>
