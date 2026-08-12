@@ -85,11 +85,14 @@ This sprint has the highest polish density in the project. It's not just gluing 
 
 | Task | Estimate |
 |------|----------|
-| Serialize briefing (text + MP3 path + timestamp) to `data/briefing_cache.json` | 1 hr |
+| Serialize briefing (text + timestamp) to `data/briefing_cache.json` | 1 hr |
 | Stale-on-failure fallback: if generation fails, serve last-known briefing (`71f7c7e`) | 0.5 hr |
 | Wire `--now` flag in `friday.py` to call the cached path (`e7a29c8`) | 0.5 hr |
+| Cache-read validation: reject cached text if empty or word count falls outside 250–350 | 0.25 hr |
 
-**Total: ~2 hrs**
+**Total: ~2.25 hrs**
+
+**Cache design note:** Store the briefing *text* (not the MP3 path) in `briefing_cache.json`. TTS regenerates audio from the cached text on each playback — audio is disposable, text is durable. This avoids the "cached path points to a deleted MP3" bug that would otherwise fire whenever the temp-file cleanup in `voice.py` (see Sprint 1) runs between cache write and cache read.
 
 ### tkinter Dashboard (Deprecated) (2 pts)
 

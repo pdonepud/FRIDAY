@@ -61,13 +61,14 @@ Every module lands with a caching layer and a standalone `__main__` block so it 
 
 | Task | Estimate |
 |------|----------|
-| `modules/weather.py` — Open-Meteo (no API key needed), Santa Cruz coords hard-coded, per-request fetch | 1.5 hr |
+| `modules/weather.py` — fetch current + 2-day forecast from Open-Meteo (no API key) with a 15-minute cache TTL, Santa Cruz coords hard-coded | 1.5 hr |
+| Weather cache lookup logic: skip external call if cached value is <15 min old; fall back to stale cache on Open-Meteo failure | 0.5 hr |
 | `modules/stocks.py` — Alpha Vantage TIME_SERIES_INTRADAY, per-symbol cache, rate-limit-aware (`bdb032b`) | 2.5 hr |
 | Sign up NewsAPI key, add `NEWS_API_KEY` config | 0.5 hr |
 | `modules/news.py` — top-headlines endpoint, 30-min cache, title/description dedup (`5eee0b9`) | 2.5 hr |
 | Standalone test harness for each module (`if __name__ == "__main__"`) | 1 hr |
 
-**Total: ~8 hrs**
+**Total: ~8.5 hrs**
 
 ---
 

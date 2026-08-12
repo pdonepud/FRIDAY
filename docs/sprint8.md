@@ -66,6 +66,21 @@ These are the features that convert FRIDAY from "morning briefing tool" into "co
 
 **Total: ~4.5 hrs**
 
+### Focus Mode Safety (2 pts)
+
+*Crash-resilient site blocking — don't leave the system in a broken state.*
+
+| Task | Estimate |
+|------|----------|
+| Own a hosts-file backup at `data/hosts.backup` before any modification | 0.5 hr |
+| Idempotent block application (adding blocks is safe to re-run) | 0.5 hr |
+| Startup recovery: on FRIDAY launch, check for stale focus-mode blocks and restore | 0.5 hr |
+| Permission-failure path: gracefully explain if admin rights are missing | 0.5 hr |
+
+**Total: ~2 hrs**
+
+**Design note:** Hosts-file modification requires elevated permissions on both Windows and macOS. Focus mode should degrade gracefully if run without admin — a clear message rather than a silent failure. If FRIDAY is force-killed or the machine loses power mid-session, blocks would otherwise remain active system-wide; the startup-recovery check closes that loop.
+
 ---
 
 ## Initial Task Assignment
