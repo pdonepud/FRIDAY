@@ -50,10 +50,25 @@ The sprint closes with meeting prep cards and an end-of-day wrap — bookending 
 | Explicit opt-in for external transmission: separate config flag `ALLOW_WELLNESS_TO_LLM = False` (default off) | 0.5 hr |
 | Redaction: if wellness data IS sent to Gemini, aggregate/blur specifics (e.g., "poor sleep this week" not "slept 3.5 hours Monday") | 0.5 hr |
 | Deletion: `python friday.py --wipe-wellness` command that clears local data | 0.5 hr |
+| Restrictive OS permissions on `data/wellness.json` — set to 0600 (owner read/write only) on Unix; equivalent ACL on Windows | 0.5 hr |
+| Secure delete for `--wipe-wellness` — overwrite file with random bytes before unlinking, so recovery tools can't restore | 0.5 hr |
 
-**Total: ~2.5 hrs**
+**Total: ~3.5 hrs**
 
 **Design principle:** Wellness data is more sensitive than calendar or news data. Even for a solo project used by one person (the developer), the design shows awareness of privacy engineering. Recruiters reviewing FRIDAY's code will see explicit privacy controls — a strong signal.
+
+**Threat model:** wellness data is protected against the following:
+
+- **Other local user accounts** — restrictive file permissions prevent cross-account reads
+- **File recovery after deletion** — secure delete prevents undelete tools from recovering wiped data
+- **External transmission** — default-off flag, aggregated redaction if enabled
+
+Not protected against:
+
+- **Root/administrator access** — anyone with elevated privileges can read anything
+- **Physical device access** — full disk encryption is out of scope for FRIDAY
+
+This is a solo-user tool. The threat model assumes the machine's owner is the user; wellness data protection is about limiting exposure to bugs, other logged-in users, and forensic recovery after wipe.
 
 ### Sleep + Mood Tracker (4 pts)
 

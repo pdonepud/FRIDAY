@@ -72,14 +72,18 @@ These are the features that convert FRIDAY from "morning briefing tool" into "co
 
 | Task | Estimate |
 |------|----------|
-| Own a hosts-file backup at `data/hosts.backup` before any modification | 0.5 hr |
-| Idempotent block application (adding blocks is safe to re-run) | 0.5 hr |
-| Startup recovery: on FRIDAY launch, check for stale focus-mode blocks and restore | 0.5 hr |
-| Permission-failure path: gracefully explain if admin rights are missing | 0.5 hr |
+| Create `data/hosts.backup` ONLY if no valid owned backup already exists — never overwrite | 0.5 hr |
+| Owned-backup detection: prepend the backup file with a signature line `# friday-hosts-backup v1` so we can distinguish a real backup from a corrupted/modified one | 0.25 hr |
+| Idempotent block application (adding a block that's already present is a no-op) | 0.5 hr |
+| Startup recovery: on launch, if hosts file contains FRIDAY block markers, restore from backup; then delete the backup only after successful restore | 0.5 hr |
+| Permission-failure path: gracefully explain if admin rights are missing; do NOT modify anything if we can't write cleanly | 0.5 hr |
+| Manual override: `python friday.py --unblock-hosts` — restore even if no active focus session | 0.25 hr |
 
-**Total: ~2 hrs**
+**Total: ~2.5 hrs**
 
 **Design note:** Hosts-file modification requires elevated permissions on both Windows and macOS. Focus mode should degrade gracefully if run without admin — a clear message rather than a silent failure. If FRIDAY is force-killed or the machine loses power mid-session, blocks would otherwise remain active system-wide; the startup-recovery check closes that loop.
+
+**Backup lifecycle:** a valid backup is created only when needed and destroyed only after successful restore. This prevents the "poisoned backup" scenario where a crashed session leaves a hosts file containing FRIDAY blocks, and a subsequent focus session "backs up" that already-modified file — leading to restore returning the machine to a blocked state.
 
 ---
 

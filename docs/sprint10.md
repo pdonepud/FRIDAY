@@ -68,15 +68,24 @@ By the end of this sprint FRIDAY should be something someone else can install an
 
 ### Secrets Storage Design (DESIGN NOTE)
 
-For dev, `config.py` (gitignored) holds all API keys as plaintext Python constants. This is acceptable for local development on a single machine.
+For dev, `config.py` (gitignored) is used, but this is a risk-reduction pattern rather than a guarantee:
 
-For the packaged `.exe` distribution (this sprint), plaintext `config.py` is NOT acceptable — anyone with filesystem access can read the keys. The packaged app will use:
+- `.gitignore` blocks accidental `git add`, but a forced `git add -f` bypasses it
+- Cloud-sync tools (OneDrive, iCloud, Dropbox) can silently mirror `config.py` off the developer's machine
+- Backup tools may include the file
+
+These risks are accepted for solo development. Rotation procedure (if a key does leak): revoke the leaked key at the provider, generate a new one, update `config.py`, and grep git history for any accidental commits.
+
+For the packaged `.exe` distribution, `config.py` plaintext is NOT acceptable. The packaged app will use:
 
 - **Windows:** Windows Credential Manager via `keyring` library
 - **macOS:** macOS Keychain via `keyring` library
 - **First-run flow:** Prompt for keys interactively, store via keyring
 - **Rotation:** Documented procedure for updating a rotated key
 - **Cleanup:** Uninstaller removes keyring entries
+- **Backend verification:** on first run, verify `keyring.get_keyring()` returns a secure backend (Windows Credential Manager, macOS Keychain, or Linux Secret Service). If the fallback is `keyring.backends.fail.Keyring` or `PlaintextKeyring`, refuse to start and prompt the user to install a supported OS credential manager. Never silently fall back to plaintext.
+- **Upgrade behavior:** credentials persist across FRIDAY version upgrades — the keyring namespace uses a stable service ID (`com.preetam.friday`) that doesn't change per-release.
+- **Uninstall behavior:** the uninstaller offers two options — "Uninstall" (keeps credentials for future reinstall) and "Uninstall and remove credentials" (calls `keyring.delete_password` for every stored key).
 
 This means the FRIDAY installer will NOT ship `config.py` at all — the first-run wizard writes credentials to the OS credential store. The Packaging tasks above have already been updated to reflect this: the first-run wizard task no longer writes `config.py`.
 
