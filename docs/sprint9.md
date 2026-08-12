@@ -39,6 +39,22 @@ The sprint closes with meeting prep cards and an end-of-day wrap — bookending 
 
 ## Task Listing
 
+### Privacy Design (2 pts) — MUST COMPLETE BEFORE ANY OTHER WELLNESS WORK
+
+*Before storing or transmitting any wellness data, define the privacy contract.*
+
+| Task | Estimate |
+|------|----------|
+| Local storage only by default: sleep/mood data written to `data/wellness.json`, never transmitted | 0.5 hr |
+| Retention policy: configurable, default 90 days rolling window | 0.5 hr |
+| Explicit opt-in for external transmission: separate config flag `ALLOW_WELLNESS_TO_LLM = False` (default off) | 0.5 hr |
+| Redaction: if wellness data IS sent to Gemini, aggregate/blur specifics (e.g., "poor sleep this week" not "slept 3.5 hours Monday") | 0.5 hr |
+| Deletion: `python friday.py --wipe-wellness` command that clears local data | 0.5 hr |
+
+**Total: ~2.5 hrs**
+
+**Design principle:** Wellness data is more sensitive than calendar or news data. Even for a solo project used by one person (the developer), the design shows awareness of privacy engineering. Recruiters reviewing FRIDAY's code will see explicit privacy controls — a strong signal.
+
 ### Sleep + Mood Tracker (4 pts)
 
 *Daily logging with Gemini-powered pattern recognition once ~2 weeks of data exists.*

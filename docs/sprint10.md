@@ -61,10 +61,24 @@ By the end of this sprint FRIDAY should be something someone else can install an
 |------|----------|
 | Bundle Python runtime + `modules/` + `server/` via PyInstaller into a single sidecar binary | 2 hr |
 | `tauri build` producing `.msi` installer for Windows | 1 hr |
-| First-run wizard: prompt for API keys, write `config.py` from `config.example.py` | 1.5 hr |
+| First-run wizard: prompt for API keys, store via OS keyring (Windows Credential Manager / macOS Keychain) — no `config.py` shipped in the packaged install | 1.5 hr |
 | Install → launch → briefing playback test on a clean Windows VM | 1 hr |
 
 **Total: ~5.5 hrs**
+
+### Secrets Storage Design (DESIGN NOTE)
+
+For dev, `config.py` (gitignored) holds all API keys as plaintext Python constants. This is acceptable for local development on a single machine.
+
+For the packaged `.exe` distribution (this sprint), plaintext `config.py` is NOT acceptable — anyone with filesystem access can read the keys. The packaged app will use:
+
+- **Windows:** Windows Credential Manager via `keyring` library
+- **macOS:** macOS Keychain via `keyring` library
+- **First-run flow:** Prompt for keys interactively, store via keyring
+- **Rotation:** Documented procedure for updating a rotated key
+- **Cleanup:** Uninstaller removes keyring entries
+
+This means the FRIDAY installer will NOT ship `config.py` at all — the first-run wizard writes credentials to the OS credential store. The Packaging tasks above have already been updated to reflect this: the first-run wizard task no longer writes `config.py`.
 
 ### Demo Video (2 pts)
 
