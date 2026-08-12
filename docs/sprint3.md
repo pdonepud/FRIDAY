@@ -79,7 +79,7 @@ Solo project — all tasks assigned to Preetam.
 
 ## Sprint Retrospective
 
-**Delivered:** OAuth helper (`bdcedc6`), multi-calendar fetcher (`9f9fef5`), and both CLI flags wired (`bf059be`). Verified end-to-end against `donepudipreetam2009@gmail.com` with three subscribed calendars.
+**Delivered:** OAuth helper (`bdcedc6`), multi-calendar fetcher (`9f9fef5`), and both CLI flags wired (`bf059be`). Verified end-to-end against a test Google account (`friday-test@example.com`) with three subscribed calendars.
 
 **Discoveries:** Google's OAuth flow with `prompt="select_account"` is critical for machines with multiple Google accounts — without it the flow silently picks the first cached account, which felt like a bug the first three times. The service handle is expensive to build (~200ms) and worth caching within a single session but *not* worth persisting to disk (token refresh gets weird).
 
