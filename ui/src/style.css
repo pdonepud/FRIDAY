@@ -98,3 +98,103 @@ html, body {
   font-size: 0.9rem;
   letter-spacing: 0.2rem;
 }
+
+/* ========== DASHBOARD LAYOUT ========== */
+#app {
+  display: grid;
+  grid-template-columns: 1fr 380px;
+  grid-template-rows: auto 1fr;
+  gap: 1.5rem;
+  padding: 2rem;
+  height: 100vh;
+}
+
+#panel-calendar {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+}
+
+#panel-weather {
+  grid-column: 2;
+  grid-row: 1;
+  max-height: 280px;
+}
+
+.placeholder { display: none; }
+
+/* ========== PANEL BASE ========== */
+.panel {
+  background: rgba(13, 17, 23, 0.85);
+  border: 1px solid rgba(92, 223, 255, 0.15);
+  border-radius: 4px;
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  min-height: 200px;
+  position: relative;
+  overflow: hidden;
+}
+
+.panel::before {
+  content: "";
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(92, 223, 255, 0.4), transparent);
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid rgba(125, 133, 144, 0.15);
+}
+
+.panel-label {
+  color: #7d8590;
+  font-size: 0.75rem;
+  letter-spacing: 0.3rem;
+  font-weight: 600;
+}
+
+.panel-status {
+  color: #5cdfff;
+  font-size: 0.7rem;
+  letter-spacing: 0.2rem;
+  opacity: 0.6;
+}
+
+.panel-status.error { color: #f85149; opacity: 1; }
+
+.panel-body { flex: 1; overflow-y: auto; color: #e6edf3; }
+.panel-loading { color: #7d8590; font-size: 0.85rem; letter-spacing: 0.1rem; }
+.panel-error { color: #f85149; font-size: 0.85rem; line-height: 1.6; }
+.panel-empty { color: #7d8590; font-size: 0.9rem; font-style: italic; }
+
+/* ========== WEATHER ========== */
+.weather-current { display: flex; align-items: baseline; gap: 0.5rem; margin-bottom: 0.5rem; }
+.weather-temp {
+  font-size: 4rem; font-weight: 200; color: #5cdfff;
+  text-shadow: 0 0 20px rgba(92, 223, 255, 0.4); line-height: 1;
+}
+.weather-unit { font-size: 1.5rem; color: #7d8590; font-weight: 300; }
+.weather-conditions { color: #e6edf3; font-size: 1rem; margin-bottom: 1rem; text-transform: capitalize; }
+.weather-meta { display: flex; flex-direction: column; gap: 0.4rem; color: #7d8590; font-size: 0.85rem; }
+.weather-meta-row { display: flex; justify-content: space-between; }
+.weather-meta-value { color: #e6edf3; }
+
+/* ========== CALENDAR ========== */
+.calendar-list { display: flex; flex-direction: column; }
+.calendar-event {
+  display: flex; gap: 1.5rem; padding: 0.85rem 0;
+  border-bottom: 1px solid rgba(125, 133, 144, 0.08);
+}
+.calendar-event:last-child { border-bottom: none; }
+.calendar-event-time {
+  color: #7d8590; font-size: 0.8rem; letter-spacing: 0.1rem;
+  min-width: 5rem; padding-top: 0.15rem;
+}
+.calendar-event-title { color: #e6edf3; font-size: 0.95rem; line-height: 1.4; flex: 1; }
+.calendar-event.all-day .calendar-event-time { color: #5cdfff; opacity: 0.7; }
