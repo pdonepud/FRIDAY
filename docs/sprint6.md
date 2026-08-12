@@ -45,8 +45,8 @@ By the end of this sprint the dashboard should be demoable without a terminal wi
 
 | Task | Estimate |
 |------|----------|
-| Watchlist panel: fetch `/stocks`, render ticker rows with % change and sparkline | 1.5 hr |
-| News panel: fetch `/news`, render categorized headline stack (politics/world/markets/tech) | 1 hr |
+| Watchlist panel: fetch `/api/stocks`, render ticker rows with % change and sparkline | 1.5 hr |
+| News panel: fetch `/api/news`, render categorized headline stack (politics/world/markets/tech) | 1 hr |
 | Loading + error states, consistent card chrome across all four panels | 0.5 hr |
 
 **Total: ~3 hrs**
@@ -57,7 +57,7 @@ By the end of this sprint the dashboard should be demoable without a terminal wi
 
 | Task | Estimate |
 |------|----------|
-| Extend `/weather` endpoint to return next 12 hours from Open-Meteo | 0.5 hr |
+| Extend `/api/weather` endpoint to return next 12 hours from Open-Meteo | 0.5 hr |
 | Frontend hourly strip: temp + condition glyph per hour, horizontal scroll | 1 hr |
 | Match hourly strip typography to existing card design | 0.5 hr |
 
@@ -71,7 +71,7 @@ By the end of this sprint the dashboard should be demoable without a terminal wi
 |------|----------|
 | SVG concentric arcs, three rings, subtle rotation via CSS animation | 1.5 hr |
 | Inner ring: live clock centered inside the arcs | 0.75 hr |
-| Middle ring: current CPU / memory sample (via a `/system` endpoint or JS-side) | 0.75 hr |
+| Middle ring: current CPU / memory sample (via a `/api/system` endpoint or JS-side) | 0.75 hr |
 
 **Total: ~3 hrs**
 
@@ -83,7 +83,7 @@ By the end of this sprint the dashboard should be demoable without a terminal wi
 |------|----------|
 | Configure Tauri sidecar in `tauri.conf.json` pointing at a bundled Python launcher | 1 hr |
 | Graceful shutdown: on window close, terminate the FastAPI subprocess | 0.5 hr |
-| Retry logic: frontend waits up to 5s for `/health` before rendering panels | 0.5 hr |
+| Retry logic: frontend waits up to 5s for `/api/health` (shipped in Sprint 5) before rendering panels | 0.5 hr |
 
 **Total: ~2 hrs**
 

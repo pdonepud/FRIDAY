@@ -50,7 +50,7 @@ This sprint has the highest polish density in the project. It's not just gluing 
 | Assemble context: weather + calendar + markets + politics + world + tech into structured dict | 1 hr |
 | Draft system prompt with hard rules: no invented locations, no invented tickers, no meta-commentary | 1.5 hr |
 | First pass — `--now` triggers full pipeline (`43a4051`) | 1 hr |
-| Polish: enforce 110–150 word floor, block hallucinated locations, push past safe closes (`5951d0d`) | 0.5 hr |
+| Polish: block hallucinated locations, push past safe closes (`5951d0d`) | 0.5 hr |
 
 **Total: ~4 hrs**
 

@@ -109,23 +109,24 @@ The Tauri pivot is the architectural inflection point for the whole project. It 
 
 | Task | Estimate |
 |------|----------|
-| Weather panel: fetch `/weather`, render current + condition icon | 0.75 hr |
-| Calendar panel: fetch `/calendar/today`, render event list with time strip | 1 hr |
+| Weather panel: fetch `/api/weather`, render current + condition icon | 0.75 hr |
+| Calendar panel: fetch `/api/calendar/today`, render event list with time strip | 1 hr |
 | Loading + error states for both panels | 0.25 hr |
 
 **Total: ~2 hrs**
 
 ### Briefing Button (1 pt) 📋 Planned
 
-*Add a play button on the frontend that triggers `/briefing` and streams the audio playback via the Python voice layer (Phase 13.3.C).*
+*Add a play button on the frontend that triggers `/api/briefing` and streams the audio playback via the Python voice layer (Phase 13.3.C).*
 
 | Task | Estimate |
 |------|----------|
-| Frontend button → POST `/briefing` | 0.25 hr |
+| Frontend button → POST `/api/briefing` | 0.25 hr |
 | Backend triggers `speak_interruptible()` in a thread; returns immediately | 0.5 hr |
-| Frontend "playing…" state polling `/briefing/status` (Esc still stops locally) | 0.25 hr |
+| New backend endpoint `/api/briefing/status` returning current playback state (`idle` / `playing` / `stopped`) | 0.25 hr |
+| Frontend "playing…" state polling `/api/briefing/status` (Esc still stops locally) | 0.25 hr |
 
-**Total: ~1 hr**
+**Total: ~1.25 hrs**
 
 ---
 
