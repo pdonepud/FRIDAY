@@ -8,6 +8,7 @@ credentials.json
 # === Internal Documentation ===
 CLAUDE.md
 CASE_STUDY.md
+CLAUDE_SESSION_*.md
 
 # === Python ===
 __pycache__/

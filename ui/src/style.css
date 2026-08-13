@@ -103,7 +103,7 @@ html, body {
 #app {
   display: grid;
   grid-template-columns: 1fr 380px;
-  grid-template-rows: auto 1fr;
+  grid-template-rows: auto auto 1fr;
   gap: 1.5rem;
   padding: 2rem;
   height: 100vh;
@@ -111,7 +111,7 @@ html, body {
 
 #panel-calendar {
   grid-column: 1;
-  grid-row: 1 / span 2;
+  grid-row: 1 / span 3;
 }
 
 #panel-weather {
@@ -198,3 +198,48 @@ html, body {
 }
 .calendar-event-title { color: #e6edf3; font-size: 0.95rem; line-height: 1.4; flex: 1; }
 .calendar-event.all-day .calendar-event-time { color: #5cdfff; opacity: 0.7; }
+
+/* ========== ACTIONS PANEL ========== */
+#panel-actions {
+  grid-column: 2;
+  grid-row: 2;
+  max-height: 200px;
+}
+
+.action-button {
+  width: 100%;
+  padding: 0.9rem 1rem;
+  background: rgba(92, 223, 255, 0.08);
+  color: #5cdfff;
+  border: 1px solid rgba(92, 223, 255, 0.4);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 0.85rem;
+  letter-spacing: 0.3rem;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.action-button:hover:not(:disabled) {
+  background: rgba(92, 223, 255, 0.16);
+  box-shadow: 0 0 20px rgba(92, 223, 255, 0.2);
+  border-color: rgba(92, 223, 255, 0.7);
+}
+
+.action-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.action-message {
+  margin-top: 0.75rem;
+  color: #7d8590;
+  font-size: 0.8rem;
+  letter-spacing: 0.1rem;
+  min-height: 1.2rem;
+}
+
+.action-message.error {
+  color: #f85149;
+}

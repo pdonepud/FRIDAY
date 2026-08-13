@@ -166,6 +166,99 @@ async function renderCalendarPanel() {
   setPanelStatus("calendar-status", `${events.length} EVENTS`);
 }
 
+// ========== BRIEFING BUTTON ==========
+
+let briefingPollTimer = null;
+const BRIEFING_POLL_INITIAL_MS = 500;
+const BRIEFING_POLL_LONG_MS = 2000;
+
+function setBriefingButton(disabled, label = "Run Briefing") {
+  const btn = document.getElementById("briefing-button");
+  if (!btn) return;
+  btn.disabled = disabled;
+  btn.textContent = label;
+}
+
+function setBriefingMessage(text, isError = false) {
+  const el = document.getElementById("briefing-message");
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle("error", isError);
+}
+
+function stopBriefingPolling() {
+  if (briefingPollTimer !== null) {
+    clearTimeout(briefingPollTimer);
+    briefingPollTimer = null;
+  }
+}
+
+async function pollBriefingStatus() {
+  const status = await fetchJSON("/api/briefing/status");
+  if (!status) {
+    setPanelStatus("briefing-status", "OFFLINE", true);
+    setBriefingMessage("Lost connection to server.", true);
+    setBriefingButton(false);
+    stopBriefingPolling();
+    return;
+  }
+
+  const { status: s, message } = status;
+  setPanelStatus("briefing-status", s.toUpperCase());
+  setBriefingMessage(message, s === "error");
+
+  if (s === "generating" || s === "speaking") {
+    // Long-running phase — poll less aggressively
+    briefingPollTimer = setTimeout(pollBriefingStatus, BRIEFING_POLL_LONG_MS);
+  } else {
+    // idle | done | stopped | error — stop polling, re-enable button
+    stopBriefingPolling();
+    setBriefingButton(false, "Run Briefing");
+  }
+}
+
+async function handleBriefingClick() {
+  setBriefingButton(true, "Starting...");
+  setBriefingMessage("");
+  setPanelStatus("briefing-status", "STARTING");
+
+  try {
+    const response = await fetch(`${API_BASE}/api/briefing/speak`, {
+      method: "POST",
+      headers: { "Accept": "application/json" },
+    });
+    if (!response.ok) {
+      setBriefingMessage(`Server error: ${response.status}`, true);
+      setPanelStatus("briefing-status", "ERROR", true);
+      setBriefingButton(false);
+      return;
+    }
+    const result = await response.json();
+    if (!result.accepted) {
+      // Already playing
+      setBriefingMessage(result.message, true);
+      setPanelStatus("briefing-status", "BUSY", true);
+      setBriefingButton(false);
+      return;
+    }
+    // Accepted — start polling
+    setBriefingButton(true, "Running...");
+    briefingPollTimer = setTimeout(pollBriefingStatus, BRIEFING_POLL_INITIAL_MS);
+  } catch (err) {
+    console.error("[FRIDAY UI] Briefing start failed:", err);
+    setBriefingMessage("Could not reach the briefing service.", true);
+    setPanelStatus("briefing-status", "OFFLINE", true);
+    setBriefingButton(false);
+  }
+}
+
+function initBriefingButton() {
+  const btn = document.getElementById("briefing-button");
+  if (!btn) return;
+  btn.addEventListener("click", handleBriefingClick);
+  setPanelStatus("briefing-status", "READY");
+}
+
 // ========== ORCHESTRATOR ==========
 async function loadDashboard() {
   console.log("[FRIDAY UI] Loading dashboard...");
@@ -184,6 +277,7 @@ function startAutoRefresh() {
 function init() {
   startBootSequence();
   startAutoRefresh();
+  initBriefingButton();
 }
 
 if (document.readyState === "loading") {
