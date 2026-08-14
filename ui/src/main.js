@@ -5,11 +5,23 @@ const API_BASE = "http://127.0.0.1:8765";
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
 // ========== BOOT SEQUENCE ==========
-const STATUS_MESSAGES = [
-  "INITIALIZING SYSTEMS",
-  "ESTABLISHING SECURE CONNECTION",
-  "ONLINE — WELCOME, PREETAM",
-];
+const STATUS_MESSAGES = {
+  init:           "INITIALIZING SYSTEMS",
+  connecting:     "ESTABLISHING SECURE CONNECTION",
+  starting:       "STARTING BACKEND SERVICES",
+  online:         "ONLINE — WELCOME, PREETAM",
+  serverDown:     "SERVER NOT RESPONDING — CHECK CONSOLE",
+};
+
+// Health-gate tuning. The Rust sidecar launches uvicorn on window open;
+// uvicorn typically listens within ~1-3s but a cold Python import can take
+// longer, so we allow up to 20s. Poll cadence stays snappy so the boot
+// screen doesn't linger once the server is actually up.
+const HEALTH_POLL_INTERVAL_MS = 500;
+const HEALTH_POLL_MAX_MS = 20_000;
+const HEALTH_REQUEST_TIMEOUT_MS = 2_000;
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 function showStatusMessage(text) {
   const el = document.getElementById("boot-status");
@@ -33,11 +45,52 @@ function fadeOutBoot() {
   }, 600);
 }
 
-function startBootSequence() {
-  setTimeout(() => showStatusMessage(STATUS_MESSAGES[0]), 1500);
-  setTimeout(() => showStatusMessage(STATUS_MESSAGES[1]), 2200);
-  setTimeout(() => showStatusMessage(STATUS_MESSAGES[2]), 2900);
-  setTimeout(() => fadeOutBoot(), 3700);
+// Polls /api/health until it responds 200 or the deadline passes.
+// Returns true if the server came up, false on timeout.
+async function waitForServer() {
+  const deadline = Date.now() + HEALTH_POLL_MAX_MS;
+  let attempts = 0;
+  while (Date.now() < deadline) {
+    attempts++;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), HEALTH_REQUEST_TIMEOUT_MS);
+    try {
+      const r = await fetch(`${API_BASE}/api/health`, { signal: controller.signal });
+      clearTimeout(timeoutId);
+      if (r.ok) {
+        console.log(`[FRIDAY UI] Server reachable after ${attempts} attempt(s)`);
+        return true;
+      }
+    } catch {
+      clearTimeout(timeoutId);
+      // Connection refused / abort — retry until deadline.
+    }
+    await sleep(HEALTH_POLL_INTERVAL_MS);
+  }
+  console.error(`[FRIDAY UI] Server did not respond within ${HEALTH_POLL_MAX_MS}ms (${attempts} attempts)`);
+  return false;
+}
+
+async function startBootSequence() {
+  // First two messages are pure boot atmosphere on fixed timers.
+  await sleep(1500); showStatusMessage(STATUS_MESSAGES.init);
+  await sleep(700);  showStatusMessage(STATUS_MESSAGES.connecting);
+  await sleep(700);  showStatusMessage(STATUS_MESSAGES.starting);
+
+  // Now actually wait for the FastAPI server. This gates the dashboard
+  // render so panels don't fire fetches into a dead port and flash OFFLINE.
+  const ready = await waitForServer();
+  if (!ready) {
+    // Leave the boot screen up with a persistent error — dashboard cannot
+    // render without a server, and blank panels would be worse than an
+    // explicit failure state.
+    showStatusMessage(STATUS_MESSAGES.serverDown);
+    return;
+  }
+
+  showStatusMessage(STATUS_MESSAGES.online);
+  await sleep(800);
+  fadeOutBoot();
 }
 
 // ========== FETCH HELPERS ==========

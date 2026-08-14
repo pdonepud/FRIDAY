@@ -346,11 +346,25 @@ def ask(req: AskRequest):
 
 
 if __name__ == "__main__":
+    import argparse
     import uvicorn
+
+    parser = argparse.ArgumentParser(description="FRIDAY FastAPI server")
+    parser.add_argument(
+        "--no-reload",
+        action="store_true",
+        help=(
+            "Disable uvicorn auto-reload. Set by the Tauri sidecar — reload spawns "
+            "a worker subprocess whose lifetime the sidecar cannot own, which can "
+            "leave orphaned python.exe processes after the app window closes."
+        ),
+    )
+    args = parser.parse_args()
+
     uvicorn.run(
         "server.api:app",
         host="127.0.0.1",
         port=8765,
-        reload=True,
+        reload=not args.no_reload,
         log_level="info",
     )
