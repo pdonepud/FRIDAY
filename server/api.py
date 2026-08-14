@@ -19,8 +19,10 @@ import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from typing import Optional as _Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +34,7 @@ from modules.calendar_api import describe_today, get_next_event, get_today
 from modules.gemini import ask as gemini_ask
 from modules.news import get_balanced_headlines
 from modules.stocks import get_watchlist
+from modules.voice import speak_interruptible
 from modules.weather import get_weather
 
 
@@ -53,6 +56,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ========== BRIEFING PLAYBACK STATE ==========
+# Single-instance briefing state — only one briefing can play at a time.
+# Frontend polls /api/briefing/status; Python speaks via existing speak_interruptible.
+_briefing_lock = threading.RLock()
+_briefing_state = {
+    "status": "idle",         # idle | generating | speaking | stopped | done | error
+    "message": "",            # human-readable status detail
+    "started_at": None,       # ISO timestamp of last start
+    "text": None,             # last briefing text (for display, not audio)
+}
+
+
+def _set_briefing_state(**updates):
+    """Thread-safe update of the briefing state singleton."""
+    with _briefing_lock:
+        _briefing_state.update(updates)
+
+
+def _get_briefing_state() -> dict:
+    """Thread-safe snapshot of the briefing state singleton."""
+    with _briefing_lock:
+        return dict(_briefing_state)
 
 
 # ========== RESPONSE MODELS ==========
@@ -112,6 +139,18 @@ class Headline(BaseModel):
 class BriefingResponse(BaseModel):
     text: str
     word_count: int
+
+
+class BriefingStatusResponse(BaseModel):
+    status: str          # idle | generating | speaking | stopped | done | error
+    message: str
+    started_at: Optional[str] = None
+    text: Optional[str] = None
+
+
+class BriefingSpeakResponse(BaseModel):
+    accepted: bool
+    message: str
 
 
 class AskRequest(BaseModel):
@@ -224,6 +263,76 @@ def briefing(force: bool = Query(False, description="Bypass cache and force fres
         return BriefingResponse(text=text, word_count=len(text.split()))
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Briefing failed: {e}")
+
+
+def _run_briefing_in_background():
+    """
+    Background worker that generates + speaks the briefing.
+    Updates the briefing state singleton at each phase transition.
+    Runs on a thread so the HTTP endpoint returns immediately.
+
+    The endpoint reserves the "generating" state before starting this
+    thread (so the check-and-reserve is atomic), so we don't set it
+    again here — we go straight to generation.
+    """
+    try:
+        text = generate_briefing(speak_aloud=False)
+        _set_briefing_state(
+            status="speaking",
+            message="Speaking. Press Esc to stop.",
+            text=text,
+        )
+        completed = speak_interruptible(text)
+        # speak_interruptible returns False if the user pressed Esc mid-playback.
+        current = _get_briefing_state()
+        if current["status"] == "speaking":
+            if completed:
+                _set_briefing_state(status="done", message="Briefing complete.")
+            else:
+                _set_briefing_state(status="stopped", message="Briefing stopped.")
+    except Exception as e:
+        _set_briefing_state(
+            status="error",
+            message=f"Briefing failed: {e}",
+        )
+
+
+@app.post("/api/briefing/speak", response_model=BriefingSpeakResponse)
+def briefing_speak():
+    """
+    Start the briefing in a background thread. Returns immediately.
+    Frontend polls /api/briefing/status for progress. Only one briefing
+    can play at a time — rejects if one is already in flight.
+    """
+    # Hold the lock across BOTH the "already playing" check AND the
+    # transition to "generating" so two concurrent requests can't both
+    # observe "idle" and start rival threads. _briefing_lock is an
+    # RLock, so the nested acquire inside _set_briefing_state() is safe.
+    with _briefing_lock:
+        if _briefing_state["status"] in ("generating", "speaking"):
+            return BriefingSpeakResponse(
+                accepted=False,
+                message="A briefing is already playing. Press Esc to stop it first.",
+            )
+        _set_briefing_state(
+            status="generating",
+            message="Pulling your briefing together...",
+            started_at=datetime.now().isoformat(),
+            text=None,
+        )
+    thread = threading.Thread(target=_run_briefing_in_background, daemon=True)
+    thread.start()
+    return BriefingSpeakResponse(
+        accepted=True,
+        message="Briefing started.",
+    )
+
+
+@app.get("/api/briefing/status", response_model=BriefingStatusResponse)
+def briefing_status():
+    """Snapshot of the current briefing playback state."""
+    current = _get_briefing_state()
+    return BriefingStatusResponse(**current)
 
 
 @app.post("/api/ask", response_model=AskResponse)

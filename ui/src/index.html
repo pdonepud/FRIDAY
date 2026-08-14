@@ -37,6 +37,20 @@
         <div class="panel-loading">Connecting...</div>
       </div>
     </section>
+
+    <!-- Actions panel — bottom right -->
+    <section class="panel panel-actions" id="panel-actions">
+      <header class="panel-header">
+        <span class="panel-label">ACTIONS</span>
+        <span class="panel-status" id="briefing-status" role="status" aria-live="polite" aria-atomic="true">·</span>
+      </header>
+      <div class="panel-body">
+        <button id="briefing-button" class="action-button" type="button">
+          Run Briefing
+        </button>
+        <div id="briefing-message" class="action-message"></div>
+      </div>
+    </section>
   </main>
 
   <script src="main.js"></script>
