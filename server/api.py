@@ -61,7 +61,7 @@ app.add_middleware(
 # ========== BRIEFING PLAYBACK STATE ==========
 # Single-instance briefing state — only one briefing can play at a time.
 # Frontend polls /api/briefing/status; Python speaks via existing speak_interruptible.
-_briefing_lock = threading.Lock()
+_briefing_lock = threading.RLock()
 _briefing_state = {
     "status": "idle",         # idle | generating | speaking | stopped | done | error
     "message": "",            # human-readable status detail
@@ -270,25 +270,26 @@ def _run_briefing_in_background():
     Background worker that generates + speaks the briefing.
     Updates the briefing state singleton at each phase transition.
     Runs on a thread so the HTTP endpoint returns immediately.
+
+    The endpoint reserves the "generating" state before starting this
+    thread (so the check-and-reserve is atomic), so we don't set it
+    again here — we go straight to generation.
     """
     try:
-        _set_briefing_state(
-            status="generating",
-            message="Pulling your briefing together...",
-            started_at=datetime.now().isoformat(),
-            text=None,
-        )
         text = generate_briefing(speak_aloud=False)
         _set_briefing_state(
             status="speaking",
             message="Speaking. Press Esc to stop.",
             text=text,
         )
-        speak_interruptible(text)
-        # If speak_interruptible returned without being stopped, mark done.
+        completed = speak_interruptible(text)
+        # speak_interruptible returns False if the user pressed Esc mid-playback.
         current = _get_briefing_state()
         if current["status"] == "speaking":
-            _set_briefing_state(status="done", message="Briefing complete.")
+            if completed:
+                _set_briefing_state(status="done", message="Briefing complete.")
+            else:
+                _set_briefing_state(status="stopped", message="Briefing stopped.")
     except Exception as e:
         _set_briefing_state(
             status="error",
@@ -303,11 +304,21 @@ def briefing_speak():
     Frontend polls /api/briefing/status for progress. Only one briefing
     can play at a time — rejects if one is already in flight.
     """
-    current = _get_briefing_state()
-    if current["status"] in ("generating", "speaking"):
-        return BriefingSpeakResponse(
-            accepted=False,
-            message="A briefing is already playing. Press Esc to stop it first.",
+    # Hold the lock across BOTH the "already playing" check AND the
+    # transition to "generating" so two concurrent requests can't both
+    # observe "idle" and start rival threads. _briefing_lock is an
+    # RLock, so the nested acquire inside _set_briefing_state() is safe.
+    with _briefing_lock:
+        if _briefing_state["status"] in ("generating", "speaking"):
+            return BriefingSpeakResponse(
+                accepted=False,
+                message="A briefing is already playing. Press Esc to stop it first.",
+            )
+        _set_briefing_state(
+            status="generating",
+            message="Pulling your briefing together...",
+            started_at=datetime.now().isoformat(),
+            text=None,
         )
     thread = threading.Thread(target=_run_briefing_in_background, daemon=True)
     thread.start()
