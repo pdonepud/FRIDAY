@@ -44,11 +44,18 @@ fn project_root() -> PathBuf {
 
 fn spawn_python_server() -> std::io::Result<Child> {
     let cwd = project_root();
+    // Interpreter is configurable so a venv or a specific install can be
+    // pinned (`FRIDAY_PYTHON=C:\path\to\venv\Scripts\python.exe`). Default
+    // matches convention: `python` on Windows, `python3` elsewhere.
+    let python = std::env::var("FRIDAY_PYTHON").unwrap_or_else(|_| {
+        if cfg!(windows) { "python".to_string() } else { "python3".to_string() }
+    });
     log::info!(
-        "[server-autostart] spawning `python -m server.api --no-reload` from {}",
+        "[server-autostart] spawning `{} -m server.api --no-reload` from {}",
+        python,
         cwd.display()
     );
-    Command::new("python")
+    Command::new(&python)
         .args(["-m", "server.api", "--no-reload"])
         .current_dir(&cwd)
         // Inherit stdio so uvicorn's logs land in the Tauri terminal — makes

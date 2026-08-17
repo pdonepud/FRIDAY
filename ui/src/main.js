@@ -56,16 +56,23 @@ async function waitForServer() {
     const timeoutId = setTimeout(() => controller.abort(), HEALTH_REQUEST_TIMEOUT_MS);
     try {
       const r = await fetch(`${API_BASE}/api/health`, { signal: controller.signal });
-      clearTimeout(timeoutId);
       if (r.ok) {
         console.log(`[FRIDAY UI] Server reachable after ${attempts} attempt(s)`);
         return true;
       }
     } catch {
-      clearTimeout(timeoutId);
       // Connection refused / abort — retry until deadline.
+    } finally {
+      clearTimeout(timeoutId);
     }
-    await sleep(HEALTH_POLL_INTERVAL_MS);
+    // Only sleep if the next attempt would still fit inside the deadline —
+    // otherwise the loop exits anyway and the sleep is wasted, pushing the
+    // observed timeout past HEALTH_POLL_MAX_MS.
+    if (Date.now() + HEALTH_POLL_INTERVAL_MS < deadline) {
+      await sleep(HEALTH_POLL_INTERVAL_MS);
+    } else {
+      break;
+    }
   }
   console.error(`[FRIDAY UI] Server did not respond within ${HEALTH_POLL_MAX_MS}ms (${attempts} attempts)`);
   return false;
@@ -328,7 +335,13 @@ function startAutoRefresh() {
 
 // ========== ENTRY ==========
 function init() {
-  startBootSequence();
+  // startBootSequence() is async — an unhandled rejection here would freeze
+  // the boot screen silently. Surface the failure into the same persistent
+  // error state the health-gate timeout uses.
+  startBootSequence().catch((err) => {
+    console.error("[FRIDAY UI] Boot sequence failed:", err);
+    showStatusMessage(STATUS_MESSAGES.serverDown);
+  });
   startAutoRefresh();
   initBriefingButton();
 }
