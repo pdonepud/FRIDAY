@@ -52,8 +52,13 @@ async function waitForServer() {
   let attempts = 0;
   while (Date.now() < deadline) {
     attempts++;
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), HEALTH_REQUEST_TIMEOUT_MS);
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      Math.min(HEALTH_REQUEST_TIMEOUT_MS, remainingMs),
+    );
     try {
       const r = await fetch(`${API_BASE}/api/health`, { signal: controller.signal });
       if (r.ok) {
