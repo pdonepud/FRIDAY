@@ -231,6 +231,79 @@ async function renderCalendarPanel() {
   setPanelStatus("calendar-status", `${events.length} EVENTS`);
 }
 
+// ========== WATCHLIST ==========
+
+// Mirror modules/stocks.py's _FLAT_THRESHOLD_PCT exactly — keeps the UI's
+// gray "flat" coloring aligned with what the spoken briefing calls flat.
+const WATCHLIST_FLAT_THRESHOLD_PCT = 0.2;
+
+function formatPrice(n) {
+  return `$${Number(n).toFixed(2)}`;
+}
+
+function formatChange(n) {
+  const sign = n >= 0 ? "+" : "";
+  return `${sign}${Number(n).toFixed(2)}`;
+}
+
+function formatChangePct(n) {
+  const sign = n >= 0 ? "+" : "";
+  return `${sign}${Number(n).toFixed(2)}%`;
+}
+
+function changeDirection(changePct) {
+  if (changePct > WATCHLIST_FLAT_THRESHOLD_PCT) return "up";
+  if (changePct < -WATCHLIST_FLAT_THRESHOLD_PCT) return "down";
+  return "flat";
+}
+
+async function renderWatchlistPanel() {
+  const body = document.getElementById("watchlist-body");
+  if (!body) return;
+  setPanelStatus("watchlist-status", "FETCHING");
+
+  const quotes = await fetchJSON("/api/stocks");
+  if (quotes === null) {
+    body.innerHTML = `<div class="panel-error">
+      Could not reach the stocks service.<br>
+      Is the FastAPI server running? <code>python -m server.api</code>
+    </div>`;
+    setPanelStatus("watchlist-status", "OFFLINE", true);
+    return;
+  }
+
+  if (quotes.length === 0) {
+    body.innerHTML = `<div class="panel-empty">No tickers configured.</div>`;
+    setPanelStatus("watchlist-status", "EMPTY");
+    return;
+  }
+
+  const rowsHtml = quotes.map(q => {
+    const ticker = escapeHtml(q.ticker || "");
+    const direction = changeDirection(q.change_pct);
+    const staleClass = q.stale ? "stale" : "";
+    // Stale rows get a visible "CACHED" label directly in the DOM so that
+    // keyboard-only and screen-reader users get the same signal as sighted
+    // users. Title tooltip is kept as supplementary info for hover.
+    const staleLabel = q.stale
+      ? ' <span class="watchlist-stale-label">CACHED</span>'
+      : "";
+    const titleAttr = q.stale
+      ? ' title="Cached price — live fetch unavailable"'
+      : "";
+    return `
+      <div class="watchlist-row ${staleClass}"${titleAttr}>
+        <div class="watchlist-ticker">${ticker}${staleLabel}</div>
+        <div class="watchlist-price">${formatPrice(q.price)}</div>
+        <div class="watchlist-change ${direction}">${formatChange(q.change)} (${formatChangePct(q.change_pct)})</div>
+      </div>
+    `;
+  }).join("");
+
+  body.innerHTML = `<div class="watchlist-list">${rowsHtml}</div>`;
+  setPanelStatus("watchlist-status", `LIVE · ${quotes.length} TICKERS`);
+}
+
 // ========== BRIEFING BUTTON ==========
 
 let briefingPollTimer = null;
@@ -327,7 +400,7 @@ function initBriefingButton() {
 // ========== ORCHESTRATOR ==========
 async function loadDashboard() {
   console.log("[FRIDAY UI] Loading dashboard...");
-  await Promise.all([renderWeatherPanel(), renderCalendarPanel()]);
+  await Promise.all([renderWeatherPanel(), renderCalendarPanel(), renderWatchlistPanel()]);
   console.log("[FRIDAY UI] Dashboard loaded.");
 }
 
