@@ -282,14 +282,18 @@ async function renderWatchlistPanel() {
     const ticker = escapeHtml(q.ticker || "");
     const direction = changeDirection(q.change_pct);
     const staleClass = q.stale ? "stale" : "";
-    // Title tooltip explains the stale marker to sighted hover users; the
-    // .stale opacity + trailing dot are the visual signal for the row itself.
+    // Stale rows get a visible "CACHED" label directly in the DOM so that
+    // keyboard-only and screen-reader users get the same signal as sighted
+    // users. Title tooltip is kept as supplementary info for hover.
+    const staleLabel = q.stale
+      ? ' <span class="watchlist-stale-label">CACHED</span>'
+      : "";
     const titleAttr = q.stale
       ? ' title="Cached price — live fetch unavailable"'
       : "";
     return `
       <div class="watchlist-row ${staleClass}"${titleAttr}>
-        <div class="watchlist-ticker">${ticker}</div>
+        <div class="watchlist-ticker">${ticker}${staleLabel}</div>
         <div class="watchlist-price">${formatPrice(q.price)}</div>
         <div class="watchlist-change ${direction}">${formatChange(q.change)} (${formatChangePct(q.change_pct)})</div>
       </div>

@@ -237,11 +237,16 @@ html, body {
 .watchlist-change.down { color: #f85149; }   /* reuse existing danger red */
 .watchlist-change.flat { color: #7d8590; }   /* reuse existing muted gray */
 .watchlist-row.stale { opacity: 0.6; }
-.watchlist-row.stale .watchlist-ticker::after {
-  /* Small dot marker signals the price is not fresh — the row's title
-     attribute carries the explanation for hover. */
-  content: " ·";
+.watchlist-stale-label {
+  /* Real DOM text (rendered only on stale rows) so keyboard and screen
+     reader users see the "cached" signal, not just sighted hover users.
+     Sits inline to the right of the ticker inside the same grid cell. */
+  margin-left: 0.5rem;
   color: #7d8590;
+  font-size: 0.6rem;
+  letter-spacing: 0.15rem;
+  font-weight: 400;
+  vertical-align: middle;
 }
 
 /* ========== ACTIONS PANEL ========== */
