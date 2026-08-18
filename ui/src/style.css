@@ -103,7 +103,7 @@ html, body {
 #app {
   display: grid;
   grid-template-columns: 1fr 380px;
-  grid-template-rows: auto auto 1fr;
+  grid-template-rows: auto auto auto 1fr;
   gap: 1.5rem;
   padding: 2rem;
   height: 100vh;
@@ -111,12 +111,18 @@ html, body {
 
 #panel-calendar {
   grid-column: 1;
-  grid-row: 1 / span 3;
+  grid-row: 1 / span 4;
 }
 
 #panel-weather {
   grid-column: 2;
   grid-row: 1;
+  max-height: 280px;
+}
+
+#panel-watchlist {
+  grid-column: 2;
+  grid-row: 2;
   max-height: 280px;
 }
 
@@ -199,10 +205,49 @@ html, body {
 .calendar-event-title { color: #e6edf3; font-size: 0.95rem; line-height: 1.4; flex: 1; }
 .calendar-event.all-day .calendar-event-time { color: #5cdfff; opacity: 0.7; }
 
+/* ========== WATCHLIST ========== */
+.watchlist-list { display: flex; flex-direction: column; }
+.watchlist-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 0.75rem;
+  align-items: baseline;
+  padding: 0.55rem 0;
+  border-bottom: 1px solid rgba(125, 133, 144, 0.08);
+  font-variant-numeric: tabular-nums;
+}
+.watchlist-row:last-child { border-bottom: none; }
+.watchlist-ticker {
+  color: #e6edf3;
+  font-size: 0.9rem;
+  letter-spacing: 0.08rem;
+  font-weight: 600;
+}
+.watchlist-price {
+  color: #e6edf3;
+  font-size: 0.9rem;
+  text-align: right;
+}
+.watchlist-change {
+  font-size: 0.8rem;
+  text-align: right;
+  min-width: 7rem;
+}
+.watchlist-change.up   { color: #3fb950; }   /* new token — positive move */
+.watchlist-change.down { color: #f85149; }   /* reuse existing danger red */
+.watchlist-change.flat { color: #7d8590; }   /* reuse existing muted gray */
+.watchlist-row.stale { opacity: 0.6; }
+.watchlist-row.stale .watchlist-ticker::after {
+  /* Small dot marker signals the price is not fresh — the row's title
+     attribute carries the explanation for hover. */
+  content: " ·";
+  color: #7d8590;
+}
+
 /* ========== ACTIONS PANEL ========== */
 #panel-actions {
   grid-column: 2;
-  grid-row: 2;
+  grid-row: 3;
   max-height: 200px;
 }
 
