@@ -301,7 +301,7 @@ async function renderWatchlistPanel() {
   }).join("");
 
   body.innerHTML = `<div class="watchlist-list">${rowsHtml}</div>`;
-  setPanelStatus("watchlist-status", `${quotes.length} TICKERS`);
+  setPanelStatus("watchlist-status", `LIVE · ${quotes.length} TICKERS`);
 }
 
 // ========== BRIEFING BUTTON ==========
