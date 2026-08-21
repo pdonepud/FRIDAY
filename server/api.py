@@ -89,6 +89,14 @@ class HealthResponse(BaseModel):
     timestamp: str
 
 
+class HourlyForecast(BaseModel):
+    time: str                       # naive-local ISO from Open-Meteo (timezone=auto)
+    temp_f: float
+    weather_code: int               # WMO code, translated to icon on the frontend
+    precipitation_probability: int  # 0-100; already coerced from null to 0 upstream
+    is_day: bool
+
+
 class WeatherResponse(BaseModel):
     temp_f: float
     feels_like_f: float
@@ -103,6 +111,9 @@ class WeatherResponse(BaseModel):
     tomorrow_low_f: float
     tomorrow_conditions: str
     rain_chance_tomorrow: int
+    hourly: List[HourlyForecast] = []   # default empty preserves the endpoint's
+                                        # existing contract if the upstream
+                                        # hourly block ever comes back malformed
 
 
 class StockQuote(BaseModel):

@@ -12,7 +12,8 @@ Test directly:
 import json
 import os
 import sys
-from typing import Dict
+from datetime import datetime
+from typing import Dict, List
 
 import requests
 
@@ -22,6 +23,11 @@ from config import LATITUDE, LONGITUDE
 
 _ENDPOINT = "https://api.open-meteo.com/v1/forecast"
 _TIMEOUT_SECONDS = 15
+
+# Number of hourly cells to expose in the API response. Open-Meteo returns
+# up to 168 hours; the UI strip shows the next 12 to keep the panel a
+# manageable width.
+_HOURLY_WINDOW = 12
 
 
 WEATHER_CODES: Dict[int, str] = {
@@ -68,6 +74,7 @@ def get_weather() -> dict:
         "latitude": LATITUDE,
         "longitude": LONGITUDE,
         "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m,is_day",
+        "hourly": "temperature_2m,weather_code,precipitation_probability,is_day",
         "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code",
         "temperature_unit": "fahrenheit",
         "wind_speed_unit": "mph",
@@ -91,6 +98,7 @@ def get_weather() -> dict:
         data = response.json()
         current = data["current"]
         daily = data["daily"]
+        hourly_block = data["hourly"]
         return {
             "temp_f":              current["temperature_2m"],
             "feels_like_f":        current["apparent_temperature"],
@@ -105,11 +113,60 @@ def get_weather() -> dict:
             "tomorrow_low_f":      daily["temperature_2m_min"][1],
             "tomorrow_conditions": _describe_code(daily["weather_code"][1]),
             "rain_chance_tomorrow": daily["precipitation_probability_max"][1],
+            "hourly":              _slice_next_hours(hourly_block, _HOURLY_WINDOW),
         }
     except (KeyError, IndexError, ValueError) as e:
         raise RuntimeError(
             f"Malformed Open-Meteo response: {e}. Body: {response.text[:300]}"
         )
+
+
+def _slice_next_hours(hourly_block: dict, window: int) -> List[dict]:
+    """
+    Take the parallel arrays Open-Meteo returns under `hourly` and reshape
+    them into a list of dicts, dropping any hours that already passed
+    (Open-Meteo returns from the start of today, not the current hour).
+
+    Falls back to an empty list rather than raising if the shape is off —
+    the endpoint's outer error path already covers total failure, and a
+    graceful degrade here means the current-conditions display still ships
+    even if the hourly block is malformed for one call.
+    """
+    try:
+        times = hourly_block["time"]
+        temps = hourly_block["temperature_2m"]
+        codes = hourly_block["weather_code"]
+        precip = hourly_block["precipitation_probability"]
+        is_days = hourly_block["is_day"]
+    except KeyError:
+        return []
+
+    # Open-Meteo timestamps are naive-local ISO strings (no offset) when
+    # timezone=auto is set. Compare against a naive local "now" the same
+    # way — matching on granularity of the hour is enough to find the
+    # first future cell.
+    now_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
+    start_idx = 0
+    for i, iso in enumerate(times):
+        try:
+            slot = datetime.fromisoformat(iso)
+        except ValueError:
+            continue
+        if slot >= now_hour:
+            start_idx = i
+            break
+
+    slice_end = min(start_idx + window, len(times))
+    out: List[dict] = []
+    for i in range(start_idx, slice_end):
+        out.append({
+            "time":                     times[i],
+            "temp_f":                   temps[i],
+            "weather_code":             codes[i],
+            "precipitation_probability": precip[i] if precip[i] is not None else 0,
+            "is_day":                   bool(is_days[i]),
+        })
+    return out
 
 
 def describe_weather() -> str:
