@@ -20,7 +20,17 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self'",
+        "connect-src": "'self' http://127.0.0.1:8765 ipc: http://ipc.localhost",
+        "script-src": "'self'",
+        "style-src": "'self'",
+        "img-src": "'self'",
+        "font-src": "'self'",
+        "object-src": "'none'",
+        "base-uri": "'self'",
+        "frame-ancestors": "'none'"
+      }
     },
     "withGlobalTauri": true
   },

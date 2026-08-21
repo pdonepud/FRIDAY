@@ -26,4 +26,6 @@ tauri-plugin-log = "2"
 # Shell plugin — used only for `shell.open(url)` to hand off article URLs
 # to the system default browser. See capabilities/default.json for the
 # permission and lib.rs for plugin registration.
-tauri-plugin-shell = "2"
+# Pinned to >=2.2.1 to explicitly exclude the pre-2.2.1 range (RUSTSEC
+# advisory) rather than relying on today's lockfile resolution.
+tauri-plugin-shell = ">=2.2.1"

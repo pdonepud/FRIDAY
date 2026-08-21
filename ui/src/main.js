@@ -310,10 +310,32 @@ async function renderWatchlistPanel() {
 // Kept in sync manually — no shared config file between Python and JS today.
 const NEWS_QUOTAS = { politics: 2, world: 1, markets: 1, tech: 1 };
 
+// Guards against passing anything non-http(s) into shell.open — the Tauri
+// permission is currently unscoped (see follow-up issue for https-only
+// scoping via capabilities), so this client-side check is the last defense
+// against a malformed /api/news payload trying to fire javascript:, file:,
+// or a custom scheme.
+function isSafeExternalUrl(url) {
+  if (typeof url !== "string" || url.length === 0) return false;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false;
+    if (!parsed.hostname) return false;
+    return true;
+  } catch {
+    // URL constructor throws on malformed input — reject.
+    return false;
+  }
+}
+
 // Prefer the Tauri shell plugin (opens URLs in the system default browser
 // so headlines don't try to render inside the webview). Falls back to
 // window.open for dev-in-plain-browser scenarios where Tauri isn't present.
 async function openExternalUrl(url) {
+  if (!isSafeExternalUrl(url)) {
+    console.warn("[FRIDAY UI] Refused to open unsafe URL:", url);
+    return;
+  }
   if (window.__TAURI__ && window.__TAURI__.shell) {
     try {
       await window.__TAURI__.shell.open(url);
