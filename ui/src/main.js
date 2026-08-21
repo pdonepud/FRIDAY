@@ -251,7 +251,12 @@ function renderHourlyStripHtml(hours) {
       </div>
     `;
   }).join("");
-  return `<div class="hourly-strip" role="list">${cells}</div>`;
+  // tabindex="0" makes the scroll container itself keyboard-focusable so
+  // arrow keys can scroll horizontally beyond the visible cells; the
+  // aria-label uses the live count so it stays accurate if _HOURLY_WINDOW
+  // ever changes on the backend.
+  const label = `Hourly forecast for the next ${hours.length} hours`;
+  return `<div class="hourly-strip" role="list" tabindex="0" aria-label="${label}">${cells}</div>`;
 }
 
 async function renderWeatherPanel() {

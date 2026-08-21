@@ -141,6 +141,16 @@ def _slice_next_hours(hourly_block: dict, window: int) -> List[dict]:
     except KeyError:
         return []
 
+    # Guard against parallel-array corruption: any of the five coming back
+    # as a non-list (TypeError on later index) or with mismatched lengths
+    # (IndexError on later index) would 503 the whole /api/weather call.
+    # Degrade to [] instead so the current-conditions display still ships.
+    arrays = (times, temps, codes, precip, is_days)
+    if not all(isinstance(a, list) for a in arrays):
+        return []
+    if len({len(a) for a in arrays}) != 1:
+        return []
+
     # Open-Meteo timestamps are naive-local ISO strings (no offset) when
     # timezone=auto is set. Compare against a naive local "now" the same
     # way — matching on granularity of the hour is enough to find the
