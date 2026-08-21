@@ -16,13 +16,24 @@
 
   <!-- Main dashboard — hidden during boot, revealed after -->
   <main id="app" class="app-hidden">
-    <!-- Calendar panel — left side -->
+    <!-- Calendar panel — left column, top half -->
     <section class="panel panel-calendar" id="panel-calendar">
       <header class="panel-header">
         <span class="panel-label">TODAY</span>
         <span class="panel-status" id="calendar-status" role="status" aria-live="polite" aria-atomic="true">·</span>
       </header>
       <div class="panel-body" id="calendar-body">
+        <div class="panel-loading">Connecting...</div>
+      </div>
+    </section>
+
+    <!-- News panel — left column, bottom half -->
+    <section class="panel panel-news" id="panel-news">
+      <header class="panel-header">
+        <span class="panel-label">HEADLINES</span>
+        <span class="panel-status" id="news-status" role="status" aria-live="polite" aria-atomic="true">·</span>
+      </header>
+      <div class="panel-body" id="news-body">
         <div class="panel-loading">Connecting...</div>
       </div>
     </section>

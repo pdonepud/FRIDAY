@@ -304,6 +304,130 @@ async function renderWatchlistPanel() {
   setPanelStatus("watchlist-status", `LIVE · ${quotes.length} TICKERS`);
 }
 
+// ========== NEWS ==========
+
+// Matches the /api/news endpoint's own default quotas (server/api.py:242).
+// Kept in sync manually — no shared config file between Python and JS today.
+const NEWS_QUOTAS = { politics: 2, world: 1, markets: 1, tech: 1 };
+
+// Guards against passing anything non-http(s) into shell.open — the Tauri
+// permission is currently unscoped (see follow-up issue for https-only
+// scoping via capabilities), so this client-side check is the last defense
+// against a malformed /api/news payload trying to fire javascript:, file:,
+// or a custom scheme.
+function isSafeExternalUrl(url) {
+  if (typeof url !== "string" || url.length === 0) return false;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false;
+    if (!parsed.hostname) return false;
+    return true;
+  } catch {
+    // URL constructor throws on malformed input — reject.
+    return false;
+  }
+}
+
+// Prefer the Tauri shell plugin (opens URLs in the system default browser
+// so headlines don't try to render inside the webview). Falls back to
+// window.open for dev-in-plain-browser scenarios where Tauri isn't present.
+async function openExternalUrl(url) {
+  if (!isSafeExternalUrl(url)) {
+    console.warn("[FRIDAY UI] Refused to open unsafe URL:", url);
+    return;
+  }
+  if (window.__TAURI__ && window.__TAURI__.shell) {
+    try {
+      await window.__TAURI__.shell.open(url);
+      return;
+    } catch (err) {
+      console.error("[FRIDAY UI] Tauri shell.open failed, falling back:", err);
+    }
+  }
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+
+function buildNewsQueryString(quotas) {
+  const params = new URLSearchParams();
+  for (const [key, val] of Object.entries(quotas)) {
+    params.set(key, String(val));
+  }
+  return params.toString();
+}
+
+async function renderNewsPanel() {
+  const body = document.getElementById("news-body");
+  if (!body) return;
+  setPanelStatus("news-status", "FETCHING");
+
+  const qs = buildNewsQueryString(NEWS_QUOTAS);
+  const articles = await fetchJSON(`/api/news?${qs}`);
+  if (articles === null) {
+    body.innerHTML = `<div class="panel-error">
+      Could not reach the news service.<br>
+      Is the FastAPI server running? <code>python -m server.api</code>
+    </div>`;
+    setPanelStatus("news-status", "OFFLINE", true);
+    return;
+  }
+
+  if (articles.length === 0) {
+    body.innerHTML = `<div class="panel-empty">No headlines available right now.</div>`;
+    setPanelStatus("news-status", "EMPTY");
+    return;
+  }
+
+  const rowsHtml = articles.map(article => {
+    const title = escapeHtml(article.title || "(no title)");
+    const source = escapeHtml(article.source || "");
+    const category = escapeHtml(article.category || "");
+    const url = escapeHtml(article.url || "");
+    const staleClass = article.stale ? "stale" : "";
+    // Category class is derived from the category string; unknown categories
+    // fall through to .news-category's default muted gray, so a new
+    // category from the backend won't crash the page — it just won't get a
+    // dedicated color until we add one.
+    const categoryClass = `news-category-${category}`;
+    // Stale rows get a visible "CACHED" label inside the source cell so
+    // keyboard/screen-reader users get the same signal as sighted users —
+    // same fix pattern as .watchlist-stale-label on PR #29. Tooltip on the
+    // row is the supplementary hover explanation.
+    const staleLabel = article.stale
+      ? ' <span class="news-stale-label">CACHED</span>'
+      : "";
+    const titleAttr = article.stale
+      ? ' title="Cached headline — live fetch unavailable"'
+      : "";
+    // data-url lets us delegate a single click listener on the container
+    // instead of attaching one per row (also avoids inline onclick=""
+    // injection concerns).
+    return `
+      <button type="button" class="news-row ${staleClass}" data-url="${url}"${titleAttr}>
+        <span class="news-category ${categoryClass}">${category}</span>
+        <span class="news-title">${title}</span>
+        <span class="news-source">${source}${staleLabel}</span>
+      </button>
+    `;
+  }).join("");
+
+  body.innerHTML = `<div class="news-list">${rowsHtml}</div>`;
+
+  // Single delegated click listener — cheaper than per-row and survives
+  // re-renders on the 5-min refresh (the container is replaced each time,
+  // so the old listener is garbage-collected).
+  const list = body.querySelector(".news-list");
+  if (list) {
+    list.addEventListener("click", (event) => {
+      const row = event.target.closest(".news-row");
+      if (!row) return;
+      const url = row.getAttribute("data-url");
+      if (url) openExternalUrl(url);
+    });
+  }
+
+  setPanelStatus("news-status", `LIVE · ${articles.length} HEADLINES`);
+}
+
 // ========== BRIEFING BUTTON ==========
 
 let briefingPollTimer = null;
@@ -400,7 +524,12 @@ function initBriefingButton() {
 // ========== ORCHESTRATOR ==========
 async function loadDashboard() {
   console.log("[FRIDAY UI] Loading dashboard...");
-  await Promise.all([renderWeatherPanel(), renderCalendarPanel(), renderWatchlistPanel()]);
+  await Promise.all([
+    renderWeatherPanel(),
+    renderCalendarPanel(),
+    renderWatchlistPanel(),
+    renderNewsPanel(),
+  ]);
   console.log("[FRIDAY UI] Dashboard loaded.");
 }
 

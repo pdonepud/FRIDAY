@@ -111,7 +111,14 @@ html, body {
 
 #panel-calendar {
   grid-column: 1;
-  grid-row: 1 / span 4;
+  grid-row: 1 / span 2;
+}
+
+#panel-news {
+  grid-column: 1;
+  grid-row: 3 / span 2;
+  min-height: 0;   /* Allow the panel-body's overflow-y:auto to actually
+                      scroll instead of stretching the grid row. */
 }
 
 #panel-weather {
@@ -241,6 +248,82 @@ html, body {
   /* Real DOM text (rendered only on stale rows) so keyboard and screen
      reader users see the "cached" signal, not just sighted hover users.
      Sits inline to the right of the ticker inside the same grid cell. */
+  margin-left: 0.5rem;
+  color: #7d8590;
+  font-size: 0.6rem;
+  letter-spacing: 0.15rem;
+  font-weight: 400;
+  vertical-align: middle;
+}
+
+/* ========== NEWS ========== */
+.news-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.news-row {
+  /* Rendered as a real <button> so keyboard focus + Enter/Space activation
+     come for free — matches the accessibility posture we set for the
+     watchlist "CACHED" label. Reset default button chrome so it visually
+     matches the calendar-event pattern. */
+  display: grid;
+  grid-template-columns: 4.5rem 1fr auto;
+  gap: 0.85rem;
+  align-items: baseline;
+  padding: 0.7rem 0.3rem;
+  border: none;
+  border-bottom: 1px solid rgba(125, 133, 144, 0.08);
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease;
+  width: 100%;
+}
+.news-row:last-child { border-bottom: none; }
+.news-row:hover,
+.news-row:focus-visible {
+  background: rgba(92, 223, 255, 0.06);
+  outline: none;
+}
+.news-row:focus-visible {
+  /* Keyboard focus needs a visible ring — hover-only would leave keyboard
+     users guessing which row they're on. Uses the same cyan token as
+     .panel-status so it reads as part of the same design system. */
+  box-shadow: inset 0 0 0 1px rgba(92, 223, 255, 0.5);
+}
+.news-category {
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.15rem;
+  text-transform: uppercase;
+  color: #7d8590;   /* default; per-category classes below override */
+}
+.news-category-politics { color: #f0883e; }
+.news-category-world    { color: #d2a8ff; }
+.news-category-markets  { color: #3fb950; }
+.news-category-tech     { color: #5cdfff; }
+.news-title {
+  color: #e6edf3;
+  font-size: 0.9rem;
+  line-height: 1.35;
+}
+.news-source {
+  color: #7d8590;
+  font-size: 0.7rem;
+  letter-spacing: 0.05rem;
+  white-space: nowrap;
+}
+.news-row.stale { opacity: 0.6; }
+.news-stale-label {
+  /* Real DOM text (rendered only on stale rows) so keyboard and screen
+     reader users see the "cached" signal, not just sighted opacity. Kept
+     as a separate class from .watchlist-stale-label — the styling is
+     identical today, but the semantic contexts differ enough that a
+     shared "watchlist" name on news rows would be more confusing than
+     the ~5 lines of duplication. */
   margin-left: 0.5rem;
   color: #7d8590;
   font-size: 0.6rem;

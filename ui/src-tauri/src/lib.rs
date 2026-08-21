@@ -97,6 +97,10 @@ fn shutdown_python_server(state: &PythonServer) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        // Shell plugin — enables window.__TAURI__.shell.open(url) in the
+        // frontend so news headline clicks can hand articles off to the
+        // system default browser. Permissions in capabilities/default.json.
+        .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
