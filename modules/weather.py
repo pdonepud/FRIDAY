@@ -211,6 +211,15 @@ def _slice_next_hours(
             slot = datetime.fromisoformat(iso)
         except (TypeError, ValueError):
             continue
+        # timezone=auto is contracted to return naive-local strings, but
+        # fromisoformat also accepts trailing offsets ("+00:00", or a "Z"
+        # suffix on 3.11+) and produces a tz-aware datetime for those. A
+        # naive-vs-aware `>=` on the next line would TypeError and escape
+        # the fromisoformat guard above. Strip tzinfo if present — trusts
+        # any offset matches the forecast tz (safer than a translate that
+        # would silently misalign if it didn't).
+        if slot.tzinfo is not None:
+            slot = slot.replace(tzinfo=None)
         if slot >= now_hour:
             start_idx = i
             break
