@@ -145,6 +145,120 @@ function setPanelStatus(id, text, isError = false) {
 // ========== WEATHER ==========
 function formatTemp(f) { return Math.round(f); }
 
+// Absolute-temp thresholds tuned for Santa Cruz. Warm-cyan-and-glow above
+// 75°F, plain cyan through the mid-60s, muted below. Adjust here if
+// FRIDAY ever ships somewhere with a different climate normal.
+const HOURLY_TEMP_HOT_F  = 75;
+const HOURLY_TEMP_WARM_F = 65;
+const HOURLY_TEMP_COOL_F = 55;
+
+function hourlyTempClass(tempF) {
+  const t = Number(tempF);
+  if (!Number.isFinite(t)) return "hourly-temp-warm";
+  if (t >= HOURLY_TEMP_HOT_F)  return "hourly-temp-hot";
+  if (t >= HOURLY_TEMP_WARM_F) return "hourly-temp-warm";
+  if (t >= HOURLY_TEMP_COOL_F) return "hourly-temp-cool";
+  return "hourly-temp-cold";
+}
+
+function formatHour(isoString) {
+  // Open-Meteo returns naive-local ISO with timezone=auto, so parsing as a
+  // Date lands us in the browser's local time — same time zone by design.
+  try {
+    const d = new Date(isoString);
+    if (Number.isNaN(d.getTime())) return "";
+    return d.toLocaleTimeString("en-US", { hour: "numeric", hour12: true }).replace(/\s+/g, " ");
+  } catch {
+    return "";
+  }
+}
+
+// Map an Open-Meteo WMO weather code to one of six icon groups. Grouping
+// matches modules/weather.py's WEATHER_CODES table so a single icon stands
+// in for every condition string that maps to the same visual family.
+function weatherIconGroup(code, isDay) {
+  if (code === 0 || code === 1) return isDay ? "sun" : "moon";
+  if (code === 2) return isDay ? "partly-day" : "partly-night";
+  if (code === 3) return "cloud";
+  if (code === 45 || code === 48) return "fog";
+  if (code >= 51 && code <= 67) return "rain";
+  if (code >= 71 && code <= 77) return "snow";
+  if (code >= 80 && code <= 82) return "rain";
+  if (code === 85 || code === 86) return "snow";
+  if (code >= 95 && code <= 99) return "thunder";
+  return "cloud";
+}
+
+// Inline SVGs — one path per group, drawn at 24×24, stroked with
+// currentColor so CSS can tint + glow them via the hourly-temp-* classes.
+// Kept as a lookup rather than dynamic construction so the paths can be
+// visually reviewed side-by-side.
+const WEATHER_ICON_SVG = {
+  sun: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <circle cx="12" cy="12" r="4"/>
+    <path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M5.6 18.4l1.4-1.4M17 7l1.4-1.4"/>
+  </svg>`,
+  moon: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M20 15A8 8 0 019 4a8 8 0 1011 11z"/>
+  </svg>`,
+  "partly-day": `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <circle cx="8" cy="9" r="3"/>
+    <path d="M8 3v1.5M8 13.5V15M3 9h1.5M11.5 9H13M4.4 5.4l1 1M10.6 5.4l-1 1"/>
+    <path d="M9.5 18h8a3.5 3.5 0 000-7 4.5 4.5 0 00-8.7-1"/>
+  </svg>`,
+  "partly-night": `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M10.5 8.5A5 5 0 015 3a5 5 0 105 5.5z"/>
+    <path d="M9.5 18h8a3.5 3.5 0 000-7 4.5 4.5 0 00-8.7-1"/>
+  </svg>`,
+  cloud: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M6.5 18h11a4 4 0 000-8 5.5 5.5 0 00-10.7-1A3.5 3.5 0 006.5 18z"/>
+  </svg>`,
+  rain: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M6.5 14h11a4 4 0 000-8 5.5 5.5 0 00-10.7-1A3.5 3.5 0 006.5 14z"/>
+    <path d="M9 18l-1 3M13 18l-1 3M17 18l-1 3"/>
+  </svg>`,
+  snow: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M6.5 14h11a4 4 0 000-8 5.5 5.5 0 00-10.7-1A3.5 3.5 0 006.5 14z"/>
+    <path d="M9 19v2M8 20h2M13 19v2M12 20h2M17 19v2M16 20h2"/>
+  </svg>`,
+  fog: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M4 10h16M4 14h16M4 18h16M6 6h12"/>
+  </svg>`,
+  thunder: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M6.5 14h11a4 4 0 000-8 5.5 5.5 0 00-10.7-1A3.5 3.5 0 006.5 14z"/>
+    <path d="M12 15l-2 4h3l-1 3"/>
+  </svg>`,
+};
+
+function weatherIconSvg(code, isDay) {
+  const group = weatherIconGroup(code, isDay);
+  return WEATHER_ICON_SVG[group] || WEATHER_ICON_SVG.cloud;
+}
+
+function renderHourlyStripHtml(hours) {
+  if (!Array.isArray(hours) || hours.length === 0) return "";
+  const cells = hours.map(h => {
+    const hourLabel = escapeHtml(formatHour(h.time));
+    // SVG is our own literal string, no untrusted input — safe to inline.
+    const icon = weatherIconSvg(h.weather_code, h.is_day);
+    const tempClass = hourlyTempClass(h.temp_f);
+    const temp = formatTemp(h.temp_f);
+    return `
+      <div class="hourly-cell ${tempClass}" role="listitem">
+        <div class="hourly-hour">${hourLabel}</div>
+        <div class="hourly-icon">${icon}</div>
+        <div class="hourly-temp">${temp}°</div>
+      </div>
+    `;
+  }).join("");
+  // tabindex="0" makes the scroll container itself keyboard-focusable so
+  // arrow keys can scroll horizontally beyond the visible cells; the
+  // aria-label uses the live count so it stays accurate if _HOURLY_WINDOW
+  // ever changes on the backend.
+  const label = `Hourly forecast for the next ${hours.length} hours`;
+  return `<div class="hourly-strip" role="list" tabindex="0" aria-label="${label}">${cells}</div>`;
+}
+
 async function renderWeatherPanel() {
   const body = document.getElementById("weather-body");
   if (!body) return;
@@ -161,6 +275,11 @@ async function renderWeatherPanel() {
   }
 
   const conditions = escapeHtml(data.conditions || "Unknown");
+  // Hourly is a graceful-degrade field — server returns [] if the upstream
+  // hourly block was malformed, and the helper returns "" for empty input,
+  // so a bad hourly payload just omits the strip rather than breaking the
+  // whole panel.
+  const hourlyHtml = renderHourlyStripHtml(data.hourly);
 
   body.innerHTML = `
     <div class="weather-current">
@@ -173,6 +292,7 @@ async function renderWeatherPanel() {
       <div class="weather-meta-row"><span>Today's high/low</span><span class="weather-meta-value">${formatTemp(data.today_high_f)}° / ${formatTemp(data.today_low_f)}°</span></div>
       <div class="weather-meta-row"><span>Rain chance</span><span class="weather-meta-value">${data.rain_chance_today}%</span></div>
     </div>
+    ${hourlyHtml}
   `;
   setPanelStatus("weather-status", "LIVE");
 }
