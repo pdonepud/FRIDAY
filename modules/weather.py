@@ -32,6 +32,12 @@ _TIMEOUT_SECONDS = 15
 # manageable width.
 _HOURLY_WINDOW = 12
 
+# Real-world UTC offsets max out at ±14h (Kiribati at +14, Baker Island at
+# -12; Samoa was UTC+14 pre-2011). Anything outside that means Open-Meteo
+# returned a corrupted value — clamp before feeding it to timedelta(), which
+# OverflowErrors on absurd magnitudes like 10**12 seconds.
+_MAX_UTC_OFFSET_SECONDS = 14 * 3600
+
 
 WEATHER_CODES: Dict[int, str] = {
     0:  "clear sky",
@@ -180,13 +186,18 @@ def _slice_next_hours(
     # returned. If the field is missing, fall back to server-local time
     # with a warning (works today because dev machine == Santa Cruz TZ, but
     # would silently misalign if the server ran elsewhere).
-    if isinstance(utc_offset_seconds, int) and not isinstance(utc_offset_seconds, bool):
+    if (
+        isinstance(utc_offset_seconds, int)
+        and not isinstance(utc_offset_seconds, bool)
+        and abs(utc_offset_seconds) <= _MAX_UTC_OFFSET_SECONDS
+    ):
         now_local = datetime.now(timezone.utc) + timedelta(seconds=utc_offset_seconds)
         now_hour = now_local.replace(tzinfo=None, minute=0, second=0, microsecond=0)
     else:
         logger.warning(
-            "Open-Meteo response missing utc_offset_seconds; falling back to "
-            "server-local time for hourly alignment."
+            "Open-Meteo utc_offset_seconds missing or out of range (got %r); "
+            "falling back to server-local time for hourly alignment.",
+            utc_offset_seconds,
         )
         now_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
 
