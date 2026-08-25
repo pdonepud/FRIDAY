@@ -101,7 +101,14 @@ def get_weather() -> dict:
         data = response.json()
         current = data["current"]
         daily = data["daily"]
-        hourly_block = data["hourly"]
+        # `hourly` is optional at this layer — unlike current/daily, every
+        # other field on the response is independent of it. Missing/malformed
+        # hourly should degrade to an empty strip, not 503 the whole endpoint.
+        # The `or {}` (rather than checking for None only) also covers
+        # non-dict values like null, [], or a stray string — _slice_next_hours's
+        # KeyError guard then returns [] cleanly.
+        hourly_raw = data.get("hourly")
+        hourly_block = hourly_raw if isinstance(hourly_raw, dict) else {}
         return {
             "temp_f":              current["temperature_2m"],
             "feels_like_f":        current["apparent_temperature"],
