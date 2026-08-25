@@ -10,16 +10,19 @@ Test directly:
 """
 
 import json
+import logging
 import os
 import sys
-from datetime import datetime
-from typing import Dict, List
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
 
 import requests
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import LATITUDE, LONGITUDE
 
+
+logger = logging.getLogger(__name__)
 
 _ENDPOINT = "https://api.open-meteo.com/v1/forecast"
 _TIMEOUT_SECONDS = 15
@@ -113,7 +116,11 @@ def get_weather() -> dict:
             "tomorrow_low_f":      daily["temperature_2m_min"][1],
             "tomorrow_conditions": _describe_code(daily["weather_code"][1]),
             "rain_chance_tomorrow": daily["precipitation_probability_max"][1],
-            "hourly":              _slice_next_hours(hourly_block, _HOURLY_WINDOW),
+            "hourly":              _slice_next_hours(
+                hourly_block,
+                _HOURLY_WINDOW,
+                utc_offset_seconds=data.get("utc_offset_seconds"),
+            ),
         }
     except (KeyError, IndexError, ValueError) as e:
         raise RuntimeError(
@@ -121,11 +128,20 @@ def get_weather() -> dict:
         )
 
 
-def _slice_next_hours(hourly_block: dict, window: int) -> List[dict]:
+def _slice_next_hours(
+    hourly_block: dict,
+    window: int,
+    utc_offset_seconds: Optional[int] = None,
+) -> List[dict]:
     """
     Take the parallel arrays Open-Meteo returns under `hourly` and reshape
     them into a list of dicts, dropping any hours that already passed
     (Open-Meteo returns from the start of today, not the current hour).
+
+    `utc_offset_seconds` is the offset of the forecast location, taken from
+    the top-level Open-Meteo response. It's needed to align "now" with the
+    forecast's naive-local timestamps when the server isn't in the same
+    timezone as the forecast location.
 
     Falls back to an empty list rather than raising if the shape is off —
     the endpoint's outer error path already covers total failure, and a
@@ -152,30 +168,55 @@ def _slice_next_hours(hourly_block: dict, window: int) -> List[dict]:
         return []
 
     # Open-Meteo timestamps are naive-local ISO strings (no offset) when
-    # timezone=auto is set. Compare against a naive local "now" the same
-    # way — matching on granularity of the hour is enough to find the
-    # first future cell.
-    now_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
-    start_idx = 0
+    # timezone=auto is set — local to the FORECAST LOCATION, not the server.
+    # Build a naive "now" in that same timezone using the offset the API
+    # returned. If the field is missing, fall back to server-local time
+    # with a warning (works today because dev machine == Santa Cruz TZ, but
+    # would silently misalign if the server ran elsewhere).
+    if isinstance(utc_offset_seconds, int) and not isinstance(utc_offset_seconds, bool):
+        now_local = datetime.now(timezone.utc) + timedelta(seconds=utc_offset_seconds)
+        now_hour = now_local.replace(tzinfo=None, minute=0, second=0, microsecond=0)
+    else:
+        logger.warning(
+            "Open-Meteo response missing utc_offset_seconds; falling back to "
+            "server-local time for hourly alignment."
+        )
+        now_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
+
+    # Use a None sentinel so "no future slot found" is explicit and can't be
+    # confused with "found at index 0" — the old default of start_idx=0 meant
+    # a stale forecast (all timestamps in the past) would leak past hours to
+    # the UI. Return [] in that case; current-conditions still ship.
+    start_idx: Optional[int] = None
     for i, iso in enumerate(times):
         try:
             slot = datetime.fromisoformat(iso)
-        except ValueError:
+        except (TypeError, ValueError):
             continue
         if slot >= now_hour:
             start_idx = i
             break
 
+    if start_idx is None:
+        return []
+
     slice_end = min(start_idx + window, len(times))
     out: List[dict] = []
     for i in range(start_idx, slice_end):
-        out.append({
-            "time":                     times[i],
-            "temp_f":                   temps[i],
-            "weather_code":             codes[i],
-            "precipitation_probability": precip[i] if precip[i] is not None else 0,
-            "is_day":                   bool(is_days[i]),
-        })
+        # Defense-in-depth for per-row value corruption: outer guards catch
+        # shape issues (non-list, mismatched lengths) but a single non-numeric
+        # temp or a non-bool-coercible is_day would still crash inside the
+        # dict build. Skip the bad row, keep the rest of the strip.
+        try:
+            out.append({
+                "time":                      times[i],
+                "temp_f":                    temps[i],
+                "weather_code":              codes[i],
+                "precipitation_probability": precip[i] if precip[i] is not None else 0,
+                "is_day":                    bool(is_days[i]),
+            })
+        except (TypeError, ValueError):
+            continue
     return out
 
 
