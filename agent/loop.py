@@ -4,6 +4,7 @@ Run with `python -m agent` from the repo root.
 """
 
 import os
+import sys
 
 from dotenv import load_dotenv
 
@@ -32,6 +33,14 @@ def run() -> int:
         1 — startup failure (missing ANTHROPIC_API_KEY).
         2 — unrecoverable auth failure mid-session (bad API key).
     """
+    # Force UTF-8 on stdout so the em dash in the banner and any non-ASCII
+    # in Claude's replies render correctly on Windows consoles (which
+    # otherwise default to the system ANSI code page).
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 — best-effort; a stdout without
+        pass          # reconfigure (rare) still works for ASCII.
+
     load_dotenv()
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print(_MISSING_KEY)
