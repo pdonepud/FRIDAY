@@ -6,6 +6,12 @@ intact. If this fails, the loop cannot start.
 
 
 def test_imports_and_wiring():
+    """Import every agent module and assert the wiring between them is intact.
+
+    Confirms the pinned model constant, the hardcoded user name, verbatim
+    personality markers in the system prompt, and that the Anthropic
+    exception classes are re-exported through the thin seam.
+    """
     from agent import claude, loop, models, system_prompt
 
     # Model is set and matches the pinned Tier 1 choice.

@@ -17,10 +17,10 @@ from anthropic import APIConnectionError, AuthenticationError, RateLimitError
 from agent.models import MODEL
 
 __all__ = [
-    "stream_reply",
     "APIConnectionError",
     "AuthenticationError",
     "RateLimitError",
+    "stream_reply",
 ]
 
 _MAX_TOKENS: int = 1024
