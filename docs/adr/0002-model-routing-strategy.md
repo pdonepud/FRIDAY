@@ -38,11 +38,19 @@ The thin seam already provides the abstraction LiteLLM would provide, so adoptin
 Revisit this ADR when *any* of the following becomes true:
 
 - A concrete FRIDAY task requires a model that Anthropic doesn't offer (specific capability, specific cost point) — not a hypothetical "we might want" but an actual planned feature
-- Background or bulk workloads emerge (memory summarization in Tier 4, proactive-behavior scoring in Tier 5) where the cost differential between frontier and cheap models is at least 10× the frontier cost at expected volume
+- Background or bulk workloads emerge (memory summarization in Tier 4, proactive-behavior scoring in Tier 5) where routing that workload to a cheap model would save at least an order of magnitude of cost compared to running it on the frontier model
 - Multi-provider becomes a hard requirement (a specific tool integration only works with a specific model)
 - The thin seam becomes noticeably painful to maintain because it has accumulated more than 2–3 provider-specific branches
 
 At the trigger, re-evaluate LiteLLM against extending the seam, with the concrete requirements in hand. This ADR may be superseded by a follow-up ADR documenting the actual adoption.
+
+## Error boundary
+
+The current thin seam re-exports Anthropic's exception classes (`AuthenticationError`, `RateLimitError`, `APIConnectionError`) through `agent/claude.py`, and `agent/loop.py` catches those specific classes directly. This means the seam abstracts the *call* but not the *errors* — a second provider raises different exception types, and the loop would need corresponding except clauses (or a normalization layer inside the seam) to handle them.
+
+This is a deliberate Tier-1 tradeoff: introducing an internal exception hierarchy (e.g., `FridayModelError`, `FridayAuthError`) before there's a second provider to normalize against would be premature abstraction — designing for hypothetical shapes. The concrete cost is that adding a second provider is not purely a `claude.py` edit; it will also touch `loop.py` or introduce a normalization layer at that point. That cost is acceptable given the trigger conditions above.
+
+When the trigger fires, one of two paths is chosen as part of the adoption ADR: (a) introduce a `FridayModelError` hierarchy inside the seam that normalizes across providers, letting `loop.py` catch stable internal types; or (b) accept that `loop.py` grows provider-aware except clauses, which is fine if the provider count stays small (2–3).
 
 ## Consequences
 

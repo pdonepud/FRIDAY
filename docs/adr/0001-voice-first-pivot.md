@@ -5,7 +5,7 @@
 
 ## Context
 
-FRIDAY was originally scoped as a JARVIS-inspired always-on desktop assistant with a visual HUD as the primary interface. Sprints 1–6 built toward that: a Tauri + FastAPI application with a concentric-arc dashboard displaying live watchlist prices, weather forecasts, news headlines, and system status. The stack was Python (FastAPI backend, data-source integrations) plus TypeScript/Tauri (frontend HUD panels). By end of Sprint 6, five of the planned six panels had shipped (#15 watchlist, #16 news, #17 hourly weather, #19 server auto-start), and Sprint 7 ("Professionalization") was scoped to add pytest, CI, branch protection, CodeRabbit config, and docstrings + ADRs.
+FRIDAY was originally scoped as a JARVIS-inspired always-on desktop assistant with a visual HUD as the primary interface. Sprints 1–6 built toward that: a Tauri + FastAPI application with a concentric-arc dashboard displaying live watchlist prices, weather forecasts, news headlines, and system status. The stack was Python (FastAPI backend, data-source integrations) plus TypeScript/Tauri (frontend HUD panels). By end of Sprint 6, most of the planned HUD panels had shipped (watchlist, news, hourly weather), and supporting infrastructure was in place (#19 server auto-start). The remaining center HUD (#18) was closed as superseded during the pivot.
 
 Two forces produced the pivot before Sprint 7 executed:
 
