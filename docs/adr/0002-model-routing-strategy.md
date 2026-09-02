@@ -31,7 +31,7 @@ The thin seam already provides the abstraction LiteLLM would provide, so adoptin
 
 3. **The trigger hasn't fired.** FRIDAY is a personal assistant with a single user. Cost is measured in cents per day at Sonnet rates. The capability-and-trust tiering argument is coherent but requires background classifiers, summarizers, or bulk drafters — none of which exist through Tier 3. The trigger for actually routing between providers doesn't materialize until Tier 4 (memory summarization) or Tier 5 (proactive-behavior background scoring) at the earliest.
 
-4. **The thin seam defers this decision without penalty.** When the trigger fires, the swap or extension is small and contained — the loop doesn't change, only the seam does.
+4. **The thin seam defers this decision without penalty.** When the trigger fires, the swap or extension is contained to a small area of code — the call path stays behind the seam; the error boundary is handled per the "Error boundary" section below (either normalized in the seam, or by adjusting `agent/loop.py`).
 
 ## Trigger conditions
 
