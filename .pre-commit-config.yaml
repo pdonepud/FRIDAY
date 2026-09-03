@@ -1,0 +1,41 @@
+# Pre-commit hooks for FRIDAY. Install with `pre-commit install` once per clone.
+# CI enforces the same lint checks; pre-commit catches them before the push.
+#
+# Deliberately NO pytest hook — tests are the CI job's responsibility; adding
+# them here would slow every commit for little marginal safety.
+#
+# The whitespace / EOF hooks are scoped to Tier-2+ code and configuration
+# (agent/, tests/, .github/, root dot-config files) so they don't rewrite the
+# dormant HUD-era code (modules/, server/, ui/, friday.py, config.example.py)
+# or protected AGENT.md.
+exclude: |
+  (?x)^(
+      modules/.*
+    | server/.*
+    | ui/.*
+    | friday\.py
+    | config\.py
+    | config\.example\.py
+    | AGENT\.md
+    | CLAUDE\.md
+    | CASE_STUDY\.md
+    | requirements\.txt
+    | credentials\.json
+    | token\.json
+    | scratchpad/.*
+  )$
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.22
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
