@@ -68,8 +68,10 @@ select = ["E", "F", "W", "I", "B", "UP"]
 "agent/claude.py" = ["UP028"]
 
 [tool.ruff.format]
-# agent/loop.py shipped in Tier 1 (PR #35) and is on the AGENT.md
+# agent/loop.py: shipped in Tier 1 (PR #35) and on the AGENT.md
 # "don't modify" list until Tier 3 refactors it for voice. Ruff format
 # wants two cosmetic changes there (collapse a wrapped string, tighten
 # a trailing-comment indent); grandfathered here as follow-up.
-exclude = ["agent/loop.py"]
+# README.md: ruff v0.15 flags markdown content (line 121); markdown is
+# not ruff's job, exclude it to unblock CI.
+exclude = ["agent/loop.py", "README.md"]
