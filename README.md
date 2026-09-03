@@ -265,6 +265,31 @@ Built in testable phases. Each phase runs on its own before the next is stacked.
 
 ---
 
+## Development
+
+Setup for contributors working on FRIDAY's Tier 1+ code (the `agent/` package, tests, CI).
+
+```bash
+# 1. Install FRIDAY plus dev tooling in editable mode.
+#    Runtime deps come from agent/requirements.txt via pyproject's
+#    dynamic dependencies; the [dev] extra adds pytest, coverage, ruff, pre-commit.
+pip install -e ".[dev]"
+
+# 2. Install pre-commit hooks (once per clone). Ruff (check + format) and
+#    trailing-whitespace / end-of-file fixes then run automatically on every commit.
+pre-commit install
+
+# 3. Run the test suite.
+pytest
+
+# 4. Run with coverage (mirrors CI; floor is 60%).
+pytest --cov=agent --cov-report=term-missing
+```
+
+GitHub Actions runs the same `lint` (ruff check + format check) and `test` (pytest + coverage) jobs on every push and pull request against `main`.
+
+---
+
 ## Contributing
 
 This is a personal project, but PRs and ideas are welcome. If you're building something similar or want to fork it for your own assistant:
