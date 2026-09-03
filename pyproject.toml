@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "friday"
+version = "0.1.0"
+description = "FRIDAY — personal voice assistant."
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "ruff",
+    "pre-commit",
+]
+
+[tool.setuptools]
+packages = ["agent"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = "agent/requirements.txt" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["agent"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 60
+show_missing = true
+skip_covered = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# Pre-pivot HUD-era code (modules/, server/, ui/, friday.py, config.*) is
+# dormant per CLAUDE.md and not part of Tier-2+ scope. Excluded from
+# ruff so this PR's lint job doesn't gate on drift in code the pivot
+# stopped maintaining.
+extend-exclude = [
+    "modules",
+    "server",
+    "ui",
+    "friday.py",
+    "config.py",
+    "config.example.py",
+    "scratchpad",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tier-1 seam files (agent/loop.py, agent/claude.py) are on the
+# "don't modify" list per AGENT.md / user constraints until Tier 3
+# refactors them for voice. Grandfathering the two ruff violations
+# currently in them so this PR's lint job doesn't force early edits:
+#   agent/loop.py:6  I001  — import block layout (extra blank line)
+#   agent/claude.py:69  UP028  — `yield from stream.text_stream`
+"agent/loop.py" = ["I001"]
+"agent/claude.py" = ["UP028"]
+
+[tool.ruff.format]
+# agent/loop.py shipped in Tier 1 (PR #35) and is on the AGENT.md
+# "don't modify" list until Tier 3 refactors it for voice. Ruff format
+# wants two cosmetic changes there (collapse a wrapped string, tighten
+# a trailing-comment indent); grandfathered here as follow-up.
+exclude = ["agent/loop.py"]

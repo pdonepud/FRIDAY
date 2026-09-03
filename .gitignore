@@ -41,6 +41,13 @@ build/
 dist/
 *.egg-info/
 
+# === Test / Coverage artifacts ===
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+
 # === Tauri / Node build artifacts ===
 ui/node_modules/
 ui/src-tauri/target/
