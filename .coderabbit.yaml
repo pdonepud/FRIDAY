@@ -1,0 +1,171 @@
+# CodeRabbit configuration for FRIDAY.
+#
+# Philosophy: signal over noise. Chill profile matches the manual triage
+# workflow (Fix Now / Fix Cheap / Defer / Dismiss) established in earlier
+# PRs. Path filters mirror the ruff/pre-commit exclusions so CodeRabbit
+# doesn't waste review budget on dormant HUD-era code that we've already
+# decided not to maintain until (or unless) it's brought forward.
+#
+# Auto-fix / auto-commit features are deliberately NOT enabled. Every
+# CodeRabbit suggestion must be read, understood, and applied by a
+# human — this is a hard project rule, not a preference.
+
+language: en-US
+early_access: false
+enable_free_tier: true
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+
+  finishing_touches:
+    autofix:
+      enabled: false
+
+  # Skip dormant HUD-era code (matches ruff extend-exclude + pre-commit
+  # exclude regex), archived sprint docs, build artifacts, and generated
+  # files. CodeRabbit is only useful on code we're actively maintaining.
+  path_filters:
+    - "!modules/**"
+    - "!server/**"
+    - "!ui/**"
+    - "!friday.py"
+    - "!config.py"
+    - "!config.example.py"
+    - "!scratchpad/**"
+    - "!docs/archive/**"
+    - "!docs/sprint_reports/**"
+    - "!**/*.min.js"
+    - "!**/*.min.css"
+    - "!coverage.xml"
+    - "!**/htmlcov/**"
+
+  # Per-path review priorities. Keeps CodeRabbit focused on what matters
+  # for each surface rather than applying one generic checklist everywhere.
+  path_instructions:
+    - path: "agent/**/*.py"
+      instructions: |
+        This is FRIDAY's core voice-first agent package. Prioritize:
+        (1) correctness of the conversation loop and API-client seam,
+        (2) security around API keys and any user input,
+        (3) stability of public interfaces (functions imported from
+            other modules within agent/).
+
+        HTTP endpoints: if a file introduces an HTTP endpoint via
+        FastAPI, Flask, Starlette, or any similar framework, require
+        that request and response bodies use Pydantic models (or an
+        equivalent typed-schema library). This applies wherever HTTP
+        surfaces are added in the live codebase — MCP integrations,
+        tool implementations, webhooks, etc. The dormant server/
+        directory is out of scope (excluded via path_filters).
+
+        Do not nag about docstring style — the project uses concise,
+        purpose-first docstrings by convention.
+
+    - path: "tests/**/*.py"
+      instructions: |
+        Focus on test correctness, isolation, and edge cases.
+        Do not require docstrings on test functions or fixtures beyond
+        a single descriptive line. Do not suggest adding type hints to
+        test code. Mocking of external services (Anthropic API, future
+        Deepgram / ElevenLabs) is expected and correct — do not flag it
+        as "should be an integration test."
+
+    - path: ".github/workflows/**"
+      instructions: |
+        Focus on CI/CD security: least-privilege token permissions,
+        pinned action versions — third-party actions (including
+        codecov/codecov-action) should be pinned to a full commit SHA;
+        first-party GitHub actions (actions/checkout, actions/setup-python)
+        may use major-version tags. Flag secret handling issues. Do not
+        suggest matrix expansion beyond Python 3.11 and 3.12 unless the
+        project adds an explicit third target.
+
+    - path: "**/*.md"
+      instructions: |
+        Documentation-only files. Flag broken links, factual errors,
+        and inconsistencies with AGENT.md. Do not suggest structural
+        rewrites of README or CLAUDE.md — those follow project-specific
+        conventions.
+
+  # Tools: CodeRabbit runs enabled tools on their matching files. Tools
+  # NOT listed here retain CodeRabbit defaults (which may be "enabled").
+  # This block explicitly declares each tool relevant to this repo —
+  # either enabled because we use it, or disabled because we do not
+  # want it firing on our files (or on files we may add later).
+  #
+  # If a new tool becomes relevant (new language, new toolchain), add
+  # an explicit entry here rather than relying on defaults.
+  tools:
+    # --- Enabled: tools we actively use ---
+    ruff:
+      enabled: true          # Python lint + format (see pyproject.toml)
+    shellcheck:
+      enabled: true          # Shell script correctness
+    yamllint:
+      enabled: true          # YAML syntax + style
+    gitleaks:
+      enabled: true          # Secret detection
+    actionlint:
+      enabled: true          # GitHub Actions workflow lint
+
+    # --- Disabled: explicitly rejected for this repo ---
+    markdownlint:
+      enabled: false         # Docs follow project conventions, not markdownlint
+    languagetool:
+      enabled: false         # Prose style noise
+    hadolint:
+      enabled: false         # No Dockerfiles
+    eslint:
+      enabled: false         # No maintained JS (ui/ is dormant HUD-era)
+    biome:
+      enabled: false         # No maintained JS/TS
+    prismaLint:
+      enabled: false         # No Prisma
+    phpstan:
+      enabled: false         # No PHP
+    golangci-lint:
+      enabled: false         # No Go
+    detekt:
+      enabled: false         # No Kotlin
+    swiftlint:
+      enabled: false         # No Swift
+    rubocop:
+      enabled: false         # No Ruby
+    brakeman:
+      enabled: false         # No Ruby
+    buf:
+      enabled: false         # No Protobuf
+    regal:
+      enabled: false         # No Rego
+    checkov:
+      enabled: false         # No IaC
+    circleci:
+      enabled: false         # We use GitHub Actions, not CircleCI
+    semgrep:
+      enabled: false         # Not adopted; revisit at Tier 4+
+    pylint:
+      enabled: false         # ruff replaces pylint for our purposes
+
+  abort_on_close: true
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  learnings:
+    scope: local
+  issues:
+    scope: local
+  pull_requests:
+    scope: local
