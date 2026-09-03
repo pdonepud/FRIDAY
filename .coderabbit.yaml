@@ -60,6 +60,15 @@ reviews:
         (2) security around API keys and any user input,
         (3) stability of public interfaces (functions imported from
             other modules within agent/).
+
+        HTTP endpoints: if a file introduces an HTTP endpoint via
+        FastAPI, Flask, Starlette, or any similar framework, require
+        that request and response bodies use Pydantic models (or an
+        equivalent typed-schema library). This applies wherever HTTP
+        surfaces are added in the live codebase — MCP integrations,
+        tool implementations, webhooks, etc. The dormant server/
+        directory is out of scope (excluded via path_filters).
+
         Do not nag about docstring style — the project uses concise,
         purpose-first docstrings by convention.
 
