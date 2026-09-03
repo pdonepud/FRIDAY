@@ -1,5 +1,7 @@
 # FRIDAY
 
+[![codecov](https://codecov.io/gh/pdonepud/FRIDAY/branch/main/graph/badge.svg)](https://codecov.io/gh/pdonepud/FRIDAY)
+
 ### A personal AI desktop assistant inspired by JARVIS.
 
 Voice-first. Context-aware. Actually useful.
