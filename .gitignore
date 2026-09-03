@@ -44,6 +44,7 @@ dist/
 # === Test / Coverage artifacts ===
 .coverage
 .coverage.*
+coverage.xml
 htmlcov/
 .pytest_cache/
 .ruff_cache/
