@@ -28,6 +28,10 @@ reviews:
     base_branches:
       - main
 
+  finishing_touches:
+    autofix:
+      enabled: false
+
   # Skip dormant HUD-era code (matches ruff extend-exclude + pre-commit
   # exclude regex), archived sprint docs, build artifacts, and generated
   # files. CodeRabbit is only useful on code we're actively maintaining.
@@ -71,11 +75,12 @@ reviews:
     - path: ".github/workflows/**"
       instructions: |
         Focus on CI/CD security: least-privilege token permissions,
-        pinned action versions (or major-version tags for trusted
-        first-party actions like actions/checkout, actions/setup-python,
-        codecov/codecov-action), and secret handling. Do not suggest
-        matrix expansion beyond Python 3.11 and 3.12 unless the project
-        adds an explicit third target.
+        pinned action versions — third-party actions (including
+        codecov/codecov-action) should be pinned to a full commit SHA;
+        first-party GitHub actions (actions/checkout, actions/setup-python)
+        may use major-version tags. Flag secret handling issues. Do not
+        suggest matrix expansion beyond Python 3.11 and 3.12 unless the
+        project adds an explicit third target.
 
     - path: "**/*.md"
       instructions: |
@@ -84,27 +89,64 @@ reviews:
         rewrites of README or CLAUDE.md — those follow project-specific
         conventions.
 
-  # Tools: enable only what the project actually uses. Ruff is our
-  # single Python linter/formatter (see pyproject.toml). Everything
-  # else stays disabled to keep the review focused on human-relevant
-  # findings.
+  # Tools: CodeRabbit runs enabled tools on their matching files. Tools
+  # NOT listed here retain CodeRabbit defaults (which may be "enabled").
+  # This block explicitly declares each tool relevant to this repo —
+  # either enabled because we use it, or disabled because we do not
+  # want it firing on our files (or on files we may add later).
+  #
+  # If a new tool becomes relevant (new language, new toolchain), add
+  # an explicit entry here rather than relying on defaults.
   tools:
+    # --- Enabled: tools we actively use ---
     ruff:
-      enabled: true
-    markdownlint:
-      enabled: false
-    languagetool:
-      enabled: false
-    hadolint:
-      enabled: false
+      enabled: true          # Python lint + format (see pyproject.toml)
     shellcheck:
-      enabled: true
+      enabled: true          # Shell script correctness
     yamllint:
-      enabled: true
+      enabled: true          # YAML syntax + style
     gitleaks:
-      enabled: true
+      enabled: true          # Secret detection
     actionlint:
-      enabled: true
+      enabled: true          # GitHub Actions workflow lint
+
+    # --- Disabled: explicitly rejected for this repo ---
+    markdownlint:
+      enabled: false         # Docs follow project conventions, not markdownlint
+    languagetool:
+      enabled: false         # Prose style noise
+    hadolint:
+      enabled: false         # No Dockerfiles
+    eslint:
+      enabled: false         # No maintained JS (ui/ is dormant HUD-era)
+    biome:
+      enabled: false         # No maintained JS/TS
+    prismaLint:
+      enabled: false         # No Prisma
+    phpstan:
+      enabled: false         # No PHP
+    golangci-lint:
+      enabled: false         # No Go
+    detekt:
+      enabled: false         # No Kotlin
+    swiftlint:
+      enabled: false         # No Swift
+    rubocop:
+      enabled: false         # No Ruby
+    brakeman:
+      enabled: false         # No Ruby
+    buf:
+      enabled: false         # No Protobuf
+    regal:
+      enabled: false         # No Rego
+    checkov:
+      enabled: false         # No IaC
+    circleci:
+      enabled: false         # We use GitHub Actions, not CircleCI
+    semgrep:
+      enabled: false         # Not adopted; revisit at Tier 4+
+    pylint:
+      enabled: false         # ruff replaces pylint for our purposes
 
   abort_on_close: true
 
