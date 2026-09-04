@@ -33,13 +33,21 @@ PTT press → mic (PCM chunks) → Deepgram (transcript) → Claude (tokens)
          → sentence buffer (phrases) → ElevenLabs (PCM chunks) → speaker
 ```
 
-The sentence-buffer stage exists because token-level output produces one-word-at-a-time TTS input, which sounds wrong. Flushing on sentence/clause boundaries (`[.!?]\s+`, `[,;:]\s+`, or buffer > N chars) gives ElevenLabs enough context to synthesize natural prosody without meaningfully hurting time-to-first-audio.
+The sentence-buffer stage exists because token-level output produces one-word-at-a-time TTS input, which sounds wrong. Flushing on sentence/clause boundaries (`[.!?]\s+`, `[,;:]\s+`, buffer > N chars, or upstream close) gives ElevenLabs enough context to synthesize natural prosody without meaningfully hurting time-to-first-audio.
+
+### LLM stage: `AsyncAnthropic` client
+
+The current `agent/claude.py::stream_reply` uses synchronous iteration over `client.messages.stream(...)`. Reusing that seam on the voice event loop would block mic capture, STT streaming, and TTS playback while Claude streams — the whole pipeline serializes on one sync generator.
+
+The fix is to swap the Anthropic client for `AsyncAnthropic`, exposed via the SDK's async surface. `async for event in stream:` composes cleanly with the rest of the pipeline; no worker threads, no `asyncio.to_thread` wrapper, no manual cancellation queue.
+
+This migration lands in #52 (previously scoped only to sentence-chunked streaming; scope now includes the sync → async client swap). The `UP028` exemption in `pyproject.toml` is removed as a natural side effect: the `yield from` refactor becomes idiomatic once the async generator wraps the async client stream.
 
 ### Input: push-to-talk on Right Alt via `pynput`
 
 Right Alt as the PTT key (matches Preetam's preference from project memory). `pynput` chosen over `keyboard` because:
 
-- No admin/root required on Windows or Linux.
+- No admin required on Windows (verified dev environment). macOS requires accessibility permission; Linux support depends on backend (`uinput` requires root, X11 works unprivileged, Xwayland event coverage limited) and is unverified for FRIDAY.
 - Cross-platform (macOS support if ever needed).
 - Cleaner listener-callback model to bridge into asyncio.
 
@@ -49,11 +57,17 @@ Trade-off: `pynput` is a larger dep than `keyboard`. Accepted because the admin-
 
 Thin Python wrapper over PortAudio. Covers both mic capture and speaker playback with one dep. Async-friendly via callback + queue bridging. Handles Windows WASAPI, Linux ALSA/PulseAudio, macOS CoreAudio uniformly.
 
-### STT: Deepgram Nova-3, streaming
+### STT: Deepgram Flux (`flux-general-en`), streaming, PTT-driven turn endings
 
-Streaming transcription with `interim_results=False` for Tier 3. Interim results enable barge-in and lower perceived latency but add state-machine complexity. Deferred to Tier 4 alongside barge-in itself.
+Flux is Deepgram's voice-agent-purposed streaming model — same transcription quality as Nova-3, positioned by Deepgram as the successor for interactive turn-based agents. Accessed via `deepgram-sdk`'s `client.listen.v2.connect()` against the `/v2/listen` endpoint.
 
-Model choice: **Nova-3** is Deepgram's current general-purpose streaming model and the correct fit for Tier 3's PTT model where the turn boundary is deterministic (mic released ⇒ finalize). Deepgram's newer `flux-general-en` model bundles built-in turn detection tuned for voice agents; that feature only becomes useful when Tier 4 adds barge-in and drops PTT, so migration to Flux is deferred to that tier.
+Turn endings are driven by PTT release using Deepgram's documented "Bring Your Own Turn Detection" recipe:
+
+- `eot_threshold=1.0` suppresses Flux's native end-of-turn confidence detection so the model never ends a turn on its own.
+- On PTT release, send a `ForceEndTurn` control message. Flux finalizes the turn on audio transcribed so far and emits `EndOfTurn` with `trigger: "manual"`.
+- `eot_timeout_ms` set as a safety-net backstop (30s) so a stuck session cannot hang the loop indefinitely if a PTT release event is lost.
+
+Migration path to barge-in (Tier 4): lower `eot_threshold` and enable `eager_eot_threshold` to receive Flux's native early-turn events — no provider or endpoint change required, so barge-in becomes a config change rather than a rewrite.
 
 ### TTS: ElevenLabs, streaming, British female voice
 
@@ -111,6 +125,8 @@ Deferred to Tier 4 or later:
 
 ## Alternatives Considered
 
+**Deepgram Nova-3 for STT.** Rejected: Nova-3 is Deepgram's general-purpose streaming model on `/v1/listen` with no built-in turn-taking primitives. Flux is the voice-agent-purposed model with the same transcription quality, a `ForceEndTurn` control message designed specifically for push-to-talk release, and a documented forward path to barge-in via `eager_eot_threshold` in Tier 4. Choosing Nova-3 now would mean re-migrating to Flux when barge-in lands — Flux from day one avoids the churn.
+
 **Threading + `queue.Queue` instead of asyncio.** Rejected: works but requires manual thread-to-thread bridging at every seam and interacts awkwardly with the async-first SDKs.
 
 **`keyboard` instead of `pynput` for PTT.** Rejected: requires admin on Windows for global hotkeys.
@@ -120,8 +136,6 @@ Deferred to Tier 4 or later:
 **Local Piper/Coqui for TTS.** Rejected for Tier 3: voice quality gap vs ElevenLabs is large enough to hurt the product feel this early. Revisit once the product has legs.
 
 **Non-streaming turn model** (record full utterance → transcribe → generate full response → synthesize → play). Rejected: latency would be several seconds per turn, defeating the voice-first premise.
-
-**Deepgram Flux (`flux-general-en`) for STT.** Deferred, not rejected. Flux's built-in turn detection is tuned for voice-agent barge-in; Tier 3's PTT model already provides a deterministic turn boundary, so Flux's headline feature is idle here while its newness carries the usual early-adopter risk. Migration is a natural fit when Tier 4 adds barge-in and drops PTT.
 
 ## References
 
