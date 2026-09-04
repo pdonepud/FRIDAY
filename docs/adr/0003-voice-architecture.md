@@ -43,6 +43,8 @@ The fix is to swap the Anthropic client for `AsyncAnthropic`, exposed via the SD
 
 This migration lands in #52 (previously scoped only to sentence-chunked streaming; scope now includes the sync → async client swap). The `UP028` exemption in `pyproject.toml` is removed as a natural side effect: the `yield from` refactor becomes idiomatic once the async generator wraps the async client stream.
 
+Text mode migrates alongside voice: `stream_reply` becomes an async generator (single seam preserved per ADR-0002), and the text loop wraps with `asyncio.run(text_loop())` in `__main__.py`. Both the `--text` REPL and the voice loop share the same async generator against the same `AsyncAnthropic` client. Text mode gains an asyncio runtime it doesn't strictly need; the alternative (dual sync + async client paths, two `stream_reply` variants) would break the single-seam principle.
+
 ### Input: push-to-talk on Right Alt via `pynput`
 
 Right Alt as the PTT key (matches Preetam's preference from project memory). `pynput` chosen over `keyboard` because:
@@ -67,7 +69,7 @@ Turn endings are driven by PTT release using Deepgram's documented "Bring Your O
 - On PTT release, send a `ForceEndTurn` control message. Flux finalizes the turn on audio transcribed so far and emits `EndOfTurn` with `trigger: "manual"`.
 - `eot_timeout_ms` set as a safety-net backstop (30s) so a stuck session cannot hang the loop indefinitely if a PTT release event is lost.
 
-Migration path to barge-in (Tier 4): lower `eot_threshold` and enable `eager_eot_threshold` to receive Flux's native early-turn events — no provider or endpoint change required, so barge-in becomes a config change rather than a rewrite.
+Migration path to barge-in (Tier 4): the provider stays on Flux and the endpoint stays on `/v2/listen` — no rewrite of the STT stage. What changes is the application layer: lowering `eot_threshold` and enabling `eager_eot_threshold` surfaces `EagerEndOfTurn` and `TurnResumed` events, and Tier 4 must implement handlers that cancel in-flight `AsyncAnthropic` streams, interrupt active ElevenLabs playback, and clear the sentence buffer when the user resumes speaking. Choosing Flux now avoids the provider migration; the barge-in state machine is Tier 4 work regardless of STT choice.
 
 ### TTS: ElevenLabs, streaming, British female voice
 
@@ -92,7 +94,7 @@ Each provider module (`stt.py`, `tts.py`) exposes a `_get_client()` mirroring `c
 | Package         | Purpose               | Justification                                    |
 |-----------------|-----------------------|--------------------------------------------------|
 | `sounddevice`   | Mic + speaker I/O     | Only viable cross-platform PortAudio wrapper.    |
-| `pynput`        | Global Right Alt PTT  | No-admin, cross-platform, asyncio-bridgeable.    |
+| `pynput`        | Global Right Alt PTT  | Global Right Alt hotkey; asyncio-bridgeable via listener callback. Platform support varies (see Input subsection). |
 | `deepgram-sdk`  | Streaming STT         | Native streaming client for chosen STT provider. |
 | `elevenlabs`    | Streaming TTS         | Native streaming client for chosen TTS provider. |
 
