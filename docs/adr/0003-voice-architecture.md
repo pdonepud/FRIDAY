@@ -74,12 +74,14 @@ Migration path to barge-in (Tier 4): the provider stays on Flux and the endpoint
 - **Config change 1:** lower `eot_threshold` from `1.0` back toward the default (~0.7) so Flux resumes natural end-of-turn detection. Required because Tier 4 drops PTT as the sole turn-ending signal.
 - **Config change 2:** set `eager_eot_threshold` to enable `EagerEndOfTurn` events. Independent of `eot_threshold`; controls whether Flux emits early-turn guesses at all.
 
-Application-layer handlers Tier 4 must implement, one per Flux event:
+Speculative execution pattern Tier 4 must implement (per Deepgram's eager-mode guidance):
 
-- **`StartOfTurn`** — user began speaking during an agent response. Interrupt active ElevenLabs playback and clear the sentence buffer.
-- **`EagerEndOfTurn`** — Flux's early guess the turn is ending. Optionally begin speculative `AsyncAnthropic` generation.
-- **`TurnResumed`** — user kept speaking after an eager fire. Cancel any speculative `AsyncAnthropic` stream started at the previous `EagerEndOfTurn`.
-- **`EndOfTurn`** — turn finalized. Dispatch the finalized transcript to `AsyncAnthropic` (non-speculative path) and let the response stream to ElevenLabs.
+- **`StartOfTurn`** — user began speaking. If an agent response is playing, interrupt ElevenLabs playback and clear the sentence buffer.
+- **`EagerEndOfTurn`** — Flux's early guess the turn is ending. Start a speculative `AsyncAnthropic` request with the eager transcript; cache the response as a draft.
+- **`TurnResumed`** — user kept speaking; the eager guess was wrong. Cancel the in-flight `AsyncAnthropic` stream, discard the draft, and interrupt any TTS playback of the speculative response.
+- **`EndOfTurn`** — turn finalized. If a draft exists from a prior `EagerEndOfTurn` and the final transcript matches, reuse the draft (no new `AsyncAnthropic` request). Otherwise start a fresh request with the final transcript.
+
+The reuse path avoids duplicate `AsyncAnthropic` requests per turn — Deepgram guidance is that eager and final transcripts match in the common case, so reuse is the norm rather than the exception.
 
 Choosing Flux now avoids the provider migration; the barge-in state machine is Tier 4 work regardless of STT choice.
 
