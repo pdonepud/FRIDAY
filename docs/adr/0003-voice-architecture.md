@@ -69,7 +69,19 @@ Turn endings are driven by PTT release using Deepgram's documented "Bring Your O
 - On PTT release, send a `ForceEndTurn` control message. Flux finalizes the turn on audio transcribed so far and emits `EndOfTurn` with `trigger: "manual"`.
 - `eot_timeout_ms` set as a safety-net backstop (30s) so a stuck session cannot hang the loop indefinitely if a PTT release event is lost.
 
-Migration path to barge-in (Tier 4): the provider stays on Flux and the endpoint stays on `/v2/listen` — no rewrite of the STT stage. What changes is the application layer: lowering `eot_threshold` and enabling `eager_eot_threshold` surfaces `EagerEndOfTurn` and `TurnResumed` events, and Tier 4 must implement handlers that cancel in-flight `AsyncAnthropic` streams, interrupt active ElevenLabs playback, and clear the sentence buffer when the user resumes speaking. Choosing Flux now avoids the provider migration; the barge-in state machine is Tier 4 work regardless of STT choice.
+Migration path to barge-in (Tier 4): the provider stays on Flux and the endpoint stays on `/v2/listen` — no rewrite of the STT stage. Two independent configuration changes and an application-layer state machine land in Tier 4:
+
+- **Config change 1:** lower `eot_threshold` from `1.0` back toward the default (~0.7) so Flux resumes natural end-of-turn detection. Required because Tier 4 drops PTT as the sole turn-ending signal.
+- **Config change 2:** set `eager_eot_threshold` to enable `EagerEndOfTurn` events. Independent of `eot_threshold`; controls whether Flux emits early-turn guesses at all.
+
+Application-layer handlers Tier 4 must implement, one per Flux event:
+
+- **`StartOfTurn`** — user began speaking during an agent response. Interrupt active ElevenLabs playback and clear the sentence buffer.
+- **`EagerEndOfTurn`** — Flux's early guess the turn is ending. Optionally begin speculative `AsyncAnthropic` generation.
+- **`TurnResumed`** — user kept speaking after an eager fire. Cancel any speculative `AsyncAnthropic` stream started at the previous `EagerEndOfTurn`.
+- **`EndOfTurn`** — turn finalized. Dispatch the finalized transcript to `AsyncAnthropic` (non-speculative path) and let the response stream to ElevenLabs.
+
+Choosing Flux now avoids the provider migration; the barge-in state machine is Tier 4 work regardless of STT choice.
 
 ### TTS: ElevenLabs, streaming, British female voice
 
@@ -87,7 +99,9 @@ Each provider module (`stt.py`, `tts.py`) exposes a `_get_client()` mirroring `c
 
 ### Text mode preserved
 
-`python -m agent --text` runs the Tier 2 text loop unchanged. Voice is the new default. Text mode also serves as automatic fallback if the mic device is unavailable at startup (#55).
+`python -m agent --text` preserves the Tier 2 text REPL's user-facing contract: streaming token output, prompt returns between turns, Ctrl+C exits cleanly. Runtime changes underneath — the loop now runs under `asyncio.run(text_loop())` and consumes the async `stream_reply` generator against `AsyncAnthropic` (see "LLM stage" above). User behavior unchanged; implementation and runtime changed.
+
+Text mode also serves as automatic fallback if the mic device is unavailable at startup (#55).
 
 ### New dependencies (batch-approved)
 
