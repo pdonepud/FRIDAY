@@ -1,4 +1,5 @@
 anthropic==1.1.0
+deepgram-sdk==7.8.1
 pynput==1.8.2
 python-dotenv==1.2.3
 sounddevice==0.5.6
