@@ -858,6 +858,138 @@ async def test_socket_close_without_terminal_raises(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Bundle 28: Connection failures (OSError + WebSocketException) → STTError
+# ---------------------------------------------------------------------------
+
+
+async def test_connect_oserror_becomes_STTError(monkeypatch):
+    """DNS/TCP/TLS failures at connect() time → STTError('connection failed: ...')."""
+
+    class _BadCM:
+        async def __aenter__(self):
+            raise OSError("no route to host")
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    fake_client = MagicMock()
+    fake_client.listen.v2.connect.side_effect = lambda **kwargs: _BadCM()
+    monkeypatch.setattr(agent.stt, "_client", None)
+    monkeypatch.setattr(agent.stt, "_get_client", lambda: fake_client)
+
+    ptt_release = asyncio.Event()
+    with pytest.raises(STTError, match="connection failed") as exc_info:
+        await asyncio.wait_for(transcribe(_empty_chunks(), ptt_release), timeout=1.0)
+    # Not a more-specific STT subtype:
+    assert type(exc_info.value) is STTError
+    assert isinstance(exc_info.value.__cause__, OSError)
+
+
+async def test_connect_websocketexception_becomes_STTError(monkeypatch):
+    """Websockets-level failures at connect() time → STTError('connection failed: ...')."""
+    from websockets.exceptions import InvalidURI, WebSocketException
+
+    assert issubclass(InvalidURI, WebSocketException)  # sanity
+
+    class _BadCM:
+        async def __aenter__(self):
+            raise InvalidURI("bad://url", "malformed handshake")
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    fake_client = MagicMock()
+    fake_client.listen.v2.connect.side_effect = lambda **kwargs: _BadCM()
+    monkeypatch.setattr(agent.stt, "_client", None)
+    monkeypatch.setattr(agent.stt, "_get_client", lambda: fake_client)
+
+    ptt_release = asyncio.Event()
+    with pytest.raises(STTError, match="connection failed") as exc_info:
+        await asyncio.wait_for(transcribe(_empty_chunks(), ptt_release), timeout=1.0)
+    assert type(exc_info.value) is STTError
+    assert isinstance(exc_info.value.__cause__, WebSocketException)
+
+
+# ---------------------------------------------------------------------------
+# Bundles 29-31: _main watcher supervision (Round-3 Finding 2)
+# ---------------------------------------------------------------------------
+
+
+def _install_main_fakes(monkeypatch, fake_events, fake_transcribe=None):
+    """Install fake ptt.events, agent.audio.capture (no-op), and transcribe.
+
+    Kept as a helper so bundles 29-31 share the wiring boilerplate.
+    """
+    import agent.audio as _audio_mod
+    import agent.ptt as _ptt_mod
+
+    async def _fake_capture():
+        while True:
+            await asyncio.sleep(0.001)
+            yield b"\x00" * 640
+
+    async def _default_fake_transcribe(chunks, ptt_release):
+        await asyncio.wait_for(ptt_release.wait(), timeout=5.0)
+        return "unused"
+
+    monkeypatch.setattr(_audio_mod, "capture", _fake_capture)
+    monkeypatch.setattr(_ptt_mod, "events", fake_events)
+    monkeypatch.setattr(agent.stt, "transcribe", fake_transcribe or _default_fake_transcribe)
+
+
+async def test_main_raises_when_watcher_terminates_before_pressed(monkeypatch):
+    """Watcher completes with no events → STTError('...before PRESSED')."""
+
+    async def _empty_events():
+        # Generator that yields nothing and returns immediately.
+        if False:  # pragma: no cover
+            yield None
+
+    _install_main_fakes(monkeypatch, _empty_events)
+
+    with pytest.raises(STTError, match="before PRESSED"):
+        await asyncio.wait_for(agent.stt._main(), timeout=1.0)
+
+
+async def test_main_raises_when_watcher_terminates_after_pressed_no_released(monkeypatch):
+    """Watcher yields PRESSED then completes without RELEASED → STTError('...before RELEASED')."""
+    from agent import ptt
+
+    async def _press_only_events():
+        yield ptt.PTTEvent.PRESSED
+        # Generator returns after PRESSED; no RELEASED event ever fires.
+
+    _install_main_fakes(monkeypatch, _press_only_events)
+
+    # The safety-net timeout in wait_for is the SECOND line of defense
+    # for this test: the real proof is that STTError is raised. If the
+    # supervision were broken, the test would time out instead.
+    with pytest.raises(STTError, match="before RELEASED"):
+        await asyncio.wait_for(agent.stt._main(), timeout=1.0)
+
+
+async def test_main_chains_watcher_exception_via_cause(monkeypatch):
+    """Watcher raises after PRESSED → STTError with __cause__ identity-preserved."""
+    from agent import ptt
+
+    # Capture the raised instance so we can assert __cause__ IS this
+    # object (identity, not just type). Preetam's Tightening 3 spec.
+    sentinel_exc = RuntimeError("keyboard hook exploded")
+
+    async def _raising_events():
+        yield ptt.PTTEvent.PRESSED
+        raise sentinel_exc
+
+    _install_main_fakes(monkeypatch, _raising_events)
+
+    with pytest.raises(STTError) as exc_info:
+        await asyncio.wait_for(agent.stt._main(), timeout=1.0)
+    assert "before RELEASED" in str(exc_info.value)
+    # Identity check: same object, chained via `raise ... from exc`.
+    assert exc_info.value.__cause__ is sentinel_exc
+
+
+# ---------------------------------------------------------------------------
 # Bundle 27: Missing DEEPGRAM_API_KEY at construction → STTAuthError
 # ---------------------------------------------------------------------------
 #

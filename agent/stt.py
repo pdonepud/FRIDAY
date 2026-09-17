@@ -47,7 +47,7 @@ from collections.abc import AsyncIterator
 
 from deepgram import AsyncDeepgramClient
 from deepgram.core.api_error import ApiError
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from agent.audio import INPUT_SAMPLE_RATE
 
@@ -453,6 +453,12 @@ async def transcribe(chunks: AsyncIterator[bytes], ptt_release: asyncio.Event) -
                         _log.warning("stt: task %s raised during drain: %r", t.get_name(), e)
     except ApiError as e:
         raise _wrap_api_error(e) from e
+    except (OSError, TimeoutError, WebSocketException) as e:
+        # SDK 7.8.1's AsyncV2Client.connect (deepgram/listen/v2/client.py:306-321)
+        # only translates InvalidWebSocketStatus to ApiError; DNS, TCP, TLS,
+        # timeout, and other websockets-level failures escape as-is. Wrap
+        # them to keep the STTError contract intact.
+        raise STTError(f"connection failed: {e!r}") from e
 
 
 def _wrap_api_error(exc: ApiError) -> STTError:
@@ -484,8 +490,19 @@ async def _main() -> None:
     """Wire audio.capture + ptt.events + transcribe, print the transcript.
 
     _main is single-turn by design; multi-turn loop belongs to #53.
-    Waits for the first PRESSED before consuming any audio (Finding 6)
-    so nothing captured before the physical press can reach Deepgram.
+
+    Watcher supervision (round-3 Finding 2): the PTT event stream can
+    terminate before RELEASED (or before PRESSED) — cleanly or via an
+    exception. If we naïvely awaited ``press_seen.wait()`` or the
+    inner transcribe, we would hang forever in those cases. Both
+    phases are guarded by ``asyncio.wait({watcher_task, phase_task},
+    FIRST_COMPLETED)``: if the watcher terminates first with the phase
+    condition unfulfilled, raise ``STTError`` and chain the watcher's
+    exception via ``from`` when there was one.
+
+    Waits for the first PRESSED before consuming any audio (round-1
+    Finding 6) so nothing captured before the physical press can
+    reach Deepgram.
     """
     # Imports here (not at module top) so ``import agent.stt`` doesn't
     # transitively pull in ``sounddevice`` / ``pynput`` for callers
@@ -509,16 +526,82 @@ async def _main() -> None:
 
     watcher_task = asyncio.create_task(_ptt_watcher(), name="stt-main-watcher")
     try:
-        # Finding 6: do not start audio.capture() until PRESSED. No
-        # send_media call can reach Deepgram before the physical press.
-        await press_seen.wait()
-        transcript = await transcribe(audio.capture(), ptt_release)
+        # Phase A: wait for PRESSED or watcher termination, whichever
+        # comes first. Round-1 Finding 6: don't consume audio.capture()
+        # before the physical press.
+        press_wait = asyncio.create_task(press_seen.wait(), name="stt-main-press-wait")
+        try:
+            await asyncio.wait(
+                {watcher_task, press_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            if not press_wait.done():
+                press_wait.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await press_wait
+
+        if not press_seen.is_set():
+            # Watcher terminated before PRESSED. Chain its exception if any.
+            exc = watcher_task.exception() if watcher_task.done() else None
+            if exc is not None:
+                raise STTError("PTT watcher terminated before PRESSED") from exc
+            raise STTError("PTT watcher terminated before PRESSED")
+
+        # Phase B: transcribe alongside the watcher. If the watcher
+        # dies before setting ptt_release, transcribe would hang waiting
+        # for a release that never comes — cancel it and raise instead
+        # (Round-3 Finding 2). We do NOT let Flux's eot_timeout_ms fire
+        # as a fallback: 30 s hangs on every watcher-death defeat the
+        # purpose of the guard, and STTTimeout would misleadingly imply
+        # the server backstop when the input pipeline actually collapsed.
+        transcribe_task = asyncio.create_task(
+            transcribe(audio.capture(), ptt_release),
+            name="stt-main-transcribe",
+        )
+        await asyncio.wait(
+            {watcher_task, transcribe_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if watcher_task.done() and not ptt_release.is_set():
+            # Watcher finished (raise or clean return) without RELEASED.
+            exc = watcher_task.exception()
+            if not transcribe_task.done():
+                transcribe_task.cancel()
+                try:
+                    await transcribe_task
+                except asyncio.CancelledError:
+                    pass
+                except BaseException as e:  # noqa: BLE001
+                    _log.warning(
+                        "stt: task %s raised during post-error drain: %r",
+                        transcribe_task.get_name(),
+                        e,
+                    )
+            if exc is not None:
+                raise STTError("PTT watcher terminated before RELEASED") from exc
+            raise STTError("PTT watcher terminated before RELEASED")
+
+        # Happy path (or watcher-completed-cleanly-after-RELEASED): await
+        # transcribe to completion. Its own exceptions (STTAuthError,
+        # STTTimeout, STTForceEndTurnUnsupported, STTFatal, STTError)
+        # propagate unchanged.
+        transcript = await transcribe_task
         print(f"[stt] transcript: {transcript!r}")
     finally:
         if not watcher_task.done():
             watcher_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        try:
             await watcher_task
+        except asyncio.CancelledError:
+            pass
+        except BaseException as e:  # noqa: BLE001
+            _log.warning(
+                "stt: task %s raised during drain: %r",
+                watcher_task.get_name(),
+                e,
+            )
 
 
 if __name__ == "__main__":  # pragma: no cover
