@@ -1,15 +1,21 @@
 """Tests for the Deepgram Flux STT module (``agent.stt``).
 
-No test opens a real Deepgram websocket. ``AsyncDeepgramClient`` is
-mocked via ``monkeypatch`` — a fake client exposes a fake
-``.listen.v2.connect(**kwargs)`` that returns a scripted
-``FakeAsyncSocket``. Manual hardware verification lives in
-``python -m agent.stt``.
+No test opens a real Deepgram websocket. The SDK's typed union at
+listen.v2 does not include a Warning message (upstream issue
+https://github.com/deepgram/deepgram-python-sdk/issues/792), so
+production code iterates ``socket._websocket`` directly and dispatches
+on raw JSON. Test doubles match that shape: ``FakeAsyncSocket`` exposes
+a ``_websocket`` async-iterable that yields raw JSON strings, plus
+async ``send_media`` / ``send_force_end_turn`` methods that record
+call order into ``call_order`` for send-ordering assertions.
+
+Manual hardware verification lives in ``python -m agent.stt``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator
 from inspect import iscoroutinefunction
@@ -17,8 +23,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from deepgram.core.api_error import ApiError
-from deepgram.listen.v2.types.listen_v2fatal_error import ListenV2FatalError
-from deepgram.listen.v2.types.listen_v2turn_info import ListenV2TurnInfo
+from websockets.exceptions import ConnectionClosed
 
 import agent.stt
 from agent.stt import (
@@ -41,88 +46,172 @@ from agent.stt import (
 # ---------------------------------------------------------------------------
 
 
-def _turn_info(event: str, transcript: str = "", trigger: str | None = None) -> ListenV2TurnInfo:
-    """Build a real ListenV2TurnInfo via pydantic construction."""
-    return ListenV2TurnInfo(
-        request_id="test-req",
-        sequence_id=1,
-        event=event,
-        turn_index=0,
-        audio_window_start=0.0,
-        audio_window_end=1.0,
-        transcript=transcript,
-        words=[],
-        end_of_turn_confidence=0.9,
-        trigger=trigger,
+def _turn_info_end_of_turn(transcript: str = "", trigger: str | None = "manual") -> str:
+    """Build a raw JSON string for a TurnInfo/EndOfTurn message."""
+    return json.dumps(
+        {
+            "type": "TurnInfo",
+            "request_id": "test-req",
+            "sequence_id": 1,
+            "event": "EndOfTurn",
+            "turn_index": 0,
+            "audio_window_start": 0.0,
+            "audio_window_end": 1.0,
+            "transcript": transcript,
+            "words": [],
+            "end_of_turn_confidence": 0.9,
+            "trigger": trigger,
+        }
     )
 
 
-def _fatal_error() -> ListenV2FatalError:
-    """Build a real ListenV2FatalError. Fields per the SDK model."""
-    return ListenV2FatalError(
-        sequence_id=1,
-        code="INTERNAL_SERVER_ERROR",
-        description="test",
+def _turn_info_update(event: str) -> str:
+    """Build a raw JSON string for a non-terminal TurnInfo event (Update / StartOfTurn)."""
+    return json.dumps(
+        {
+            "type": "TurnInfo",
+            "request_id": "test-req",
+            "sequence_id": 1,
+            "event": event,
+            "turn_index": 0,
+            "audio_window_start": 0.0,
+            "audio_window_end": 0.1,
+            "transcript": "",
+            "words": [],
+            "end_of_turn_confidence": 0.1,
+        }
     )
 
 
-class FakeAsyncSocket:
-    """Test double for ``deepgram.listen.v2.socket_client.AsyncV2SocketClient``.
+def _warning(code: str, description: str = "test") -> str:
+    """Build a raw JSON string for a Warning message (SDK doesn't type these)."""
+    return json.dumps(
+        {
+            "type": "Warning",
+            "request_id": "test-req",
+            "sequence_id": 1,
+            "code": code,
+            "description": description,
+        }
+    )
 
-    - ``send_media`` / ``send_force_end_turn`` record call order into
-      ``call_order`` for send-ordering assertions.
-    - ``__aiter__`` yields scripted messages, then blocks on
-      ``_release_iter`` until the surrounding task is cancelled or a
-      ``force_end_release`` sentinel is provided.
-    - A message that is an ``Exception`` instance is raised at that
-      position in the iteration (models ConnectionClosed mid-stream).
+
+def _fatal(code: str, description: str = "test") -> str:
+    """Build a raw JSON string for a FatalError message."""
+    return json.dumps(
+        {
+            "type": "Error",
+            "request_id": "test-req",
+            "sequence_id": 1,
+            "code": code,
+            "description": description,
+        }
+    )
+
+
+class _FakeWebSocket:
+    """Test double for ``websockets.legacy.client.WebSocketClientProtocol``.
+
+    Async-iterable over a scripted sequence of raw JSON strings. Each
+    entry may also be a ``BaseException`` instance to raise at that
+    position (models ``ConnectionClosed`` mid-stream). After the
+    scripted messages exhaust, blocks on an ``asyncio.Event`` unless
+    ``exhaust_after_messages=True`` — in which case it returns normally
+    (models the socket-closed-without-terminal path).
+
+    An optional ``yield_after_force_end`` list is delivered only after
+    the surrounding ``FakeAsyncSocket.send_force_end_turn`` has fired,
+    so tests can script "server responds to our ForceEndTurn."
     """
 
     def __init__(
         self,
-        messages: list | None = None,
-        *,
-        raise_on_force_end_turn: BaseException | None = None,
-        yield_after_force_end_turn: list | None = None,
+        pre_messages: list | None = None,
+        post_force_end: list | None = None,
+        exhaust_after_messages: bool = False,
+        force_end_seen: asyncio.Event | None = None,
     ):
-        self._messages = list(messages or [])
-        self._raise_on_force_end_turn = raise_on_force_end_turn
-        self._post_force_end_turn = list(yield_after_force_end_turn or [])
-        self._force_end_turn_seen = asyncio.Event()
-        self._release_iter = asyncio.Event()  # never set unless the test wants termination
+        self._pre = list(pre_messages or [])
+        self._post = list(post_force_end or [])
+        self._exhaust = exhaust_after_messages
+        self._force_end_seen = force_end_seen
+        self._hang = asyncio.Event()
+
+    def __aiter__(self):
+        return self._iter()
+
+    async def _iter(self):
+        for m in self._pre:
+            if isinstance(m, BaseException):
+                raise m
+            yield m
+        if self._post:
+            if self._force_end_seen is not None:
+                await self._force_end_seen.wait()
+            for m in self._post:
+                if isinstance(m, BaseException):
+                    raise m
+                yield m
+        if self._exhaust:
+            return
+        # Block until the receive task is cancelled (or a test sets _hang).
+        await self._hang.wait()
+
+
+class FakeAsyncSocket:
+    """Test double for ``AsyncV2SocketClient``.
+
+    Exposes ``_websocket`` (matching the private-but-stable name our
+    ``_receive`` iterates) plus ``send_media`` / ``send_force_end_turn``
+    that record call order. The private-name convention here is
+    intentional: production code touches ``socket._websocket`` and the
+    tests must match to exercise that path.
+    """
+
+    def __init__(
+        self,
+        pre_messages: list | None = None,
+        post_force_end: list | None = None,
+        exhaust_after_messages: bool = False,
+        raise_on_force_end: BaseException | None = None,
+        omit_websocket_attr: bool = False,
+    ):
+        self._raise_on_force_end = raise_on_force_end
         self.call_order: list[tuple] = []
         self.send_media_calls: list[bytes] = []
         self.force_end_turn_count = 0
+        self.force_end_seen = asyncio.Event()
+        self._pump_task_done_at_force_end: bool | None = None
+        if not omit_websocket_attr:
+            self._websocket = _FakeWebSocket(
+                pre_messages=pre_messages,
+                post_force_end=post_force_end,
+                exhaust_after_messages=exhaust_after_messages,
+                force_end_seen=self.force_end_seen,
+            )
 
     async def send_media(self, chunk: bytes) -> None:
         self.call_order.append(("send_media", chunk))
         self.send_media_calls.append(chunk)
 
     async def send_force_end_turn(self, message=None) -> None:
+        # Tightening 2: record whether the pump task had reached done()
+        # by the time send_force_end_turn was actually called. Set from
+        # outside via observe_pump_at_force_end so we can prove the
+        # cancel-and-await completed before this send happened.
+        if self._observed_pump_task is not None:
+            self._pump_task_done_at_force_end = self._observed_pump_task.done()
         self.call_order.append(("send_force_end_turn",))
         self.force_end_turn_count += 1
-        self._force_end_turn_seen.set()
-        if self._raise_on_force_end_turn is not None:
-            raise self._raise_on_force_end_turn
+        self.force_end_seen.set()
+        if self._raise_on_force_end is not None:
+            raise self._raise_on_force_end
 
-    def __aiter__(self):
-        return self._iter()
+    _observed_pump_task: asyncio.Task | None = None
 
-    async def _iter(self):
-        for msg in self._messages:
-            if isinstance(msg, BaseException):
-                raise msg
-            yield msg
-        # If the test wants extra messages after ForceEndTurn fires,
-        # wait for it and yield them.
-        if self._post_force_end_turn:
-            await self._force_end_turn_seen.wait()
-            for msg in self._post_force_end_turn:
-                if isinstance(msg, BaseException):
-                    raise msg
-                yield msg
-        # Otherwise block until cancelled.
-        await self._release_iter.wait()
+    def observe_pump_at_force_end(self, task: asyncio.Task) -> None:
+        """Register a pump task whose ``.done()`` will be captured at force-end call time."""
+        self._observed_pump_task = task
 
 
 class FakeConnectCM:
@@ -143,10 +232,10 @@ class FakeConnectCM:
         return None
 
 
-def _install_fake_client(monkeypatch, socket: FakeAsyncSocket) -> FakeConnectCM:
-    """Wire up ``_get_client`` to return a client whose ``listen.v2.connect``
-    yields ``socket`` inside a ``FakeConnectCM``. Returns the CM instance
-    so tests can inspect ``entered`` / ``exited`` / ``kwargs``.
+def _install_fake_client(monkeypatch, socket: FakeAsyncSocket) -> MagicMock:
+    """Wire ``_get_client`` to return a client whose ``listen.v2.connect``
+    yields ``socket`` inside a ``FakeConnectCM``. Returns a proxy whose
+    ``_holder`` attribute lists the created CMs in order.
     """
     cm_holder: list[FakeConnectCM] = []
 
@@ -160,12 +249,9 @@ def _install_fake_client(monkeypatch, socket: FakeAsyncSocket) -> FakeConnectCM:
 
     monkeypatch.setattr(agent.stt, "_client", None)
     monkeypatch.setattr(agent.stt, "_get_client", lambda: fake_client)
-    # Return a proxy that lazily reads the created CM.
     proxy = MagicMock()
-    proxy.cm = property(lambda _: cm_holder[-1] if cm_holder else None)
-    # A property on a MagicMock is awkward; just expose the holder.
     proxy._holder = cm_holder
-    return proxy  # tests: proxy._holder[-1] gives the created CM
+    return proxy
 
 
 async def _chunks_from(items: list[bytes]) -> AsyncIterator[bytes]:
@@ -198,13 +284,11 @@ def test_config_constants():
 
 
 def test_get_client_is_lazy(monkeypatch):
-    """Module import must not touch AsyncDeepgramClient."""
     monkeypatch.setattr(agent.stt, "_client", None)
     assert agent.stt._client is None
 
 
 def test_get_client_caches_instance(monkeypatch):
-    """Repeated _get_client() calls return the same instance."""
     monkeypatch.setattr(agent.stt, "_client", None)
     fake_client = MagicMock(name="AsyncDeepgramClient()")
     fake_ctor = MagicMock(return_value=fake_client)
@@ -227,17 +311,15 @@ def test_transcribe_is_coroutine_function():
 
 
 # ---------------------------------------------------------------------------
-# Bundle 5: happy path + send-ordering assertion
+# Bundle 5: happy path + send ordering
 # ---------------------------------------------------------------------------
 
 
 async def test_happy_path_returns_transcript_and_orders_sends(monkeypatch):
-    """All send_media calls precede the single send_force_end_turn call."""
     socket = FakeAsyncSocket(
-        messages=[],
-        yield_after_force_end_turn=[
-            _turn_info("StartOfTurn"),
-            _turn_info("EndOfTurn", transcript="hello world", trigger="manual"),
+        post_force_end=[
+            _turn_info_update("StartOfTurn"),
+            _turn_info_end_of_turn(transcript="hello world", trigger="manual"),
         ],
     )
     _install_fake_client(monkeypatch, socket)
@@ -245,40 +327,31 @@ async def test_happy_path_returns_transcript_and_orders_sends(monkeypatch):
     ptt_release = asyncio.Event()
     chunks_payload = [b"AAA", b"BBB", b"CCC"]
 
-    async def _run():
-        return await transcribe(_chunks_from(chunks_payload), ptt_release)
-
-    task = asyncio.create_task(_run())
-    # Let pump send its chunks and receive begin waiting.
+    task = asyncio.create_task(transcribe(_chunks_from(chunks_payload), ptt_release))
     await asyncio.sleep(0.05)
-    # User releases PTT.
     ptt_release.set()
 
     transcript = await asyncio.wait_for(task, timeout=1.0)
     assert transcript == "hello world"
 
-    # Send ordering: every send_media entry precedes the send_force_end_turn.
-    force_index = [i for i, c in enumerate(socket.call_order) if c[0] == "send_force_end_turn"]
-    assert len(force_index) == 1, "ForceEndTurn must be sent exactly once"
-    force_at = force_index[0]
+    force_at = [i for i, c in enumerate(socket.call_order) if c[0] == "send_force_end_turn"]
+    assert len(force_at) == 1
     media_indices = [i for i, c in enumerate(socket.call_order) if c[0] == "send_media"]
-    assert media_indices, "send_media must have been called at least once"
-    assert all(i < force_at for i in media_indices), (
-        f"all send_media calls must precede send_force_end_turn: {socket.call_order}"
+    assert media_indices, "send_media must have been called"
+    assert all(i < force_at[0] for i in media_indices), (
+        f"send_media must precede send_force_end_turn: {socket.call_order}"
     )
     assert socket.send_media_calls == chunks_payload
 
 
 # ---------------------------------------------------------------------------
-# Bundle 6: config kwargs forwarded to connect()
+# Bundle 6: config kwargs forwarded
 # ---------------------------------------------------------------------------
 
 
 async def test_connect_kwargs_forwarded(monkeypatch):
     socket = FakeAsyncSocket(
-        yield_after_force_end_turn=[
-            _turn_info("EndOfTurn", transcript="ok", trigger="manual"),
-        ],
+        post_force_end=[_turn_info_end_of_turn(transcript="ok", trigger="manual")]
     )
     proxy = _install_fake_client(monkeypatch, socket)
 
@@ -301,15 +374,13 @@ async def test_connect_kwargs_forwarded(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Bundle 7: trigger == "timeout" → STTTimeout(partial=...)
+# Bundle 7-9: EndOfTurn trigger dispatch
 # ---------------------------------------------------------------------------
 
 
 async def test_trigger_timeout_raises_STTTimeout_with_partial(monkeypatch):
     socket = FakeAsyncSocket(
-        yield_after_force_end_turn=[
-            _turn_info("EndOfTurn", transcript="half a sentence", trigger="timeout"),
-        ],
+        post_force_end=[_turn_info_end_of_turn(transcript="half a sentence", trigger="timeout")]
     )
     _install_fake_client(monkeypatch, socket)
 
@@ -323,17 +394,10 @@ async def test_trigger_timeout_raises_STTTimeout_with_partial(monkeypatch):
     assert exc_info.value.partial == "half a sentence"
 
 
-# ---------------------------------------------------------------------------
-# Bundle 8: trigger == "model" → returns transcript, logs warning
-# ---------------------------------------------------------------------------
-
-
 async def test_trigger_model_returns_transcript_with_warning(monkeypatch, caplog):
     caplog.set_level(logging.WARNING, logger="agent.stt")
     socket = FakeAsyncSocket(
-        yield_after_force_end_turn=[
-            _turn_info("EndOfTurn", transcript="something", trigger="model"),
-        ],
+        post_force_end=[_turn_info_end_of_turn(transcript="something", trigger="model")]
     )
     _install_fake_client(monkeypatch, socket)
 
@@ -344,21 +408,13 @@ async def test_trigger_model_returns_transcript_with_warning(monkeypatch, caplog
 
     transcript = await asyncio.wait_for(task, timeout=1.0)
     assert transcript == "something"
-    warnings = [r for r in caplog.records if "trigger='model'" in r.getMessage()]
-    assert warnings, f"expected trigger='model' warning, got {caplog.records}"
-
-
-# ---------------------------------------------------------------------------
-# Bundle 9: trigger unknown → returns transcript, logs warning
-# ---------------------------------------------------------------------------
+    assert any("trigger='model'" in r.getMessage() for r in caplog.records)
 
 
 async def test_trigger_unknown_returns_transcript_with_warning(monkeypatch, caplog):
     caplog.set_level(logging.WARNING, logger="agent.stt")
     socket = FakeAsyncSocket(
-        yield_after_force_end_turn=[
-            _turn_info("EndOfTurn", transcript="mystery", trigger="brand-new-trigger"),
-        ],
+        post_force_end=[_turn_info_end_of_turn(transcript="mystery", trigger="brand-new-trigger")]
     )
     _install_fake_client(monkeypatch, socket)
 
@@ -369,22 +425,22 @@ async def test_trigger_unknown_returns_transcript_with_warning(monkeypatch, capl
 
     transcript = await asyncio.wait_for(task, timeout=1.0)
     assert transcript == "mystery"
-    warnings = [r for r in caplog.records if "unknown trigger" in r.getMessage()]
-    assert warnings, f"expected unknown-trigger warning, got {caplog.records}"
+    assert any("unknown trigger" in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
-# Bundle 10: FatalError → STTFatal
+# Bundle 10: FatalError with non-UNPARSABLE code → STTFatal
 # ---------------------------------------------------------------------------
 
 
-async def test_fatal_error_raises_STTFatal(monkeypatch):
-    socket = FakeAsyncSocket(messages=[_fatal_error()])
+async def test_fatal_error_generic_code_raises_STTFatal(monkeypatch):
+    socket = FakeAsyncSocket(pre_messages=[_fatal("INTERNAL_SERVER_ERROR", "boom")])
     _install_fake_client(monkeypatch, socket)
 
     ptt_release = asyncio.Event()
-    with pytest.raises(STTFatal):
+    with pytest.raises(STTFatal) as exc_info:
         await asyncio.wait_for(transcribe(_empty_chunks(), ptt_release), timeout=1.0)
+    assert "INTERNAL_SERVER_ERROR" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -393,29 +449,34 @@ async def test_fatal_error_raises_STTFatal(monkeypatch):
 
 
 async def test_connection_closed_mid_stream_raises_STTError(monkeypatch):
-    class _FakeConnectionClosed(Exception):
-        pass
+    # ConnectionClosed's constructor differs across websockets versions;
+    # a subclass with a null-op __init__ sidesteps that.
+    class _ClosedNow(ConnectionClosed):
+        def __init__(self):  # type: ignore[no-untyped-def]
+            Exception.__init__(self, "simulated close")
 
-    socket = FakeAsyncSocket(messages=[_FakeConnectionClosed("simulated close")])
+    socket = FakeAsyncSocket(pre_messages=[_ClosedNow()])
     _install_fake_client(monkeypatch, socket)
 
     ptt_release = asyncio.Event()
     with pytest.raises(STTError) as exc_info:
         await asyncio.wait_for(transcribe(_empty_chunks(), ptt_release), timeout=1.0)
-    # Not a more-specific STT subtype:
     assert type(exc_info.value) is STTError
-    assert "receive loop failed" in str(exc_info.value)
+    assert "connection closed" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
-# Bundle 12: ForceEndTurn unsupported → STTForceEndTurnUnsupported
+# Bundle 12 (split): send_force_end_turn raising → STTError (generic transport)
 # ---------------------------------------------------------------------------
 
 
-async def test_force_end_turn_unsupported_raises(monkeypatch):
-    socket = FakeAsyncSocket(
-        raise_on_force_end_turn=RuntimeError("UNPARSABLE_CLIENT_MESSAGE"),
-    )
+async def test_send_force_end_turn_raising_maps_to_STTError(monkeypatch):
+    """send-side transport failures do NOT map to STTForceEndTurnUnsupported.
+
+    Rejection surfaces as a server-sent FatalError on the receive path;
+    a send-side raise is generic connection trouble.
+    """
+    socket = FakeAsyncSocket(raise_on_force_end=RuntimeError("send exploded"))
     _install_fake_client(monkeypatch, socket)
 
     ptt_release = asyncio.Event()
@@ -423,8 +484,10 @@ async def test_force_end_turn_unsupported_raises(monkeypatch):
     await asyncio.sleep(0.02)
     ptt_release.set()
 
-    with pytest.raises(STTForceEndTurnUnsupported):
+    with pytest.raises(STTError) as exc_info:
         await asyncio.wait_for(task, timeout=1.0)
+    assert type(exc_info.value) is STTError
+    assert "ForceEndTurn send failed" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -448,13 +511,12 @@ async def test_chunks_iterator_raises_wraps_to_STTError(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Bundle 14a: cancellation cleanup mid-stream
+# Bundle 14a: cancellation mid-stream closes socket
 # ---------------------------------------------------------------------------
 
 
 async def test_cancellation_mid_stream_closes_socket(monkeypatch):
-    """Cancel transcribe after chunks have started; socket __aexit__ must run."""
-    socket = FakeAsyncSocket()  # no scripted messages; hangs
+    socket = FakeAsyncSocket()
     proxy = _install_fake_client(monkeypatch, socket)
 
     ptt_release = asyncio.Event()
@@ -465,7 +527,7 @@ async def test_cancellation_mid_stream_closes_socket(monkeypatch):
             await asyncio.sleep(0.001)
 
     task = asyncio.create_task(transcribe(_long_chunks(), ptt_release))
-    await asyncio.sleep(0.05)  # let pump run and receive enter its loop
+    await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -476,20 +538,16 @@ async def test_cancellation_mid_stream_closes_socket(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Bundle 14b: cancellation on the totally-idle path — cancel before any
-# task has resolved the future. Catches socket-leak regressions.
+# Bundle 14b: cancellation on the totally-idle path
 # ---------------------------------------------------------------------------
 
 
 async def test_cancellation_before_any_task_resolves(monkeypatch):
-    socket = FakeAsyncSocket()  # no messages, no send activity
+    socket = FakeAsyncSocket()
     proxy = _install_fake_client(monkeypatch, socket)
 
     ptt_release = asyncio.Event()
     task = asyncio.create_task(transcribe(_empty_chunks(), ptt_release))
-    # Let transcribe enter the async-with, spawn the three tasks, and
-    # begin awaiting done_future — but don't set ptt_release or feed
-    # chunks. Nothing resolves the future.
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
@@ -499,87 +557,79 @@ async def test_cancellation_before_any_task_resolves(monkeypatch):
 
     cm = proxy._holder[-1]
     assert cm.entered is True
-    assert cm.exited is True, "socket context manager must exit on idle cancel"
+    assert cm.exited is True
 
 
 # ---------------------------------------------------------------------------
-# Bundle 15: receive timeout guard fires when nothing arrives
+# Bundle 15: receive watchdog fires ONLY after force_end_sent
 # ---------------------------------------------------------------------------
 
 
-async def test_receive_timeout_guard_fires(monkeypatch):
+async def test_receive_watchdog_fires_only_after_force_end(monkeypatch):
     monkeypatch.setattr(agent.stt, "RECEIVE_TIMEOUT_S", 0.05)
-    socket = FakeAsyncSocket()  # no messages, receive hangs
+    # Socket never yields EndOfTurn — post_force_end is empty, iter hangs.
+    socket = FakeAsyncSocket()
     _install_fake_client(monkeypatch, socket)
 
     ptt_release = asyncio.Event()
+    task = asyncio.create_task(transcribe(_empty_chunks(), ptt_release))
+    # Sit here well past RECEIVE_TIMEOUT_S with ptt_release NOT set —
+    # watchdog must not fire because force_end_sent hasn't been set.
+    await asyncio.sleep(0.2)
+    assert not task.done(), "watchdog fired before ForceEndTurn was sent"
+
+    # Now release; ForceEndTurn is sent, watchdog arms, fires 0.05s later.
+    ptt_release.set()
     with pytest.raises(STTError, match="no EndOfTurn within"):
-        await asyncio.wait_for(transcribe(_empty_chunks(), ptt_release), timeout=1.0)
+        await asyncio.wait_for(task, timeout=1.0)
 
 
 # ---------------------------------------------------------------------------
-# Bundle 16: ptt_release already set at entry, with EMPTY chunks
-# → send_force_end_turn precedes any send_media (trivially, since there
-# is no send_media). Deterministic ordering guarantee.
+# Bundle 16: ptt_release pre-set — Warning FORCE_END_TURN_NO_ACTIVE_TURN → ""
 # ---------------------------------------------------------------------------
 
 
-async def test_pre_set_ptt_release_empty_chunks_ordering(monkeypatch):
+async def test_pre_set_ptt_release_returns_empty_on_no_active_turn(monkeypatch):
     socket = FakeAsyncSocket(
-        yield_after_force_end_turn=[
-            _turn_info("EndOfTurn", transcript="", trigger="manual"),
-        ],
+        post_force_end=[_warning("FORCE_END_TURN_NO_ACTIVE_TURN", "no active turn")]
     )
     _install_fake_client(monkeypatch, socket)
 
     ptt_release = asyncio.Event()
-    ptt_release.set()  # already set at call time
+    ptt_release.set()
 
     transcript = await asyncio.wait_for(transcribe(_empty_chunks(), ptt_release), timeout=1.0)
     assert transcript == ""
 
-    # Deterministic: no send_media calls, exactly one send_force_end_turn.
-    assert socket.send_media_calls == []
-    assert socket.force_end_turn_count == 1
-    assert socket.call_order == [("send_force_end_turn",)]
-
 
 # ---------------------------------------------------------------------------
-# Bundle 17: ptt_release pre-set with NON-EMPTY chunks — no ordering claim,
-# just that the pipeline completes cleanly.
+# Bundle 17: ptt_release pre-set with chunks — clean return, no ordering claim
 # ---------------------------------------------------------------------------
 
 
 async def test_pre_set_ptt_release_with_chunks_returns_cleanly(monkeypatch):
     socket = FakeAsyncSocket(
-        yield_after_force_end_turn=[
-            _turn_info("EndOfTurn", transcript="done", trigger="manual"),
-        ],
+        post_force_end=[_turn_info_end_of_turn(transcript="done", trigger="manual")]
     )
     _install_fake_client(monkeypatch, socket)
 
     ptt_release = asyncio.Event()
-    ptt_release.set()  # already set at call time; race with pump is expected
+    ptt_release.set()
 
     transcript = await asyncio.wait_for(
-        transcribe(_chunks_from([b"AAA", b"BBB"]), ptt_release),
-        timeout=1.0,
+        transcribe(_chunks_from([b"AAA", b"BBB"]), ptt_release), timeout=1.0
     )
     assert transcript == "done"
-    # No ordering claim here — pre-set release racing with pump is the
-    # documented (defensive) contract, not a guarantee.
 
 
 # ---------------------------------------------------------------------------
-# Bundle 18: empty transcript from EndOfTurn/manual is a valid outcome
+# Bundle 18: empty transcript from EndOfTurn/manual → clean return
 # ---------------------------------------------------------------------------
 
 
 async def test_empty_transcript_returns_empty_string(monkeypatch):
     socket = FakeAsyncSocket(
-        yield_after_force_end_turn=[
-            _turn_info("EndOfTurn", transcript="", trigger="manual"),
-        ],
+        post_force_end=[_turn_info_end_of_turn(transcript="", trigger="manual")]
     )
     _install_fake_client(monkeypatch, socket)
 
@@ -593,31 +643,27 @@ async def test_empty_transcript_returns_empty_string(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Bundle 19: _main dispatch wiring
+# Bundle 19: _main wiring
 # ---------------------------------------------------------------------------
 
 
 async def test_main_wires_audio_ptt_and_transcribe(monkeypatch, capsys):
-    """_main pulls capture(), watches for PRESSED/RELEASED, calls transcribe."""
     from agent import ptt
 
     async def _fake_capture():
-        # Never yields; _main's transcribe would await forever without ptt.
         while True:
             await asyncio.sleep(0.01)
             yield b"\x00" * 640
 
     async def _fake_events():
         yield ptt.PTTEvent.PRESSED
+        await asyncio.sleep(0)
         yield ptt.PTTEvent.RELEASED
 
     async def _fake_transcribe(chunks, ptt_release):
-        # Realistic behavior: wait for the PTT release before returning.
-        # The watcher task races us; asserting is_set() at entry is racy.
         await asyncio.wait_for(ptt_release.wait(), timeout=1.0)
         return "hello from stt"
 
-    # Patch inside _main's imports via the module attribute path.
     import agent.audio as _audio_mod
     import agent.ptt as _ptt_mod
 
@@ -632,13 +678,11 @@ async def test_main_wires_audio_ptt_and_transcribe(monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
-# Bundle 20: ApiError with status 401 → STTAuthError (bonus wrap check)
+# Bundle 20: ApiError 401 → STTAuthError
 # ---------------------------------------------------------------------------
 
 
 async def test_api_error_401_becomes_STTAuthError(monkeypatch):
-    """401 from Deepgram's ApiError should surface as STTAuthError."""
-
     def _bad_connect(**kwargs):
         raise ApiError(status_code=401, body="invalid credentials")
 
@@ -650,3 +694,297 @@ async def test_api_error_401_becomes_STTAuthError(monkeypatch):
     ptt_release = asyncio.Event()
     with pytest.raises(STTAuthError):
         await asyncio.wait_for(transcribe(_empty_chunks(), ptt_release), timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Bundle 21: UNPARSABLE_CLIENT_MESSAGE fatal → STTForceEndTurnUnsupported
+# ---------------------------------------------------------------------------
+
+
+async def test_unparsable_client_message_maps_to_force_end_unsupported(monkeypatch):
+    socket = FakeAsyncSocket(
+        post_force_end=[
+            _fatal(
+                "UNPARSABLE_CLIENT_MESSAGE",
+                "The ForceEndTurn message is not enabled on this deployment.",
+            )
+        ]
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    task = asyncio.create_task(transcribe(_empty_chunks(), ptt_release))
+    await asyncio.sleep(0.02)
+    ptt_release.set()
+
+    with pytest.raises(STTForceEndTurnUnsupported):
+        await asyncio.wait_for(task, timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Bundle 22: post-release chunks — pump cancelled and awaited before ForceEndTurn
+# ---------------------------------------------------------------------------
+
+
+async def test_post_release_chunks_not_sent_and_pump_done_before_force_end(monkeypatch):
+    """Cancel-and-await pump completes BEFORE send_force_end_turn runs.
+
+    Ordering-only assertion isn't strong enough (Tightening 2): the fake
+    captures ``pump_task.done()`` at the moment ``send_force_end_turn``
+    is called and asserts it's True. Also verifies no send_media entry
+    appears after the single send_force_end_turn entry in call_order.
+    """
+    socket = FakeAsyncSocket(
+        post_force_end=[_turn_info_end_of_turn(transcript="ok", trigger="manual")]
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+
+    async def _long_chunks() -> AsyncIterator[bytes]:
+        # 20 chunks with small awaits so cancellation has a real await
+        # point to inject at.
+        for i in range(20):
+            yield bytes([i]) * 8
+            await asyncio.sleep(0.005)
+
+    # Wire the fake to observe the pump task at force-end call time.
+    async def _run() -> str:
+        # Reach into transcribe's task construction via monkeypatch: we
+        # need the actual pump task instance created inside transcribe.
+        # Easiest hook: patch asyncio.create_task once and grab the
+        # pump task by name.
+        return await transcribe(_long_chunks(), ptt_release)
+
+    captured_pump: list[asyncio.Task] = []
+    real_create_task = asyncio.create_task
+
+    def _wrapped_create_task(coro, *args, **kwargs):
+        t = real_create_task(coro, *args, **kwargs)
+        if kwargs.get("name") == "stt-pump":
+            captured_pump.append(t)
+            socket.observe_pump_at_force_end(t)
+        return t
+
+    monkeypatch.setattr(asyncio, "create_task", _wrapped_create_task)
+
+    task = asyncio.create_task(_run())
+    await asyncio.sleep(0.03)  # let some chunks flow
+    ptt_release.set()
+
+    transcript = await asyncio.wait_for(task, timeout=1.0)
+    assert transcript == "ok"
+
+    # Ordering: single send_force_end_turn, and no send_media after it.
+    force_at = [i for i, c in enumerate(socket.call_order) if c[0] == "send_force_end_turn"]
+    assert len(force_at) == 1
+    media_after_force = [
+        i for i, c in enumerate(socket.call_order) if c[0] == "send_media" and i > force_at[0]
+    ]
+    assert media_after_force == [], (
+        f"send_media call recorded after send_force_end_turn: {socket.call_order}"
+    )
+
+    # Tightening 2: pump task was done() at the moment force_end_turn was
+    # dispatched, not merely cancelled but still pending.
+    assert captured_pump, "did not capture the stt-pump task"
+    assert socket._pump_task_done_at_force_end is True, (
+        "pump_task.done() was False when send_force_end_turn was called — "
+        "cancel-and-await did not complete before the send"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bundle 23: long turn stays alive past RECEIVE_TIMEOUT_S while active
+# ---------------------------------------------------------------------------
+
+
+async def test_long_active_turn_stays_alive_past_watchdog(monkeypatch):
+    """Watchdog does not arm while the turn is active (Tightening 3: no wall clock).
+
+    Drives the receive loop with ``asyncio.sleep(0)`` yields between many
+    Update messages, then only after N updates completes with EndOfTurn.
+    Timing-independent: even with ``RECEIVE_TIMEOUT_S`` monkeypatched
+    small, the watchdog stays disarmed because ``force_end_sent`` never
+    fires until ``ptt_release`` is set.
+    """
+    monkeypatch.setattr(agent.stt, "RECEIVE_TIMEOUT_S", 0.01)
+
+    # Stream a StartOfTurn plus many Updates before any release. Fake
+    # cooperates by yielding as fast as the receive loop consumes.
+    pre = [_turn_info_update("StartOfTurn")] + [_turn_info_update("Update") for _ in range(50)]
+    socket = FakeAsyncSocket(
+        pre_messages=pre,
+        post_force_end=[_turn_info_end_of_turn(transcript="final", trigger="manual")],
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    task = asyncio.create_task(transcribe(_empty_chunks(), ptt_release))
+
+    # Give the receive loop many event-loop turns to consume the 51
+    # non-terminal messages. If the watchdog were armed pre-release
+    # with the 0.01s timeout, transcribe would already have failed.
+    for _ in range(200):
+        await asyncio.sleep(0)
+    assert not task.done(), (
+        "watchdog fired during an active turn — it must only arm after force_end_sent"
+    )
+
+    ptt_release.set()
+    transcript = await asyncio.wait_for(task, timeout=1.0)
+    assert transcript == "final"
+
+
+# ---------------------------------------------------------------------------
+# Bundle 24: socket close without terminal → STTError
+# ---------------------------------------------------------------------------
+
+
+async def test_socket_close_without_terminal_raises(monkeypatch):
+    """Iterator ends normally with no EndOfTurn/FatalError/Warning-terminal."""
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_update("StartOfTurn"),
+            _turn_info_update("Update"),
+        ],
+        exhaust_after_messages=True,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    with pytest.raises(STTError, match="socket closed without EndOfTurn"):
+        await asyncio.wait_for(transcribe(_empty_chunks(), ptt_release), timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Bundle 25a: SDK _websocket attribute missing → STTError (pin-mismatch guard)
+# ---------------------------------------------------------------------------
+
+
+async def test_missing_websocket_attribute_raises_STTError(monkeypatch):
+    """The ``hasattr(socket, "_websocket")`` guard fires cleanly."""
+    socket = FakeAsyncSocket(omit_websocket_attr=True)
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    with pytest.raises(STTError, match="socket._websocket"):
+        await asyncio.wait_for(transcribe(_empty_chunks(), ptt_release), timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Bundle 25b: Warning with unrecognized code → log + continue
+# ---------------------------------------------------------------------------
+
+
+async def test_unrecognized_warning_logs_and_continues(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="agent.stt")
+    socket = FakeAsyncSocket(
+        pre_messages=[_warning("SOME_UNRELATED_CODE", "just a warning")],
+        post_force_end=[_turn_info_end_of_turn(transcript="after", trigger="manual")],
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    task = asyncio.create_task(transcribe(_empty_chunks(), ptt_release))
+    await asyncio.sleep(0.02)
+    ptt_release.set()
+
+    transcript = await asyncio.wait_for(task, timeout=1.0)
+    assert transcript == "after"
+    assert any("SOME_UNRELATED_CODE" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Bundle 25c: ApiError non-401 → generic STTError
+# ---------------------------------------------------------------------------
+
+
+async def test_api_error_non_401_becomes_generic_STTError(monkeypatch):
+    def _bad_connect(**kwargs):
+        raise ApiError(status_code=500, body="server melted")
+
+    fake_client = MagicMock()
+    fake_client.listen.v2.connect.side_effect = _bad_connect
+    monkeypatch.setattr(agent.stt, "_client", None)
+    monkeypatch.setattr(agent.stt, "_get_client", lambda: fake_client)
+
+    ptt_release = asyncio.Event()
+    with pytest.raises(STTError) as exc_info:
+        await asyncio.wait_for(transcribe(_empty_chunks(), ptt_release), timeout=1.0)
+    # NOT the auth subclass; the generic bucket.
+    assert type(exc_info.value) is STTError
+    assert not isinstance(exc_info.value, STTAuthError)
+    assert "status=500" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Bundle 25d: chunks source raises STTError → propagates with original identity
+# ---------------------------------------------------------------------------
+
+
+async def test_chunks_raising_STTError_preserves_identity(monkeypatch):
+    """An STTError raised inside chunks propagates as-is, not wrapped."""
+    socket = FakeAsyncSocket()
+    _install_fake_client(monkeypatch, socket)
+
+    class _CustomSTT(STTError):
+        pass
+
+    async def _stt_chunks() -> AsyncIterator[bytes]:
+        yield b"AAA"
+        raise _CustomSTT("preserve me")
+
+    ptt_release = asyncio.Event()
+    with pytest.raises(_CustomSTT, match="preserve me"):
+        await asyncio.wait_for(transcribe(_stt_chunks(), ptt_release), timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Bundle 26: _main waits for PRESSED before consuming capture (Finding 6)
+# ---------------------------------------------------------------------------
+
+
+async def test_main_does_not_consume_capture_before_pressed(monkeypatch):
+    from agent import ptt
+
+    press_at: list[float] = []
+    first_capture_at: list[float] = []
+
+    async def _fake_events():
+        # Idle for 100 ms with no events, then PRESSED, then RELEASED.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        press_at.append(asyncio.get_event_loop().time())
+        yield ptt.PTTEvent.PRESSED
+        await asyncio.sleep(0)
+        yield ptt.PTTEvent.RELEASED
+
+    async def _fake_capture():
+        first_capture_at.append(asyncio.get_event_loop().time())
+        while True:
+            await asyncio.sleep(0)
+            yield b"\x00" * 640
+
+    async def _fake_transcribe(chunks, ptt_release):
+        # Consume one chunk to trigger _fake_capture's first __anext__.
+        async for _ in chunks:
+            break
+        await asyncio.wait_for(ptt_release.wait(), timeout=1.0)
+        return ""
+
+    import agent.audio as _audio_mod
+    import agent.ptt as _ptt_mod
+
+    monkeypatch.setattr(_audio_mod, "capture", _fake_capture)
+    monkeypatch.setattr(_ptt_mod, "events", _fake_events)
+    monkeypatch.setattr(agent.stt, "transcribe", _fake_transcribe)
+
+    await agent.stt._main()
+
+    assert press_at, "PRESSED was never emitted by fake events"
+    assert first_capture_at, "audio.capture was never consumed"
+    assert first_capture_at[0] >= press_at[0], (
+        f"audio.capture started at {first_capture_at[0]} before "
+        f"PRESSED at {press_at[0]} — Finding 6 regression"
+    )

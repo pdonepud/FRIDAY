@@ -13,17 +13,20 @@ tasks are:
 
 * ``_pump`` — read PCM chunks from the caller's async iterator, send
   each to Flux via ``send_media``.
-* ``_release`` — wait on the caller's ``ptt_release`` event; when it
-  fires, send a ``ForceEndTurn`` control message.
-* ``_receive`` — iterate the socket, watching for the terminal
-  ``EndOfTurn`` (or a ``FatalError``, connection close, or timeout).
+* ``_release`` — wait on the caller's ``ptt_release`` event; cancel
+  and await ``_pump`` (so no ``send_media`` call reaches the socket
+  after release), then send a ``ForceEndTurn`` control message and
+  set ``force_end_sent``. This arms the receive watchdog.
+* ``_receive`` — iterate the raw websocket, watching for the terminal
+  ``EndOfTurn`` (or a ``FatalError``, a ``Warning`` announcing the
+  turn was silent, connection close, or the post-release watchdog).
 
 Turn detection is fully suppressed on the Flux side
 (``eot_threshold=1.0``) so the application layer owns the turn
 boundary. ``eot_timeout_ms=30000`` is the server-side safety net;
-``RECEIVE_TIMEOUT_S=35`` is our own outer guard around the receive
-loop so a stuck socket surfaces inside the caller's ``await`` rather
-than hanging forever.
+``RECEIVE_TIMEOUT_S=35`` is our own outer guard, but it only arms
+AFTER ``ForceEndTurn`` is sent — an active turn can legitimately run
+for as long as the user is speaking.
 
 Audio format is a byte-for-byte match with ``agent.audio``'s capture:
 16 kHz mono s16le. No resampling.
@@ -36,14 +39,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import sys
 from collections.abc import AsyncIterator
 
 from deepgram import AsyncDeepgramClient
 from deepgram.core.api_error import ApiError
-from deepgram.listen.v2.types.listen_v2fatal_error import ListenV2FatalError
-from deepgram.listen.v2.types.listen_v2turn_info import ListenV2TurnInfo
+from websockets.exceptions import ConnectionClosed
 
 from agent.audio import INPUT_SAMPLE_RATE
 
@@ -80,9 +83,10 @@ EOT_THRESHOLD = 1.0
 # Prevents the server-side turn from hanging if a PTT release event
 # is lost or never fires.
 EOT_TIMEOUT_MS = 30000
-# Outer safety net around the receive loop: eot_timeout_ms is Flux's
-# own backstop; add 5 s of headroom for network round-trip so a stuck
-# receive raises inside our async-with rather than hanging the caller.
+# Outer safety net around the receive loop, armed only AFTER
+# ForceEndTurn is sent. Bounds "how long to wait for the terminal
+# event"; the active-turn window (before ForceEndTurn) has no such
+# bound and can run indefinitely while the user speaks.
 RECEIVE_TIMEOUT_S = 35
 
 
@@ -107,14 +111,15 @@ class STTFatal(STTError):
 class STTForceEndTurnUnsupported(STTError):
     """The Deepgram deployment does not have ForceEndTurn enabled.
 
-    Server responds ``UNPARSABLE_CLIENT_MESSAGE`` to our control
-    message and closes the connection. Enable ForceEndTurn on the
-    Deepgram dashboard (Feature Flags) before using this module.
+    Server responds with a ``FatalError`` whose ``code`` field is
+    ``UNPARSABLE_CLIENT_MESSAGE`` and closes the socket. Enable
+    ForceEndTurn on the Deepgram dashboard (Feature Flags) before
+    using this module.
     """
 
 
 class STTTimeout(STTError):
-    """``eot_timeout_ms`` fired before ``ptt_release`` triggered.
+    """``eot_timeout_ms`` fired before the caller drove the turn to end.
 
     Carries the partial transcript so the caller can salvage it if
     desired. Distinct from ``STTError`` so a caller can distinguish
@@ -170,7 +175,7 @@ async def _pump(socket, chunks: AsyncIterator[bytes], done_future: asyncio.Futur
     try:
         async for chunk in chunks:
             await socket.send_media(chunk)
-        # chunks exhausted early is legal — just stop sending; receive
+        # Chunks exhausted early is legal — just stop sending; receive
         # keeps listening for the eventual EndOfTurn.
     except asyncio.CancelledError:
         raise
@@ -180,77 +185,168 @@ async def _pump(socket, chunks: AsyncIterator[bytes], done_future: asyncio.Futur
         _fail(done_future, STTError(f"chunk source failed: {e!r}"))
 
 
-async def _release(socket, ptt_release: asyncio.Event, done_future: asyncio.Future[str]) -> None:
-    """Wait for PTT release, then send ForceEndTurn."""
+async def _release(
+    socket,
+    ptt_release: asyncio.Event,
+    pump_task: asyncio.Task[None],
+    force_end_sent: asyncio.Event,
+    done_future: asyncio.Future[str],
+) -> None:
+    """Wait for PTT release, quiesce ``_pump``, then send ForceEndTurn.
+
+    Invariant preservation: if ``_pump`` failed before ``cancel()``
+    took effect, its exception was already recorded on ``done_future``
+    by ``_pump``'s own error path — ``await pump_task`` re-raises
+    only ``CancelledError`` in that case (the swallowed exception is
+    NOT re-raised through the task). This function must NOT relabel
+    any pump-side error as "ForceEndTurn send failed"; we only wrap
+    the send itself.
+    """
     try:
         await ptt_release.wait()
+    except asyncio.CancelledError:
+        raise
+
+    # Cancel ``_pump`` BEFORE sending ForceEndTurn (Finding 1). No
+    # send_media() call may reach the socket after the release signal.
+    pump_task.cancel()
+    try:
+        await pump_task
+    except asyncio.CancelledError:
+        pass
+    # Any other pump exception is impossible here because _pump swallows
+    # them into done_future via its own except-clause and returns
+    # normally. If a future edit removes that swallow, the exception
+    # would propagate here — that is desirable; do not add a
+    # blanket except that would relabel it.
+
+    try:
         await socket.send_force_end_turn()
     except asyncio.CancelledError:
         raise
-    except STTError as e:
-        _fail(done_future, e)
     except Exception as e:
-        # send_force_end_turn raising here often means the deployment
-        # doesn't support ForceEndTurn — the receive loop will usually
-        # see the connection close first, but if send raises before
-        # that, surface it as STTForceEndTurnUnsupported.
+        # Finding 3: send-side exceptions are transport failures, not
+        # necessarily rejection. The specific STTForceEndTurnUnsupported
+        # mapping lives in _receive on the server-sent FatalError with
+        # code=UNPARSABLE_CLIENT_MESSAGE.
+        _fail(done_future, STTError(f"ForceEndTurn send failed: {e!r}"))
+        return
+    force_end_sent.set()
+
+
+async def _receive(socket, force_end_sent: asyncio.Event, done_future: asyncio.Future[str]) -> None:
+    """Consume raw websocket JSON until a terminal event, close, or watchdog.
+
+    Iterates ``socket._websocket`` (a private-but-stable Fern-generated
+    attribute) rather than the SDK's public ``__aiter__``. Reason: the
+    public iterator uses ``construct_type`` on a typed union that does
+    NOT include ``Warning`` messages, so unknown-type payloads are
+    silently yielded as ``None`` with no way to recover the raw JSON.
+    We need the JSON to see ``FORCE_END_TURN_NO_ACTIVE_TURN`` warnings
+    (Finding 2). Tracked upstream at
+    https://github.com/deepgram/deepgram-python-sdk/issues/792 — if
+    resolved upstream, migrate back to the typed iterator and delete
+    this workaround. The ``deepgram-sdk==7.8.1`` pin in
+    ``agent/requirements.txt`` bounds the coupling.
+    """
+    if not hasattr(socket, "_websocket"):
         _fail(
             done_future,
-            STTForceEndTurnUnsupported(
-                f"ForceEndTurn send failed ({e!r}); enable ForceEndTurn "
-                f"on the Deepgram dashboard (Feature Flags)."
+            STTError(
+                "SDK internal 'socket._websocket' missing — "
+                "pin mismatch, check deepgram-sdk version"
             ),
         )
+        return
 
+    ws = socket._websocket
 
-async def _receive(socket, done_future: asyncio.Future[str]) -> None:
-    """Consume socket messages until a terminal event or timeout."""
-    try:
-        async with asyncio.timeout(RECEIVE_TIMEOUT_S):
-            async for msg in socket:
-                if isinstance(msg, ListenV2TurnInfo) and msg.event == "EndOfTurn":
-                    _handle_end_of_turn(msg, done_future)
-                    return
-                if isinstance(msg, ListenV2FatalError):
-                    _fail(done_future, STTFatal(f"Flux fatal error: {msg!r}"))
-                    return
-                # Update, StartOfTurn, EagerEndOfTurn, TurnResumed,
-                # Connected, ConfigureSuccess, ConfigureFailure:
-                # log-only and keep listening. Configure* would only
-                # arrive if we send Configure messages mid-session,
-                # which we don't.
-                _log.debug("stt receive: non-terminal message %r", msg)
-    except asyncio.CancelledError:
-        raise
-    except TimeoutError:
+    async def _watchdog() -> None:
+        """Sleep until ``force_end_sent`` fires, then bound the wait for EndOfTurn."""
+        await force_end_sent.wait()
+        await asyncio.sleep(RECEIVE_TIMEOUT_S)
         _fail(
             done_future,
-            STTError(f"no EndOfTurn within {RECEIVE_TIMEOUT_S}s (receive-loop guard)"),
+            STTError(f"no EndOfTurn within {RECEIVE_TIMEOUT_S}s of ForceEndTurn"),
         )
-    except STTError as e:
-        _fail(done_future, e)
+
+    watchdog_task = asyncio.create_task(_watchdog(), name="stt-receive-watchdog")
+    try:
+        async for raw in ws:
+            if isinstance(raw, bytes):
+                # Server-originated binary frames are not part of Flux's
+                # documented protocol; ignore rather than crash.
+                continue
+            msg = json.loads(raw)
+            msg_type = msg.get("type")
+
+            if msg_type == "TurnInfo" and msg.get("event") == "EndOfTurn":
+                _handle_end_of_turn(msg, done_future)
+                return
+
+            if msg_type == "Warning":
+                code = msg.get("code")
+                if code == "FORCE_END_TURN_NO_ACTIVE_TURN":
+                    # Finding 2: ForceEndTurn arrived before StartOfTurn.
+                    # Silent PTT turn — no active turn to end, no
+                    # transcript to return. Treat as clean empty success.
+                    _succeed(done_future, "")
+                    return
+                _log.warning(
+                    "stt: Warning code=%r description=%r",
+                    code,
+                    msg.get("description"),
+                )
+                continue
+
+            if msg_type == "Error":
+                code = msg.get("code")
+                if code == "UNPARSABLE_CLIENT_MESSAGE":
+                    # Finding 3: server rejected our ForceEndTurn.
+                    _fail(
+                        done_future,
+                        STTForceEndTurnUnsupported(
+                            "ForceEndTurn not enabled on this Deepgram deployment "
+                            "(FatalError code=UNPARSABLE_CLIENT_MESSAGE). "
+                            "Enable ForceEndTurn on the Deepgram dashboard "
+                            "(Feature Flags)."
+                        ),
+                    )
+                else:
+                    _fail(
+                        done_future,
+                        STTFatal(f"Flux fatal (code={code!r}): {msg.get('description')!r}"),
+                    )
+                return
+
+            # Update, StartOfTurn, EagerEndOfTurn, TurnResumed, Connected,
+            # ConfigureSuccess, ConfigureFailure: log-only, keep listening.
+            _log.debug("stt receive: non-terminal type=%r", msg_type)
+
+        # Finding 5: iterator exhausted without a terminal event.
+        _fail(done_future, STTError("socket closed without EndOfTurn"))
+    except asyncio.CancelledError:
+        raise
+    except ConnectionClosed as e:
+        _fail(done_future, STTError(f"connection closed: {e!r}"))
     except Exception as e:
-        # ConnectionClosed and other websocket-level errors land here.
-        # If we haven't heard back from send_force_end_turn yet, this
-        # is likely the deployment rejecting ForceEndTurn.
         _fail(done_future, STTError(f"receive loop failed: {e!r}"))
+    finally:
+        if not watchdog_task.done():
+            watchdog_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watchdog_task
 
 
-def _handle_end_of_turn(msg: ListenV2TurnInfo, done_future: asyncio.Future[str]) -> None:
-    """Resolve the shared future based on ``msg.trigger``."""
-    trigger = msg.trigger
-    transcript = msg.transcript
+def _handle_end_of_turn(msg: dict, done_future: asyncio.Future[str]) -> None:
+    """Resolve the shared future based on ``msg["trigger"]``."""
+    trigger = msg.get("trigger")
+    transcript = msg.get("transcript", "")
     if trigger == "manual":
-        # Happy path: our ForceEndTurn drove the turn end.
         _succeed(done_future, transcript)
     elif trigger == "timeout":
-        # Server-side backstop fired. Surface as STTTimeout with
-        # the partial transcript so the caller may salvage.
         _fail(done_future, STTTimeout(partial=transcript))
     elif trigger == "model":
-        # Flux fired its own EOT despite eot_threshold=1.0. Shouldn't
-        # happen; log and return what we got — the caller wanted a
-        # transcript and Flux delivered one.
         _log.warning(
             "stt: EndOfTurn with trigger='model' despite eot_threshold=%s; "
             "Flux boundary-condition. Returning transcript anyway.",
@@ -258,8 +354,6 @@ def _handle_end_of_turn(msg: ListenV2TurnInfo, done_future: asyncio.Future[str])
         )
         _succeed(done_future, transcript)
     else:
-        # Open enum per Deepgram docs — new trigger values may appear.
-        # Tolerate: log at warning, return transcript.
         _log.warning(
             "stt: EndOfTurn with unknown trigger=%r; returning transcript.",
             trigger,
@@ -276,26 +370,34 @@ async def transcribe(chunks: AsyncIterator[bytes], ptt_release: asyncio.Event) -
     Args:
         chunks: async iterator yielding 16 kHz mono s16le PCM bytes.
             Chunk size is not constrained; ``agent.audio.capture()``'s
-            20 ms chunks (640 bytes) are the intended source.
+            20 ms chunks (640 bytes) are the intended source. Callers
+            SHOULD NOT start yielding chunks until the physical PTT
+            press has occurred — see ``_main`` for the reference
+            pattern.
         ptt_release: asyncio Event that the caller sets when the user
-            releases the PTT key. Sending ``ForceEndTurn`` on this
-            signal is what ends the turn on the Flux side.
+            releases the PTT key. This drives ``ForceEndTurn`` and
+            arms the receive-side watchdog.
 
     Returns:
-        The finalized transcript from Flux's ``EndOfTurn`` event. May
-        be an empty string if the user released without speaking
-        (still a valid outcome; error is signalled by ``raise``, not
-        by string emptiness).
+        The finalized transcript from Flux's ``EndOfTurn`` event, or
+        ``""`` if the PTT turn contained no speech (Flux returned
+        ``Warning FORCE_END_TURN_NO_ACTIVE_TURN``). Empty is a valid
+        outcome; error is signalled by ``raise``, not by string
+        emptiness.
 
     Raises:
         STTAuthError: DEEPGRAM_API_KEY is missing or invalid.
-        STTTimeout: Flux's ``eot_timeout_ms`` fired before PTT release
-            (partial transcript in ``.partial``).
+        STTTimeout: Flux's ``eot_timeout_ms`` fired before the client
+            drove the turn to completion (partial transcript in
+            ``.partial``).
         STTForceEndTurnUnsupported: the Deepgram deployment does not
-            have ForceEndTurn enabled.
-        STTFatal: Flux emitted a ``FatalError`` mid-session.
+            have ForceEndTurn enabled (FatalError code
+            ``UNPARSABLE_CLIENT_MESSAGE``).
+        STTFatal: Flux emitted a ``FatalError`` with any other code.
         STTError: any other pipeline failure (chunk source raised,
-            connection closed, receive-loop guard fired).
+            connection closed, receive-side watchdog fired after
+            ForceEndTurn, socket closed without a terminal event,
+            ForceEndTurn send failed for transport reasons).
     """
     try:
         client = _get_client()
@@ -311,45 +413,37 @@ async def transcribe(chunks: AsyncIterator[bytes], ptt_release: asyncio.Event) -
             eot_timeout_ms=EOT_TIMEOUT_MS,
         )
     except ApiError as e:
-        # Some SDK versions raise on connect() before the async-with;
-        # others raise inside. Handle both.
         raise _wrap_api_error(e) from e
 
     try:
         async with connect_cm as socket:
             loop = asyncio.get_running_loop()
             done_future: asyncio.Future[str] = loop.create_future()
+            force_end_sent = asyncio.Event()
 
             pump_task = asyncio.create_task(_pump(socket, chunks, done_future), name="stt-pump")
             release_task = asyncio.create_task(
-                _release(socket, ptt_release, done_future), name="stt-release"
+                _release(socket, ptt_release, pump_task, force_end_sent, done_future),
+                name="stt-release",
             )
-            receive_task = asyncio.create_task(_receive(socket, done_future), name="stt-receive")
+            receive_task = asyncio.create_task(
+                _receive(socket, force_end_sent, done_future), name="stt-receive"
+            )
             tasks = (pump_task, release_task, receive_task)
 
             try:
                 return await done_future
             finally:
-                # Cancel all children so the shared drain below is a
-                # no-op on already-done tasks.
                 for t in tasks:
                     if not t.done():
                         t.cancel()
-                # Drain: suppress CancelledError (expected on the tasks
-                # we just cancelled), but log any other exception under
-                # the task's name — the real outcome is already in
-                # done_future, but a straggler is a signal worth surfacing.
                 for t in tasks:
                     try:
                         await t
                     except asyncio.CancelledError:
                         pass
                     except BaseException as e:
-                        _log.warning(
-                            "stt: task %s raised during drain: %r",
-                            t.get_name(),
-                            e,
-                        )
+                        _log.warning("stt: task %s raised during drain: %r", t.get_name(), e)
     except ApiError as e:
         raise _wrap_api_error(e) from e
 
@@ -373,8 +467,9 @@ def _wrap_api_error(exc: ApiError) -> STTError:
 async def _main() -> None:
     """Wire audio.capture + ptt.events + transcribe, print the transcript.
 
-    Runs one turn: waits for PTT press, records while held, waits for
-    PTT release, prints the transcript. Exits cleanly on Ctrl+C.
+    _main is single-turn by design; multi-turn loop belongs to #53.
+    Waits for the first PRESSED before consuming any audio (Finding 6)
+    so nothing captured before the physical press can reach Deepgram.
     """
     # Imports here (not at module top) so ``import agent.stt`` doesn't
     # transitively pull in ``sounddevice`` / ``pynput`` for callers
@@ -384,12 +479,13 @@ async def _main() -> None:
     print("[stt] hold Right Alt and speak (Ctrl+C to quit)...", file=sys.stderr)
 
     ptt_release = asyncio.Event()
+    press_seen = asyncio.Event()
 
     async def _ptt_watcher() -> None:
-        """Set the release event on the first PRESSED→RELEASED pair."""
         async for event in ptt.events():
             if event == ptt.PTTEvent.PRESSED:
                 print("[stt] pressed", file=sys.stderr)
+                press_seen.set()
             elif event == ptt.PTTEvent.RELEASED:
                 print("[stt] released", file=sys.stderr)
                 ptt_release.set()
@@ -397,6 +493,9 @@ async def _main() -> None:
 
     watcher_task = asyncio.create_task(_ptt_watcher(), name="stt-main-watcher")
     try:
+        # Finding 6: do not start audio.capture() until PRESSED. No
+        # send_media call can reach Deepgram before the physical press.
+        await press_seen.wait()
         transcript = await transcribe(audio.capture(), ptt_release)
         print(f"[stt] transcript: {transcript!r}")
     finally:
