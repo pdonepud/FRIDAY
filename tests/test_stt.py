@@ -858,6 +858,36 @@ async def test_socket_close_without_terminal_raises(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Bundle 27: Missing DEEPGRAM_API_KEY at construction → STTAuthError
+# ---------------------------------------------------------------------------
+#
+# The SDK's construction-time raise message, quoted VERBATIM from
+# deepgram/base_client.py:266-269 in deepgram-sdk==7.8.1. Hardcoded so
+# that a future SDK version bump that changes this text surfaces
+# through this test rather than drifting silently.
+_SDK_MISSING_KEY_BODY = (
+    "The client must be instantiated be either passing in api_key or setting DEEPGRAM_API_KEY"
+)
+
+
+async def test_missing_api_key_at_construction_maps_to_STTAuthError(monkeypatch):
+    """Empty/unset DEEPGRAM_API_KEY at construction → STTAuthError, not STTError."""
+    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
+
+    def _bad_ctor(*args, **kwargs):
+        # Attributes match Task 1b findings for SDK 7.8.1: status_code
+        # and headers are both None; body carries the sentinel message.
+        raise ApiError(status_code=None, headers=None, body=_SDK_MISSING_KEY_BODY)
+
+    monkeypatch.setattr(agent.stt, "_client", None)
+    monkeypatch.setattr(agent.stt, "AsyncDeepgramClient", _bad_ctor)
+
+    ptt_release = asyncio.Event()
+    with pytest.raises(STTAuthError, match="DEEPGRAM_API_KEY missing"):
+        await asyncio.wait_for(transcribe(_empty_chunks(), ptt_release), timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
 # Bundle 25a: SDK _websocket attribute missing → STTError (pin-mismatch guard)
 # ---------------------------------------------------------------------------
 

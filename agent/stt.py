@@ -41,6 +41,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import sys
 from collections.abc import AsyncIterator
 
@@ -386,7 +387,7 @@ async def transcribe(chunks: AsyncIterator[bytes], ptt_release: asyncio.Event) -
         emptiness.
 
     Raises:
-        STTAuthError: DEEPGRAM_API_KEY is missing or invalid.
+        STTAuthError: DEEPGRAM_API_KEY is missing, unset, empty, or invalid.
         STTTimeout: Flux's ``eot_timeout_ms`` fired before the client
             drove the turn to completion (partial transcript in
             ``.partial``).
@@ -401,6 +402,12 @@ async def transcribe(chunks: AsyncIterator[bytes], ptt_release: asyncio.Event) -
     """
     try:
         client = _get_client()
+    except ApiError as e:
+        # SDK 7.8.1 raises ApiError from AsyncBaseClient.__init__ when
+        # api_key is None (DEEPGRAM_API_KEY unset). Route through
+        # _wrap_api_error so the status_code=None+empty-env-var case
+        # maps to STTAuthError rather than generic STTError.
+        raise _wrap_api_error(e) from e
     except Exception as e:
         raise STTError(f"failed to construct Deepgram client: {e!r}") from e
 
@@ -455,6 +462,15 @@ def _wrap_api_error(exc: ApiError) -> STTError:
         return STTAuthError(
             "DEEPGRAM_API_KEY missing or invalid (401 from Deepgram); see .env.example."
         )
+    if status is None and not os.environ.get("DEEPGRAM_API_KEY"):
+        # SDK 7.8.1's AsyncBaseClient.__init__ raises ApiError with
+        # status_code=None when api_key is None — i.e. DEEPGRAM_API_KEY
+        # is unset or empty. See deepgram/base_client.py:266-269.
+        # Distinct from a 401 which fires later during connect(). Any
+        # other status_code=None case (env var set, unknown ApiError
+        # shape) falls through to the generic bucket below —
+        # evidence-based routing over shape-based routing.
+        return STTAuthError("DEEPGRAM_API_KEY missing (unset or empty); see .env.example.")
     return STTError(f"Deepgram API error (status={status}): {exc!r}")
 
 
