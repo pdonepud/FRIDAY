@@ -1,5 +1,7 @@
 anthropic==1.1.0
 deepgram-sdk==7.8.1
+elevenlabs==2.68.0
 pynput==1.8.2
 python-dotenv==1.2.3
 sounddevice==0.5.6
+websockets==16.0

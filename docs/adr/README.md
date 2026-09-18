@@ -18,6 +18,7 @@ ADRs are numbered sequentially starting at 0001. Filenames follow `NNNN-kebab-ca
 - [0001 — Voice-first pivot](./0001-voice-first-pivot.md) — Accepted
 - [0002 — Model routing strategy](./0002-model-routing-strategy.md) — Accepted (deferred adoption)
 - [0003 — Voice architecture](./0003-voice-architecture.md) — Accepted
+- [0004 — TTS provider concrete choices](./0004-tts-provider-concrete-choices.md) — Accepted (refines 0003 §TTS)
 
 ## When to write an ADR
 
