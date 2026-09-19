@@ -40,7 +40,7 @@ from urllib.parse import urlencode
 from elevenlabs import AsyncElevenLabs
 from elevenlabs.core.api_error import ApiError
 from websockets.asyncio.client import connect as ws_connect
-from websockets.exceptions import ConnectionClosed, WebSocketException
+from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
 
 __all__ = [
     "INACTIVITY_TIMEOUT_S",
@@ -357,6 +357,20 @@ async def synthesize(text_chunks: AsyncIterator[str]) -> AsyncIterator[bytes]:
                 # consumer raised inside their ``async for`` body).
                 if pipeline_error[0] is not None and sys.exc_info()[1] is None:
                     raise pipeline_error[0]
+    except InvalidStatus as exc:
+        # websockets 16.0 raises InvalidStatus (a WebSocketException
+        # subclass) when the HTTP upgrade handshake gets a non-101
+        # response — see websockets/exceptions.py:245. The response's
+        # HTTP status code lives at exc.response.status_code
+        # (websockets/http11.py:194). Must catch BEFORE the generic
+        # WebSocketException branch below (InvalidStatus is a subclass).
+        status = exc.response.status_code
+        cls = _map_auth_status(status)
+        if cls is TTSAuthError:
+            raise TTSAuthError(
+                f"ELEVENLABS_API_KEY rejected during handshake ({status}); see .env.example."
+            ) from exc
+        raise TTSError(f"handshake rejected (status={status})") from exc
     except ConnectionClosed as exc:
         # Handshake-level closes (e.g. 401 from the server after headers
         # are inspected) surface here rather than inside the receiver
@@ -369,6 +383,19 @@ async def synthesize(text_chunks: AsyncIterator[str]) -> AsyncIterator[bytes]:
         raise TTSError("connection failed") from exc
     except ApiError as exc:
         raise _wrap_api_error(exc) from exc
+
+
+def _map_auth_status(status: int | None) -> type[TTSError]:
+    """Map an HTTP status code to the right ``TTSError`` subtype.
+
+    401 and 403 route to :class:`TTSAuthError`; anything else routes to
+    the generic :class:`TTSError`. Shared between the ``InvalidStatus``
+    handshake path and the ``ApiError`` HTTP path so both use the same
+    auth-routing rule.
+    """
+    if status in (401, 403):
+        return TTSAuthError
+    return TTSError
 
 
 def _wrap_handshake_close(exc: ConnectionClosed) -> TTSError:
@@ -392,8 +419,11 @@ def _wrap_handshake_close(exc: ConnectionClosed) -> TTSError:
 def _wrap_api_error(exc: ApiError) -> TTSError:
     """Translate an ElevenLabs ``ApiError`` into our hierarchy."""
     status = getattr(exc, "status_code", None)
-    if status == 401:
-        return TTSAuthError("ELEVENLABS_API_KEY invalid (401 from ElevenLabs); see .env.example.")
+    cls = _map_auth_status(status)
+    if cls is TTSAuthError:
+        return TTSAuthError(
+            f"ELEVENLABS_API_KEY invalid ({status} from ElevenLabs); see .env.example."
+        )
     return TTSError(f"ElevenLabs API error (status={status})")
 
 

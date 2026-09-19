@@ -629,6 +629,91 @@ async def test_empty_api_key_raises_TTSAuthError(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Bundle 17b: _map_auth_status helper — direct unit test
+# ---------------------------------------------------------------------------
+
+
+def test_map_auth_status_routes_401_and_403_to_auth():
+    from agent.tts import _map_auth_status
+
+    assert _map_auth_status(401) is TTSAuthError
+    assert _map_auth_status(403) is TTSAuthError
+    # Everything else — including None — is generic.
+    assert _map_auth_status(500) is TTSError
+    assert _map_auth_status(200) is TTSError
+    assert _map_auth_status(None) is TTSError
+
+
+# ---------------------------------------------------------------------------
+# Bundle 17c-e: InvalidStatus at handshake → routed via _map_auth_status
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    """Stand-in for ``websockets.http11.Response``. Only ``.status_code`` is read."""
+
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+
+
+def _install_invalid_status_at_connect(monkeypatch, status: int):
+    """Wire ws_connect to raise ``InvalidStatus`` with the given HTTP status."""
+    from websockets.exceptions import InvalidStatus
+
+    class _BadCM:
+        async def __aenter__(self):
+            raise InvalidStatus(_FakeResponse(status))
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    monkeypatch.setattr(agent.tts, "ws_connect", lambda url, *, additional_headers, **kw: _BadCM())
+
+
+async def test_handshake_invalid_status_401_becomes_TTSAuthError(monkeypatch):
+    _install_key(monkeypatch)
+    _install_invalid_status_at_connect(monkeypatch, 401)
+
+    from websockets.exceptions import InvalidStatus
+
+    with pytest.raises(TTSAuthError) as exc_info:
+        async for _ in synthesize(_chunks_from(["Hi."])):
+            pass
+    # __cause__ identity check per Concern 7 / Tightening 3.
+    assert isinstance(exc_info.value.__cause__, InvalidStatus)
+    assert "401" in str(exc_info.value)
+
+
+async def test_handshake_invalid_status_403_becomes_TTSAuthError(monkeypatch):
+    _install_key(monkeypatch)
+    _install_invalid_status_at_connect(monkeypatch, 403)
+
+    from websockets.exceptions import InvalidStatus
+
+    with pytest.raises(TTSAuthError) as exc_info:
+        async for _ in synthesize(_chunks_from(["Hi."])):
+            pass
+    assert isinstance(exc_info.value.__cause__, InvalidStatus)
+    assert "403" in str(exc_info.value)
+
+
+async def test_handshake_invalid_status_500_generic_TTSError(monkeypatch):
+    """500 → plain TTSError, NOT TTSAuthError; message names the status."""
+    _install_key(monkeypatch)
+    _install_invalid_status_at_connect(monkeypatch, 500)
+
+    from websockets.exceptions import InvalidStatus
+
+    with pytest.raises(TTSError) as exc_info:
+        async for _ in synthesize(_chunks_from(["Hi."])):
+            pass
+    assert type(exc_info.value) is TTSError
+    assert not isinstance(exc_info.value, TTSAuthError)
+    assert "500" in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, InvalidStatus)
+
+
+# ---------------------------------------------------------------------------
 # Bundle 18: 401 from server close → TTSAuthError
 # ---------------------------------------------------------------------------
 
