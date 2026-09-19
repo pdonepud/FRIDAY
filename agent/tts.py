@@ -269,14 +269,23 @@ async def synthesize(text_chunks: AsyncIterator[str]) -> AsyncIterator[bytes]:
                     await pcm_queue.put(None)
 
             async def _receiver() -> None:
+                # Inactivity-timer discipline: the timer must ONLY tick
+                # while we are waiting on the server. Any await that
+                # blocks on a downstream consumer (queue put, callback,
+                # etc.) MUST disarm the timer first via
+                # ``timeout_ctx.reschedule(None)`` and rearm after.
+                # Otherwise playback backpressure gets misreported as
+                # server inactivity. The only downstream await in this
+                # loop today is ``pcm_queue.put`` below; keep this
+                # comment in sync if that changes.
                 loop = asyncio.get_running_loop()
                 try:
                     async with asyncio.timeout(INACTIVITY_TIMEOUT_S) as timeout_ctx:
                         async for raw in ws:
                             frame = json.loads(raw)
-                            # (a) Server sent us a frame — reset the deadline
-                            # from now, so downstream work in this iteration
-                            # gets a fresh budget.
+                            # Server sent us a frame — reset the
+                            # deadline from now, so downstream work in
+                            # this iteration gets a fresh budget.
                             timeout_ctx.reschedule(loop.time() + INACTIVITY_TIMEOUT_S)
                             server_err = frame.get("error")
                             if server_err:
@@ -285,11 +294,14 @@ async def synthesize(text_chunks: AsyncIterator[str]) -> AsyncIterator[bytes]:
                             if audio_b64:
                                 data = base64.b64decode(audio_b64)
                                 _log.debug("tts recv: audio %d bytes", len(data))
+                                # Disarm before a potentially-blocking
+                                # put; rearm to a fresh full window
+                                # once we're back to waiting on the
+                                # server. Round-1's post-put reschedule
+                                # alone could not survive put()-blocks
+                                # longer than INACTIVITY_TIMEOUT_S.
+                                timeout_ctx.reschedule(None)
                                 await pcm_queue.put(data)
-                                # (b) put() may have blocked on playback
-                                # backpressure; that isn't server inactivity.
-                                # Reset again so the next-frame wait starts
-                                # with a full budget.
                                 timeout_ctx.reschedule(loop.time() + INACTIVITY_TIMEOUT_S)
                             else:
                                 # Alignment-only frames (alignment /

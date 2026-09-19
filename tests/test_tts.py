@@ -569,6 +569,39 @@ async def test_inactivity_reschedules_across_long_stream(monkeypatch):
     assert got == payloads + [b"ZZZZ"]
 
 
+async def test_inactivity_survives_long_playback_backpressure(monkeypatch):
+    """Consumer paces 4× slower than the timeout; put() must disarm the timer.
+
+    Round-1's (b) reset AFTER put() only helps if put() returns before
+    the deadline fires. If playback pressure holds put() blocked for
+    longer than INACTIVITY_TIMEOUT_S, the timer fires DURING put with
+    a bogus "no audio within Ns" — the last frame arrived just fine,
+    the timer just wasn't the right instrument to measure playback
+    latency. Fix: disarm before put, rearm after.
+    """
+    _install_key(monkeypatch)
+    monkeypatch.setattr(agent.tts, "INACTIVITY_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(agent.tts, "PCM_QUEUE_MAX", 1)
+
+    payloads = [b"AAAA", b"BBBB", b"CCCC"]
+    ws = _FakeWebSocket(
+        post_end_of_input=[
+            *(_audio_frame(p) for p in payloads[:-1]),
+            _final_frame(payloads[-1]),
+        ]
+    )
+    _install_fake_ws(monkeypatch, ws)
+
+    got: list[bytes] = []
+    async for pcm in synthesize(_chunks_from(["Hi."])):
+        got.append(pcm)
+        # 4× the timeout — well over the window the (b)-only fix can
+        # tolerate; only the disarm-during-put fix keeps this passing.
+        await asyncio.sleep(0.2)
+
+    assert got == payloads
+
+
 async def test_inactivity_reschedules_across_slow_playback(monkeypatch):
     """Consumer paces slower than the timeout; put() blocks trigger (b) reset.
 
