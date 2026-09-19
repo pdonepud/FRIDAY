@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextlib
 import json
 import logging
 import os
@@ -492,11 +491,22 @@ async def _main() -> None:
                 await t
         print("[tts] OK", file=sys.stderr)
     finally:
+        # Cancel any still-running task first, then observe outcomes
+        # via gather(return_exceptions=True). Previous shape used
+        # contextlib.suppress(BaseException), which swallowed an outer
+        # CancelledError propagating through this finally — the caller
+        # cancelling _main() must see CancelledError, not silence.
         for t in (synthesize_task, playback_task):
             if not t.done():
                 t.cancel()
-            with contextlib.suppress(asyncio.CancelledError, BaseException):
-                await t
+        results = await asyncio.gather(synthesize_task, playback_task, return_exceptions=True)
+        for t, r in zip((synthesize_task, playback_task), results, strict=True):
+            if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
+                _log.warning(
+                    "tts._main: task %s raised during drain: %r",
+                    t.get_name(),
+                    r,
+                )
 
 
 if __name__ == "__main__":  # pragma: no cover

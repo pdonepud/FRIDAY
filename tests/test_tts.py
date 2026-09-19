@@ -846,6 +846,40 @@ async def test_main_wires_synthesize_and_playback(monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
+# Bundle 21b: _main propagates external cancellation (Finding 3)
+# ---------------------------------------------------------------------------
+
+
+async def test_main_propagates_external_cancellation(monkeypatch):
+    """Cancelling _main() from outside surfaces CancelledError; drain logs preserved."""
+    import agent.audio as _audio_mod
+
+    hang = asyncio.Event()  # never set
+
+    async def _fake_synthesize(text_chunks):
+        async for _ in text_chunks:
+            pass
+        yield b"AAAA"
+        # Block forever so the caller cancels us mid-flight.
+        await hang.wait()
+
+    async def _fake_playback(chunks):
+        async for _ in chunks:
+            await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(agent.tts, "synthesize", _fake_synthesize)
+    monkeypatch.setattr(_audio_mod, "playback", _fake_playback)
+
+    main_task = asyncio.create_task(agent.tts._main())
+    # Let _main enter the wait() before we cancel.
+    await asyncio.sleep(0.05)
+    main_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await main_task
+
+
+# ---------------------------------------------------------------------------
 # Bundle 22: text_chunks raises → __cause__ identity preserved
 # (This is bundle 10 restated as an explicit identity check for the
 # Tightening 3 discipline. Kept separate so a regression is easy to
