@@ -498,11 +498,12 @@ async def test_odd_length_audio_chunk_passes_through(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Bundle 16: INACTIVITY_TIMEOUT_S fires when server silent
+# Bundle 16: inactivity watchdog — fires on true stall, reschedules on frames
 # ---------------------------------------------------------------------------
 
 
-async def test_inactivity_timeout_fires(monkeypatch):
+async def test_inactivity_fires_on_true_stall(monkeypatch):
+    """No frames at all → TTSError('no audio within Ns') within the budget."""
     _install_key(monkeypatch)
     monkeypatch.setattr(agent.tts, "INACTIVITY_TIMEOUT_S", 0.05)
     ws = _FakeWebSocket()  # never yields anything
@@ -511,6 +512,93 @@ async def test_inactivity_timeout_fires(monkeypatch):
     with pytest.raises(TTSError, match="no audio within"):
         async for _ in synthesize(_chunks_from(["Hi."])):
             pass
+
+
+class _PacedFakeWebSocket(_FakeWebSocket):
+    """FakeWebSocket that inserts a delay between post-flush frames."""
+
+    def __init__(
+        self,
+        pre_messages: list | None = None,
+        post_end_of_input: list | None = None,
+        gap_seconds: float = 0.0,
+    ):
+        super().__init__(pre_messages=pre_messages, post_end_of_input=post_end_of_input)
+        self._gap = gap_seconds
+
+    async def _iter(self):
+        for m in self._pre:
+            if isinstance(m, BaseException):
+                raise m
+            yield m
+        if self._post:
+            await self._end_of_input_seen.wait()
+            for m in self._post:
+                if self._gap > 0:
+                    await asyncio.sleep(self._gap)
+                if isinstance(m, BaseException):
+                    raise m
+                yield m
+        await self._hang.wait()
+
+
+async def test_inactivity_reschedules_across_long_stream(monkeypatch):
+    """Frames arriving at 0.6× the timeout keep resetting deadline (a).
+
+    Total wall-clock (7 gaps × 0.12s ≈ 0.84s) exceeds
+    INACTIVITY_TIMEOUT_S (0.2s), but per-frame gaps stay under it.
+    Without the (a) reset, the second or third frame would trigger a
+    spurious timeout. Values are big enough to survive Windows event-
+    loop scheduling jitter (~15ms in the worst case observed).
+    """
+    _install_key(monkeypatch)
+    monkeypatch.setattr(agent.tts, "INACTIVITY_TIMEOUT_S", 0.2)
+
+    payloads = [b"AAAA", b"BBBB", b"CCCC", b"DDDD", b"EEEE", b"FFFF", b"GGGG"]
+    ws = _PacedFakeWebSocket(
+        post_end_of_input=[
+            *(_audio_frame(p) for p in payloads),
+            _final_frame(b"ZZZZ"),
+        ],
+        gap_seconds=0.12,  # 60% of 0.2
+    )
+    _install_fake_ws(monkeypatch, ws)
+
+    got = [pcm async for pcm in synthesize(_chunks_from(["Hi."]))]
+
+    assert got == payloads + [b"ZZZZ"]
+
+
+async def test_inactivity_reschedules_across_slow_playback(monkeypatch):
+    """Consumer paces slower than the timeout; put() blocks trigger (b) reset.
+
+    PCM_QUEUE_MAX=1 so each ``pcm_queue.put`` in the receiver blocks
+    until the consumer pulls. Consumer's ``async for`` body sleeps
+    0.12s — 60% larger than the 0.2s window minus the queue-drain
+    overhead. Without the (b) reset — i.e., if the deadline stays at
+    "frame-arrival + INACTIVITY_TIMEOUT_S" — the wait for the second
+    frame after a slow put-return would fire the timeout spuriously.
+    Values chosen to survive Windows event-loop jitter.
+    """
+    _install_key(monkeypatch)
+    monkeypatch.setattr(agent.tts, "INACTIVITY_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(agent.tts, "PCM_QUEUE_MAX", 1)
+
+    payloads = [b"AAAA", b"BBBB", b"CCCC"]
+    ws = _FakeWebSocket(
+        post_end_of_input=[
+            *(_audio_frame(p) for p in payloads),
+            _final_frame(b"DDDD"),
+        ]
+    )
+    _install_fake_ws(monkeypatch, ws)
+
+    got: list[bytes] = []
+    async for pcm in synthesize(_chunks_from(["Hi."])):
+        got.append(pcm)
+        await asyncio.sleep(0.12)
+
+    assert got == payloads + [b"DDDD"]
 
 
 # ---------------------------------------------------------------------------

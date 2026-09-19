@@ -270,10 +270,15 @@ async def synthesize(text_chunks: AsyncIterator[str]) -> AsyncIterator[bytes]:
                     await pcm_queue.put(None)
 
             async def _receiver() -> None:
+                loop = asyncio.get_running_loop()
                 try:
-                    async with asyncio.timeout(INACTIVITY_TIMEOUT_S):
+                    async with asyncio.timeout(INACTIVITY_TIMEOUT_S) as timeout_ctx:
                         async for raw in ws:
                             frame = json.loads(raw)
+                            # (a) Server sent us a frame — reset the deadline
+                            # from now, so downstream work in this iteration
+                            # gets a fresh budget.
+                            timeout_ctx.reschedule(loop.time() + INACTIVITY_TIMEOUT_S)
                             server_err = frame.get("error")
                             if server_err:
                                 raise TTSError(f"server error: {server_err}")
@@ -282,6 +287,11 @@ async def synthesize(text_chunks: AsyncIterator[str]) -> AsyncIterator[bytes]:
                                 data = base64.b64decode(audio_b64)
                                 _log.debug("tts recv: audio %d bytes", len(data))
                                 await pcm_queue.put(data)
+                                # (b) put() may have blocked on playback
+                                # backpressure; that isn't server inactivity.
+                                # Reset again so the next-frame wait starts
+                                # with a full budget.
+                                timeout_ctx.reschedule(loop.time() + INACTIVITY_TIMEOUT_S)
                             else:
                                 # Alignment-only frames (alignment /
                                 # normalizedAlignment with no audio and
