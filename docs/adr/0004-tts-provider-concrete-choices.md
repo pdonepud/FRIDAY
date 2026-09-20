@@ -39,12 +39,22 @@ constants; ADR is the source of truth if the two ever disagree.
   with `agent/audio.py`'s `OUTPUT_SAMPLE_RATE / OUTPUT_CHANNELS / OUTPUT_DTYPE`.
   Not tier-gated (`pcm_44100` is Pro-only; `pcm_24000` is available on all
   tiers).
-- **Inactivity guard:** `INACTIVITY_TIMEOUT_S = 25`. Server closes idle
-  connections at ~20 s
-  ([elevenlabs.io/docs/websockets](https://elevenlabs.io/docs/websockets):
-  "The WebSocket connection will automatically close after 20 seconds of
-  inactivity."). 25 s gives the client the first shot at surfacing a clean
-  `TTSError("no audio within 25s")` before the server-side close races us.
+- **Inactivity guards (client + server):**
+  - `PROVIDER_INACTIVITY_TIMEOUT_S = 30` — sent as a query parameter
+    on the stream-input WebSocket alongside `model_id` and
+    `output_format`. The blog post
+    [WebSocket improvements: reliability & custom timeout](https://elevenlabs.io/blog/websocket-improvements-reliability-and-custom-timeout)
+    documents the server-side default as 20 seconds and the maximum
+    as 180 seconds (unit: seconds; example URL:
+    `wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input?model_id=eleven_turbo_v2&inactivity_timeout=180`).
+    Sending 30 reserves a 5-second window before the server-side
+    idle-close so the client-side timer fires first.
+  - `INACTIVITY_TIMEOUT_S = 25` — client-side guard on the receive
+    loop. Set 5 s below `PROVIDER_INACTIVITY_TIMEOUT_S` so the client
+    surfaces a clean typed `TTSError("no audio within 25s")` before
+    the server's own idle-close races us. `INACTIVITY_TIMEOUT_S`
+    remains the source of truth for the wording embedded in the
+    error message.
 - **Init frame:** `{"text": " ", "generation_config": {"chunk_length_schedule": [50]}}`.
   Aggressive `chunk_length_schedule=[50]` matches the SDK's own
   `elevenlabs/realtime_tts.py:123` and prioritizes time-to-first-audio over
@@ -81,6 +91,14 @@ precisely what the SDK's own sync `convert_realtime` does.
   `INACTIVITY_TIMEOUT_S` before surfacing.
 - 24 kHz output byte-matches the playback pipeline — no resampling, no
   format conversion.
+- Server-side idle-close no longer races the client-side timer. The
+  server closes at `PROVIDER_INACTIVITY_TIMEOUT_S = 30 s`, the client
+  fires at `INACTIVITY_TIMEOUT_S = 25 s`, and the 5 s window means
+  callers see `TTSError("no audio within 25s")` — a typed error whose
+  `__cause__` is a `TimeoutError` — rather than a `ConnectionClosed`
+  from the server pulling the plug first. The safety property
+  survives event-loop scheduling jitter (measured ≪ 5 s on all tested
+  platforms).
 
 **Negative:**
 

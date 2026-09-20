@@ -259,7 +259,32 @@ async def test_ws_url_query_params_and_headers(monkeypatch):
     assert VOICE_ID in cm.url
     assert f"model_id={MODEL_ID}" in cm.url
     assert f"output_format={OUTPUT_FORMAT}" in cm.url
+    assert f"inactivity_timeout={agent.tts.PROVIDER_INACTIVITY_TIMEOUT_S}" in cm.url
     assert cm.headers == {"xi-api-key": "sk_specific"}
+
+
+async def test_ws_url_query_params_ordered_and_complete(monkeypatch):
+    """Parse the URL and assert all three documented query params present.
+
+    Uses ``urllib.parse`` so the assertion doesn't depend on the
+    module's chosen encoding order. Values pulled from the module
+    constants so a future value bump can't quietly diverge from this
+    test.
+    """
+    from urllib.parse import parse_qs, urlparse
+
+    _install_key(monkeypatch)
+    ws = _FakeWebSocket(post_end_of_input=[_final_frame(b"X")])
+    cms = _install_fake_ws(monkeypatch, ws)
+
+    async for _ in synthesize(_chunks_from(["Hi."])):
+        pass
+
+    parsed = urlparse(cms[0].url)
+    query = parse_qs(parsed.query)
+    assert query["model_id"] == [MODEL_ID]
+    assert query["output_format"] == [OUTPUT_FORMAT]
+    assert query["inactivity_timeout"] == [str(agent.tts.PROVIDER_INACTIVITY_TIMEOUT_S)]
 
 
 async def test_init_frame_is_first_sent(monkeypatch):

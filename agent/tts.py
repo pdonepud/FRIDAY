@@ -46,6 +46,7 @@ __all__ = [
     "MODEL_ID",
     "OUTPUT_FORMAT",
     "PCM_QUEUE_MAX",
+    "PROVIDER_INACTIVITY_TIMEOUT_S",
     "TTSAuthError",
     "TTSError",
     "VOICE_ID",
@@ -66,12 +67,24 @@ OUTPUT_FORMAT = "pcm_24000"
 
 # --- Timing + queue bounds ---
 
-# Server closes idle stream-input connections at ~20 s
-# (https://elevenlabs.io/docs/websockets: "The WebSocket connection
-# will automatically close after 20 seconds of inactivity."). Our
-# client-side guard fires slightly earlier so we surface a clean
-# TTSError before the server-side close races us. Hoisted so tests
-# can monkeypatch small.
+# Server-side inactivity timeout on the stream-input WebSocket. Sent
+# as a query parameter alongside model_id and output_format. The
+# ElevenLabs blog post at
+# https://elevenlabs.io/blog/websocket-improvements-reliability-and-custom-timeout
+# documents the server-side default as 20 seconds and the maximum as
+# 180 seconds (unit: seconds; example URL:
+# ``wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input?model_id=eleven_turbo_v2&inactivity_timeout=180``).
+# We send 30 so INACTIVITY_TIMEOUT_S (25 s, client-side) fires first
+# — the caller sees a typed ``TTSError("no audio within 25s")``
+# instead of a ``ConnectionClosed`` from the server pulling the plug.
+PROVIDER_INACTIVITY_TIMEOUT_S = 30
+
+# Client-side guard on receive-loop inactivity. Set 5 s below
+# PROVIDER_INACTIVITY_TIMEOUT_S (25 vs 30) so the client fires first
+# and surfaces TTSError("no audio within 25s") before the server's
+# own idle-close races us — a clean typed error is worth more than a
+# race with a mid-stream ConnectionClosed. Hoisted so tests can
+# monkeypatch small.
 INACTIVITY_TIMEOUT_S = 25
 
 # Bound on the internal PCM queue between the receiver task and the
@@ -125,8 +138,19 @@ def _get_client() -> AsyncElevenLabs:
 
 
 def _ws_url(voice_id: str, model_id: str, output_format: str) -> str:
-    """Build the stream-input WebSocket URL with query params."""
-    query = urlencode({"model_id": model_id, "output_format": output_format})
+    """Build the stream-input WebSocket URL with query params.
+
+    Sends three query params: ``model_id``, ``output_format``, and
+    ``inactivity_timeout``. See ``PROVIDER_INACTIVITY_TIMEOUT_S`` for
+    the last one's grounding.
+    """
+    query = urlencode(
+        {
+            "model_id": model_id,
+            "output_format": output_format,
+            "inactivity_timeout": PROVIDER_INACTIVITY_TIMEOUT_S,
+        }
+    )
     return f"wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input?{query}"
 
 
