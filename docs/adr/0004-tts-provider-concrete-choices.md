@@ -65,17 +65,25 @@ constants; ADR is the source of truth if the two ever disagree.
 
 ### `auto_mode`
 
-`auto_mode` investigated at #51 implementation time; not present in the
-Fern-generated schema at `elevenlabs==2.68.0`
-(`types/initialize_connection.py`, `types/generation_config.py`), not sent
-as a query param by the SDK (`realtime_tts.py:102-104`), and not documented
-at any reachable ElevenLabs docs URL (all candidate paths returned 404).
-Deferred; revisit if a citable source surfaces.
-
-Fallback path locked: `chunk_length_schedule=[50]` in the init frame plus
-`try_trigger_generation=True` on every text frame achieves the same "generate
-immediately, don't defer" behavior the `auto_mode` name suggests. This is
-precisely what the SDK's own sync `convert_realtime` does.
+auto_mode was investigated at #51 implementation time and
+subsequently verified during PR #62 CodeRabbit review round 3
+(2026-09-19). It IS a documented query parameter on the
+stream-input endpoint (see the ElevenLabs concepts page on audio
+streaming: <https://elevenlabs.io/docs/eleven-api/concepts/audio-streaming>).
+We deliberately do not adopt it here. The concepts page states
+that auto_mode "attempts to find a good balance automatically by
+analysing the incoming text" and is intended for cases where the
+caller wants to defer chunk-scheduling decisions to the model.
+The same page explicitly recommends configuring the chunk
+schedule directly "in a voice agent where you are willing to
+accept slightly less natural prosody in exchange for lower
+latency" — which is exactly FRIDAY's use case. We take that
+finer-control path: chunk_length_schedule=[50] in the init
+frame (matches SDK's realtime_tts.py:123) plus per-frame
+try_trigger_generation=True (matches realtime_tts.py:132).
+Revisit if the tradeoff shifts — e.g. if the module moves out of
+the voice-agent hot path or if ElevenLabs documents auto_mode's
+schedule interaction more concretely.
 
 ## Consequences
 
