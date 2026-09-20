@@ -290,6 +290,14 @@ async def synthesize(text_chunks: AsyncIterator[str]) -> AsyncIterator[bytes]:
                         err.__cause__ = exc
                         pipeline_error[0] = err
                     # Unblock the yield loop within one event-loop tick.
+                    # Cancellation of a pending putter inside
+                    # asyncio.Queue.put() unwinds without storing the item
+                    # (CPython Lib/asyncio/queues.py), so this sentinel put
+                    # reaches an empty or partially-drained queue even when
+                    # cancellation arrived at a full-queue put — no hang.
+                    # Non-cancellation exits leave the yield loop as a live
+                    # consumer, so any brief blocking here is normal
+                    # backpressure, not deadlock.
                     await pcm_queue.put(None)
 
             async def _receiver() -> None:
@@ -359,6 +367,14 @@ async def synthesize(text_chunks: AsyncIterator[str]) -> AsyncIterator[bytes]:
                         err.__cause__ = exc
                         pipeline_error[0] = err
                 finally:
+                    # Cancellation of a pending putter inside
+                    # asyncio.Queue.put() unwinds without storing the item
+                    # (CPython Lib/asyncio/queues.py), so this sentinel put
+                    # reaches an empty or partially-drained queue even when
+                    # cancellation arrived at a full-queue put — no hang.
+                    # Non-cancellation exits leave the yield loop as a live
+                    # consumer, so any brief blocking here is normal
+                    # backpressure, not deadlock.
                     await pcm_queue.put(None)
 
             sender_task = asyncio.create_task(_sender(), name="tts-sender")
