@@ -53,3 +53,6 @@ htmlcov/
 ui/node_modules/
 ui/src-tauri/target/
 ui/dist/
+
+# === scratchpad — untracked utilities (auditions, spikes) ===
+scratchpad/
