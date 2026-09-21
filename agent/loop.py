@@ -12,7 +12,7 @@ from agent.claude import (
     APIConnectionError,
     AuthenticationError,
     RateLimitError,
-    stream_reply,
+    stream_tokens,
 )
 from agent.system_prompt import SYSTEM_PROMPT
 
@@ -25,7 +25,7 @@ _MISSING_KEY: str = (
 _GOODBYE: str = "\n[goodbye]"
 
 
-def run() -> int:
+async def run() -> int:
     """Run the FRIDAY REPL. Returns a process exit code.
 
     Exit codes:
@@ -52,6 +52,8 @@ def run() -> int:
     while True:
         # --- prompt for a user turn ----------------------------------
         try:
+            # sync input() is deliberate — text REPL has no concurrent
+            # coroutines and pauses on stdin by design.
             user = input("you > ").strip()
         except (KeyboardInterrupt, EOFError):
             print(_GOODBYE)
@@ -64,7 +66,7 @@ def run() -> int:
         print("friday > ", end="", flush=True)
         chunks: list[str] = []
         try:
-            for chunk in stream_reply(messages, SYSTEM_PROMPT):
+            async for chunk in stream_tokens(messages, SYSTEM_PROMPT):
                 print(chunk, end="", flush=True)
                 chunks.append(chunk)
             print()
