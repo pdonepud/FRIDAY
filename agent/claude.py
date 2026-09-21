@@ -235,5 +235,9 @@ async def stream_sentences(messages: list[dict], system: str) -> AsyncIterator[s
         Sentence and clause chunks in order. Concatenating every
         chunk gives the complete reply text.
     """
-    async for chunk in _buffer_sentences(stream_tokens(messages, system)):
-        yield chunk
+    tokens = stream_tokens(messages, system)
+    try:
+        async for chunk in _buffer_sentences(tokens):
+            yield chunk
+    finally:
+        await tokens.aclose()

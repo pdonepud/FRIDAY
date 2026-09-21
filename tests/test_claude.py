@@ -390,3 +390,31 @@ async def test_stream_sentences_composes_over_stream_tokens(monkeypatch):
     ]
 
     assert got == ["Hi.", " There. "]
+
+
+async def test_stream_sentences_consumer_break_closes_provider(monkeypatch, mock_claude_client):
+    """Consumer breaking out of stream_sentences must close the underlying provider stream promptly.
+
+    Regression guard for CodeRabbit finding on PR #63: without the finally/aclose in
+    stream_sentences, the inner stream_tokens generator is left dangling and the
+    provider context stays open until GC finalization. Explicit gen.aclose() after
+    break forces the async-generator machinery to unwind synchronously so the
+    assertion catches the invariant.
+    """
+    ctx = _mk_stream_ctx(_aiter(["Hello. ", "There. "]))
+    mock_claude_client.messages.stream.return_value = ctx
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        gen = agent.claude.stream_sentences([{"role": "user", "content": "hi"}], "sys")
+        async for _c in gen:
+            break
+        await gen.aclose()
+
+    assert ctx.__aexit__.called, (
+        "provider __aexit__ was not invoked after stream_sentences.aclose()"
+    )
+    resource_warnings = [w for w in caught if issubclass(w.category, ResourceWarning)]
+    assert not resource_warnings, (
+        f"ResourceWarnings during teardown: {[str(w.message) for w in resource_warnings]}"
+    )
