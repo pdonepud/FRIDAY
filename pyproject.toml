@@ -58,14 +58,14 @@ extend-exclude = [
 select = ["E", "F", "W", "I", "B", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
-# Tier-1 seam files (agent/loop.py, agent/claude.py) are on the
-# "don't modify" list per AGENT.md / user constraints until Tier 3
-# refactors them for voice. Grandfathering the two ruff violations
-# currently in them so this PR's lint job doesn't force early edits:
+# Tier-1 seam file agent/loop.py is on the "don't modify" list per
+# AGENT.md / user constraints until #55 refactors it for voice.
+# agent/claude.py's UP028 exemption was removed in #52 as a natural
+# consequence of the AsyncAnthropic swap. Grandfathering the one
+# remaining ruff violation so this PR's lint job doesn't force early
+# edits:
 #   agent/loop.py:6  I001  — import block layout (extra blank line)
-#   agent/claude.py:69  UP028  — `yield from stream.text_stream`
 "agent/loop.py" = ["I001"]
-"agent/claude.py" = ["UP028"]
 
 [tool.ruff.format]
 # agent/loop.py: shipped in Tier 1 (PR #35) and on the AGENT.md

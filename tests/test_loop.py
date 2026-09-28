@@ -24,7 +24,7 @@ def test_loop_and_main_import_without_side_effects():
     assert agent_main.run is agent.loop.run
 
 
-def test_run_exits_one_when_api_key_missing(monkeypatch, capsys):
+async def test_run_exits_one_when_api_key_missing(monkeypatch, capsys):
     """``run()`` returns exit code 1 with a friendly message when the API key is unset.
 
     Guards the loop's startup path: with no ``ANTHROPIC_API_KEY`` in the
@@ -37,11 +37,11 @@ def test_run_exits_one_when_api_key_missing(monkeypatch, capsys):
 
     from agent.loop import run
 
-    assert run() == 1
+    assert await run() == 1
     assert "ANTHROPIC_API_KEY" in capsys.readouterr().out
 
 
-def test_run_exits_zero_on_ctrl_c_at_prompt(monkeypatch, capsys):
+async def test_run_exits_zero_on_ctrl_c_at_prompt(monkeypatch, capsys):
     """``run()`` returns exit code 0 when the user Ctrl+Cs at the prompt.
 
     Guards the loop's clean-exit path: with a dummy API key set and
@@ -54,5 +54,5 @@ def test_run_exits_zero_on_ctrl_c_at_prompt(monkeypatch, capsys):
 
     from agent.loop import run
 
-    assert run() == 0
+    assert await run() == 0
     assert "goodbye" in capsys.readouterr().out
