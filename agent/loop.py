@@ -66,6 +66,9 @@ async def run() -> int:
         print("friday > ", end="", flush=True)
         chunks: list[str] = []
         try:
+            # NOTE: mid-stream Ctrl+C surfaces as asyncio.CancelledError under
+            # asyncio.run(), not KeyboardInterrupt — deferred to #55 with the
+            # rest of the voice-pipeline error handling (see PR #63 review).
             async for chunk in stream_tokens(messages, SYSTEM_PROMPT):
                 print(chunk, end="", flush=True)
                 chunks.append(chunk)

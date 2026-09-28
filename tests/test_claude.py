@@ -366,6 +366,63 @@ async def test_buffer_sentences_safety_valve_exact_threshold():
     assert got[1] == "x" * 50
 
 
+async def test_buffer_sentences_safety_valve_drains_repeatedly():
+    """Safety valve keeps draining while buffer remains at or above threshold.
+
+    A single punctuation-free delta containing multiple 400-char
+    whitespace-delimited sections must produce multiple safety-valve
+    flushes, not a single flush plus a verbatim mandatory-flush chunk
+    that exceeds the limit. Regression guard for CodeRabbit finding on
+    commit e8be4c8 (PR #63).
+    """
+    section = "a" * 399 + " "  # 400 chars, whitespace at position 399
+    payload = section * 3 + "a" * 44  # three 400-char sections + 44-char tail
+    got = [c async for c in agent.claude._buffer_sentences(_aiter([payload]))]
+    # Three safety-valve flushes of 400 chars each + one mandatory
+    # finalization flush of 44 chars.
+    assert len(got) == 4
+    assert len(got[0]) == 400
+    assert len(got[1]) == 400
+    assert len(got[2]) == 400
+    assert got[3] == "a" * 44
+    # Every emitted chunk except the final tail must be at or under
+    # (threshold + 1) — the safety valve's contract for realistic
+    # Claude token sizes where whitespace lands at or near position N-1.
+    for chunk in got[:-1]:
+        assert len(chunk) <= agent.claude._MAX_BUFFER_CHARS + 1, (
+            f"safety valve emitted oversized chunk: len={len(chunk)}"
+        )
+
+
+async def test_buffer_sentences_safety_valve_no_whitespace_fallback():
+    """Safety valve gives up cleanly on pathological input with no
+    whitespace past position N-1.
+
+    The buffer is preserved through the safety-valve while loop
+    (``if not flushed: break``) and emitted verbatim by the mandatory
+    finalization flush at end-of-stream. Covers the fallback branch
+    added by the drain-repeatedly refactor.
+    """
+    payload = "a" * 450  # 450 non-whitespace chars, no boundary
+    got = [c async for c in agent.claude._buffer_sentences(_aiter([payload]))]
+    assert got == [payload]
+
+
+async def test_buffer_sentences_safety_valve_whitespace_only_flush_skipped():
+    """Safety valve flushes a whitespace-only chunk without yielding it.
+
+    When the buffer starts with a long run of whitespace and hits the
+    safety-valve threshold on whitespace, the flushed chunk is entirely
+    whitespace and the ``if chunk.strip():`` guard skips the yield.
+    Covers the False-branch of that guard inside the safety valve.
+    """
+    payload = " " * 405 + "actual content."
+    got = [c async for c in agent.claude._buffer_sentences(_aiter([payload]))]
+    # Whitespace-only 400-char chunk was flushed but not yielded (strip filter).
+    # Remaining buffer = " " * 5 + "actual content." → mandatory flush at close.
+    assert got == [" " * 5 + "actual content."]
+
+
 # ---------------------------------------------------------------------------
 # Bundle 5: stream_sentences composition
 # ---------------------------------------------------------------------------

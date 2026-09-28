@@ -188,17 +188,25 @@ async def _buffer_sentences(tokens: AsyncIterator[str]) -> AsyncIterator[str]:
 
         # Safety valve — buffer is past the threshold and no boundary
         # regex fired. Look for the next whitespace at or after position
-        # N and flush there.
-        if len(buffer) >= _MAX_BUFFER_CHARS:
+        # N and flush there. Drain repeatedly to handle single deltas
+        # that contain multiple threshold-crossing sections; without the
+        # outer while, one flush per delta leaves oversized content for
+        # the finalization flush to emit verbatim.
+        while len(buffer) >= _MAX_BUFFER_CHARS:
+            flushed = False
             for i in range(_MAX_BUFFER_CHARS - 1, len(buffer)):
                 if buffer[i].isspace():
                     chunk = buffer[: i + 1]
                     buffer = buffer[i + 1 :]
                     if chunk.strip():
                         yield chunk
+                    flushed = True
                     break
-            # If no whitespace at or after position N-1, buffer stays and
-            # waits for more.
+            if not flushed:
+                # No whitespace beyond N-1; buffer stays and waits for
+                # more (mandatory flush at end-of-stream handles the
+                # pathological no-whitespace case).
+                break
 
     # Mandatory finalization flush — the token iterator has closed;
     # emit any non-whitespace remainder.
