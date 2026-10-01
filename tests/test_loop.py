@@ -38,7 +38,9 @@ async def test_run_exits_one_when_api_key_missing(monkeypatch, capsys):
     from agent.loop import run
 
     assert await run() == 1
-    assert "ANTHROPIC_API_KEY" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "ANTHROPIC_API_KEY" in captured.out
+    assert "see .env.example" in captured.out
 
 
 async def test_run_exits_zero_on_ctrl_c_at_prompt(monkeypatch, capsys):

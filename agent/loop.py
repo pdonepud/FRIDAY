@@ -19,8 +19,8 @@ from agent.system_prompt import SYSTEM_PROMPT
 
 _BANNER: str = "FRIDAY — Tier 1 baseline. Type to talk. Ctrl+C to exit."
 _MISSING_KEY: str = (
-    "ANTHROPIC_API_KEY isn't set. "
-    "Copy .env.example to .env and add your key."
+    "ANTHROPIC_API_KEY isn't set; see .env.example. "
+    "Copy it to .env and add your key."
 )
 _GOODBYE: str = "\n[goodbye]"
 

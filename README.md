@@ -292,6 +292,31 @@ GitHub Actions runs the same `lint` (ruff check + format check) and `test` (pyte
 
 ---
 
+## Environment variables
+
+FRIDAY's `agent/` package reads three API keys from a local `.env`
+file at the repository root. `.env.example` is the template.
+
+| Env var | Purpose | Signup URL |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | LLM (Claude via `agent/claude.py`, required for all tiers) | <https://console.anthropic.com/settings/keys> |
+| `DEEPGRAM_API_KEY` | STT (Deepgram Flux via `agent/stt.py`, required for voice mode) | <https://console.deepgram.com/> |
+| `ELEVENLABS_API_KEY` | TTS (ElevenLabs streaming via `agent/tts.py`, required for voice mode) | <https://elevenlabs.io/app/settings/api-keys> |
+
+Setup:
+
+1. Copy the template: `Copy-Item .env.example .env` on Windows
+   PowerShell, or `cp .env.example .env` on macOS/Linux.
+2. Open `.env` and replace each `<your-…-here>` placeholder with the
+   real key from the provider.
+3. Run the agent — text mode (`python -m agent --text`) needs
+   `ANTHROPIC_API_KEY`; voice mode (default) needs all three keys.
+
+`.env` is gitignored via `.gitignore` — never commit it, never paste
+keys into a chat or public log.
+
+---
+
 ## Contributing
 
 This is a personal project, but PRs and ideas are welcome. If you're building something similar or want to fork it for your own assistant:
