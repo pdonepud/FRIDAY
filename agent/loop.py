@@ -82,24 +82,63 @@ async def _tee(src: AsyncIterator[str], collect: list[str]) -> AsyncIterator[str
         yield chunk
 
 
-async def _watch_release(
+async def _ptt_pump(
     ptt_iter: AsyncIterator[ptt.PTTEvent],
-    ptt_release: asyncio.Event,
+    ptt_queue: asyncio.Queue[ptt.PTTEvent | None],
+    pump_error: list[BaseException],
 ) -> None:
-    """Watch the held ``ptt.events()`` iterator for the next RELEASED.
+    """Drain ``ptt.events()`` into a queue consumed by Phase 1 + watcher.
 
-    Sets ``ptt_release`` as soon as RELEASED arrives so
-    ``stt.transcribe`` can finalize via its ForceEndTurn path. On any
-    exit path (RELEASED seen, iterator exhausted, exception
-    propagated) the Event is set in the ``finally`` block so a
-    pending transcribe never hangs forever on PTT death — the next
-    Phase 1 PRESSED-wait will detect the dead iterator and return 2
-    per the fatal-triage table.
+    Lives for the whole ``voice_loop`` lifetime. The queue decouples
+    the single shared async generator from its two per-turn consumers
+    (Phase 1 idle wait, ``_watch_release``) so cancelling a consumer
+    only cancels its ``queue.get()`` — the generator's ``finally``
+    (which stops the pynput Listener) never fires mid-session.
+
+    On any pump exit path (iterator exhausted, exception, cancellation)
+    a ``None`` sentinel is enqueued so a consumer blocked on ``get()``
+    wakes and sees pump termination. If the iterator raised, the
+    exception is stashed in the ``pump_error`` out-param (CancelledError
+    excluded — it re-raises so outer-finally teardown recognizes it) so
+    Phase 1 can surface the original ``[ptt] <Type>: <msg>`` detail
+    rather than the generic "event stream ended" line.
     """
     try:
         async for event in ptt_iter:
-            if event == ptt.PTTEvent.RELEASED:
+            await ptt_queue.put(event)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001 — PTT death is fatal (A2)
+        pump_error.append(e)
+    finally:
+        # Best-effort sentinel; swallow failure (queue full is
+        # impossible with the single-consumer-at-a-time design here,
+        # but defensive).
+        with contextlib.suppress(Exception):
+            ptt_queue.put_nowait(None)
+
+
+async def _watch_release(
+    ptt_queue: asyncio.Queue[ptt.PTTEvent | None],
+    ptt_release: asyncio.Event,
+) -> None:
+    """Wait on the pumped queue for the next RELEASED (or pump death).
+
+    Sets ``ptt_release`` as soon as RELEASED arrives so
+    ``stt.transcribe`` can finalize via its ForceEndTurn path. On any
+    exit path (RELEASED seen, pump sentinel ``None`` seen, exception
+    propagated, task cancelled) the Event is set in the ``finally``
+    block so a pending transcribe never hangs forever on PTT death —
+    the next Phase 1 PRESSED-wait will detect the sentinel and return 2
+    per the fatal-triage table.
+    """
+    try:
+        while True:
+            event = await ptt_queue.get()
+            if event is None or event == ptt.PTTEvent.RELEASED:
                 return
+            # Defensive: an unexpected PRESSED (orphaned pair, etc.)
+            # while watching for RELEASED — ignore and keep listening.
     finally:
         ptt_release.set()
 
@@ -167,12 +206,16 @@ async def voice_loop() -> int:
     One turn: PRESSED → ``audio.capture`` → ``stt.transcribe`` →
     (empty? short-circuit) → ``claude.stream_sentences`` →
     ``tts.synthesize`` → ``audio.playback`` → back to PRESSED wait.
-    One ``ptt.events()`` iterator is held for the whole loop; a
-    per-turn ``_watch_release`` task is spawned to catch RELEASED
-    and torn down at turn end.
+    One ``ptt.events()`` iterator is held for the whole loop and
+    drained by a long-lived ``_ptt_pump`` task into an
+    ``asyncio.Queue``; a per-turn ``_watch_release`` task consumes
+    the queue to catch RELEASED and is torn down at turn end. The
+    pump sits between the generator and its consumers so that
+    cancelling the per-turn watcher does not run the generator's
+    ``finally`` (which would stop the pynput Listener mid-session).
 
     Exit codes:
-        0 — Ctrl+C at the idle wait between turns.
+        0 — Ctrl+C / cancellation at the idle wait between turns.
         2 — fatal auth across any provider, or the PTT event stream
             dies / exhausts (continuing would tight-loop into the
             same error on the next ``_next_press`` call).
@@ -183,21 +226,42 @@ async def voice_loop() -> int:
     print(_VOICE_BANNER)
     messages: list[dict] = []
     ptt_iter = ptt.events()
+    ptt_queue: asyncio.Queue[ptt.PTTEvent | None] = asyncio.Queue(
+        maxsize=ptt.EVENT_QUEUE_MAX,
+    )
+    pump_error: list[BaseException] = []
+    pump_task = asyncio.create_task(
+        _ptt_pump(ptt_iter, ptt_queue, pump_error),
+        name="voice-loop-ptt-pump",
+    )
 
     try:
         while True:
             # --- Phase 1: idle wait for PRESSED --------------------
             try:
-                async for event in ptt_iter:
+                while True:
+                    event = await ptt_queue.get()
+                    if event is None:
+                        # Pump sentinel: iterator exhausted or raised.
+                        # NOTE: #55 may want structured PTT-health
+                        # handling here; for now, PTT death is fatal
+                        # (A2 in #53 plan).
+                        if pump_error:
+                            e = pump_error[0]
+                            print(f"[ptt] {type(e).__name__}: {e}")
+                        else:
+                            print("[ptt] event stream ended at idle wait")
+                        return 2
                     if event == ptt.PTTEvent.PRESSED:
                         break
-                else:
-                    # ptt_iter exhausted before PRESSED. NOTE: #55 may
-                    # want to add structured PTT-health handling here;
-                    # for now, PTT death is fatal (A2 in #53 plan).
-                    print("[ptt] event stream ended at idle wait")
-                    return 2
-            except KeyboardInterrupt:
+                    # Orphan RELEASED at idle — defensive, keep listening.
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                # SIGINT at idle. On Python 3.11+, ``asyncio.run()``
+                # delivers SIGINT by cancelling the main task, so the
+                # Phase 1 ``await`` sees CancelledError, not KI. We
+                # treat both as clean idle exits. Mid-stream Phase 5
+                # cancellation (interrupt-the-response UX) is a
+                # different concern tracked under #55.
                 print(_GOODBYE)
                 return 0
             except Exception as e:  # noqa: BLE001 — PTT death is fatal (A2)
@@ -207,10 +271,13 @@ async def voice_loop() -> int:
                 print(f"[ptt] {type(e).__name__}: {e}")
                 return 2
 
-            # Spawn the per-turn RELEASED watcher.
+            # Spawn the per-turn RELEASED watcher. Watcher consumes the
+            # pumped queue, so cancelling it mid-``get()`` only
+            # cancels its own task — the shared ``ptt.events()``
+            # generator stays alive for the next turn.
             ptt_release = asyncio.Event()
             watcher_task = asyncio.create_task(
-                _watch_release(ptt_iter, ptt_release),
+                _watch_release(ptt_queue, ptt_release),
                 name="voice-loop-ptt-watcher",
             )
 
@@ -272,19 +339,29 @@ async def voice_loop() -> int:
                 messages.append({"role": "assistant", "content": "".join(collect)})
             finally:
                 # Tear down the per-turn watcher so it doesn't eat the
-                # next PRESSED. On RELEASED-seen the watcher has
-                # already returned; this cancel is a no-op in that
-                # case. On any mid-turn exit (recoverable or fatal)
-                # the watcher may still be waiting on ptt_iter —
-                # cancel + await.
+                # next PRESSED off the pumped queue. On RELEASED-seen
+                # the watcher has already returned; this cancel is a
+                # no-op in that case. On any mid-turn exit (recoverable
+                # or fatal) the watcher may still be blocked on
+                # ``ptt_queue.get()`` — cancel + await. Because the
+                # watcher consumes the queue (not the shared
+                # ``ptt.events()`` generator directly), cancellation
+                # here does NOT close the generator, so the next turn's
+                # Phase 1 still sees live PTT events.
                 if not watcher_task.done():
                     watcher_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await watcher_task
     finally:
-        # Close the held PTT iterator on any exit path so pynput's
-        # Listener stops cleanly. ``agent.ptt.events`` closes
-        # idempotently via its own finally.
+        # Tear down the pump before closing the iterator so pynput's
+        # Listener stops cleanly on any exit path. Cancellation on the
+        # pump is safe here because ``_ptt_pump`` is the only task
+        # still consuming the shared ``ptt.events()`` generator at
+        # this point. ``agent.ptt.events`` closes idempotently via
+        # its own finally.
+        pump_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await pump_task
         with contextlib.suppress(Exception):
             await ptt_iter.aclose()
 

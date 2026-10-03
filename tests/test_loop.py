@@ -18,6 +18,7 @@ which seam raises.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -179,7 +180,8 @@ def _install_voice_pipeline_mocks(
     monkeypatch,
     *,
     ptt_script,
-    stt_result,
+    stt_result=None,
+    stt_results=None,
     sentences=("ok.",),
     synth_result=(b"a",),
 ):
@@ -187,16 +189,33 @@ def _install_voice_pipeline_mocks(
     ``agent.stt.transcribe``, ``agent.claude.stream_sentences``,
     ``agent.tts.synthesize``, and ``agent.audio.playback``.
 
+    Exactly one of ``stt_result`` (single value or exception, replayed on
+    every turn) or ``stt_results`` (list indexed by call count, letting a
+    test inject a different outcome per turn) must be set. The list form
+    is what the F2 regression and F3 recoverable-multi-turn tests use to
+    observe behavior across more than one turn.
+
     Returns the list of ``messages`` captured by the ``stream_sentences``
     stub so individual tests can assert on message-history state.
     """
+    if (stt_result is None) == (stt_results is None):
+        raise AssertionError("exactly one of stt_result / stt_results must be set")
+
     monkeypatch.setattr("agent.ptt.events", lambda: _scripted_async_gen(ptt_script))
     monkeypatch.setattr("agent.audio.capture", lambda *a, **kw: _scripted_async_gen([]))
 
+    stt_call_count = {"n": 0}
+
     async def _fake_transcribe(_chunks, _release):
-        if isinstance(stt_result, BaseException):
-            raise stt_result
-        return stt_result
+        if stt_results is not None:
+            idx = stt_call_count["n"]
+            stt_call_count["n"] += 1
+            result = stt_results[idx]
+        else:
+            result = stt_result
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     monkeypatch.setattr("agent.stt.transcribe", _fake_transcribe)
 
@@ -246,19 +265,38 @@ def _install_voice_pipeline_mocks(
     return captured_messages
 
 
-# --- T8: KeyboardInterrupt at Phase 1 idle wait ------------------------
+# --- T8: SIGINT / CancelledError at Phase 1 idle wait ------------------
 
 
-async def test_voice_mode_ctrl_c_at_idle_exits_zero(monkeypatch, capsys):
-    """KeyboardInterrupt during Phase 1 idle wait → exit 0 + goodbye."""
+async def test_voice_mode_cancelled_at_idle_exits_zero(monkeypatch, capsys):
+    """CancelledError during Phase 1 idle wait → exit 0 + goodbye.
+
+    On Python 3.11+, ``asyncio.run()`` delivers SIGINT by cancelling the
+    main task, so the Phase 1 ``await ptt_queue.get()`` sees
+    ``asyncio.CancelledError``, not ``KeyboardInterrupt``. The handler
+    catches both together, so this one test (which injects CancelledError
+    directly at the queue-get call site, mirroring the production
+    propagation path) covers both signals.
+
+    We stub the pump to a no-op and swap in a queue whose first ``get()``
+    raises CancelledError, so the error arrives at the Phase 1 await
+    rather than inside the pump (where it would be treated as a fatal
+    source exhaustion and return 2 instead of 0).
+    """
     _set_voice_argv(monkeypatch)
     _set_all_keys(monkeypatch)
     monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
     _install_voice_pipeline_mocks(
         monkeypatch,
-        ptt_script=[("raise", KeyboardInterrupt())],
+        ptt_script=[],  # pump exhausts cleanly without emitting
         stt_result="never-reached",
     )
+
+    class _CancellingQueue(asyncio.Queue):
+        async def get(self):  # type: ignore[override]
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr("agent.loop.asyncio.Queue", _CancellingQueue)
 
     from agent.loop import run
 
@@ -430,81 +468,39 @@ async def test_voice_mode_stt_recoverable_continues(monkeypatch, capsys, exc_fac
     assert captured_messages == []
 
 
-# --- T16-T21: Phase 5 error triage (Claude + TTS + generic) ------------
+# --- T16+: Phase 5 error triage (Claude + TTS + generic) ---------------
 #
-# The parametrize covers the full triage table:
-# * fatal rows → exit 2, user turn NOT popped (A1)
-# * recoverable rows → continue, user turn popped
+# Split per CodeRabbit F3 into two tests so the pop-vs-no-pop behavioral
+# distinction between fatal and recoverable rows is actually observed:
 #
-# All rows use the same single-turn script: PRESSED → RELEASED → stt="hi",
-# then the chosen error is injected into Phase 5 via either
-# ``stream_sentences`` or ``synthesize`` depending on which seam owns
-# the exception type.
+# * Fatal rows (single turn, exit 2 immediately): assert captured_messages
+#   length == 1 and content shows the (unpopped) user turn.
+# * Recoverable rows (two turns): assert captured_messages length == 2 and
+#   turn 2's view shows ONLY the second user message — proving turn 1's
+#   message was popped from history after the recoverable error.
 
 
 @pytest.mark.parametrize(
-    "source,exc_factory,expected_exit,expected_tag,pops_user",
+    "source,exc_factory,expected_tag",
     [
         pytest.param(
             "claude",
             lambda: AuthenticationError("401", response=MagicMock(), body=None),
-            2,
             "[auth]",
-            False,
             id="claude-auth-fatal",
-        ),
-        pytest.param(
-            "claude",
-            lambda: RateLimitError("429", response=MagicMock(), body=None),
-            2,
-            "[rate]",
-            True,
-            id="claude-rate-recoverable",
-        ),
-        pytest.param(
-            "claude",
-            lambda: APIConnectionError(request=MagicMock()),
-            2,
-            "[net]",
-            True,
-            id="claude-net-recoverable",
         ),
         pytest.param(
             "tts",
             lambda: tts.TTSAuthError("401 elevenlabs"),
-            2,
             "[auth]",
-            False,
             id="tts-auth-fatal",
-        ),
-        pytest.param(
-            "tts",
-            lambda: tts.TTSError("socket dropped"),
-            2,
-            "[tts]",
-            True,
-            id="tts-generic-recoverable",
-        ),
-        pytest.param(
-            "tts",
-            lambda: RuntimeError("surprise"),
-            2,
-            "[err]",
-            True,
-            id="unknown-exception-safety-net",
         ),
     ],
 )
-async def test_voice_mode_phase5_error_triage(
-    monkeypatch, capsys, source, exc_factory, expected_exit, expected_tag, pops_user
+async def test_voice_mode_phase5_fatal_exits_two_without_pop(
+    monkeypatch, capsys, source, exc_factory, expected_tag
 ):
-    """Phase-5 fatal rows exit 2 without popping (A1); recoverable rows pop and continue.
-
-    After a single injected error, the PTT script exhausts, so recoverable
-    paths still end at exit 2 via Phase 1's "PTT ended" detector — the
-    behavioral assertion for recoverable rows is on ``captured_messages``,
-    not on the exit code difference.
-    """
+    """Fatal Phase-5 rows exit 2 immediately and do NOT pop the user turn (A1)."""
     _set_voice_argv(monkeypatch)
     _set_all_keys(monkeypatch)
     monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
@@ -526,19 +522,175 @@ async def test_voice_mode_phase5_error_triage(
 
     from agent.loop import run
 
-    assert await run() == expected_exit
+    assert await run() == 2
     out = capsys.readouterr().out
     assert expected_tag in out
-    # Pop behavior is observable via the next Phase-1 iteration's view of
-    # messages, but with only one turn before exhaustion we assert on the
-    # messages that ``stream_sentences`` saw: that view is pre-pop, so a
-    # single ``{role:user,content:hi}`` entry is present either way. The
-    # distinction between fatal (no pop, exit 2 immediate) and
-    # recoverable (pop, loop continues to idle, idle sees exhaustion,
-    # exit 2) manifests in observability more subtly — the parametrize
-    # row's ``pops_user`` flag is retained for self-documentation and to
-    # express intent even though a single-turn script can't disambiguate
-    # the two shapes further. Deeper multi-turn coverage can land once
-    # #55's cancellation story is nailed down.
-    _ = pops_user
-    assert captured_messages == [[{"role": "user", "content": "hi"}]]
+    # Exactly one stream_sentences call; the user turn stayed on history
+    # (fatal rows do not pop) and PTT death never got a chance to add
+    # a second iteration — exit 2 is immediate from the fatal branch,
+    # not from Phase 1's "PTT ended" detector.
+    assert len(captured_messages) == 1
+    assert captured_messages[0] == [{"role": "user", "content": "hi"}]
+
+
+@pytest.mark.parametrize(
+    "source,exc_factory,expected_tag",
+    [
+        pytest.param(
+            "claude",
+            lambda: RateLimitError("429", response=MagicMock(), body=None),
+            "[rate]",
+            id="claude-rate-recoverable",
+        ),
+        pytest.param(
+            "claude",
+            lambda: APIConnectionError(request=MagicMock()),
+            "[net]",
+            id="claude-net-recoverable",
+        ),
+        pytest.param(
+            "tts",
+            lambda: tts.TTSError("socket dropped"),
+            "[tts]",
+            id="tts-generic-recoverable",
+        ),
+        pytest.param(
+            "tts",
+            lambda: RuntimeError("surprise"),
+            "[err]",
+            id="unknown-exception-safety-net",
+        ),
+    ],
+)
+async def test_voice_mode_phase5_recoverable_pops_and_continues(
+    monkeypatch, capsys, source, exc_factory, expected_tag
+):
+    """Recoverable Phase-5 rows pop the user turn and keep going.
+
+    Two-turn script: turn 1 fails with the parametrized error (user turn
+    expected to be popped); turn 2 completes cleanly. The behavioral
+    assertion is that turn 2's ``stream_sentences`` view contains ONLY
+    turn 2's user message — a leaked turn-1 entry would prove the pop
+    didn't happen.
+    """
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    # Turn 1 injects the error via the chosen seam; turn 2 streams a clean
+    # reply. We pin ``sentences`` and ``synth_result`` to the *first*
+    # turn's shape; the fakes are stateless w.r.t. call count so turn 2
+    # re-uses the same stub behavior — for a recoverable row that means
+    # Claude's turn 2 either yields the pinned sentence (TTS-side error)
+    # or re-raises (Claude-side error). The latter would prevent us from
+    # observing turn 2, so for Claude-side errors we flip ``sentences`` to
+    # a plain string on second call via a small per-call wrapper.
+    exc = exc_factory()
+    sentences_calls = {"n": 0}
+    synth_calls = {"n": 0}
+    pinned_sentence = ("Reply.",)
+
+    def _flaky_stream_sentences(messages, _system):
+        captured_messages.append([dict(m) for m in messages])
+        n = sentences_calls["n"]
+        sentences_calls["n"] += 1
+        if source == "claude" and n == 0:
+
+            async def _raiser():
+                raise exc
+                yield  # pragma: no cover
+
+            return _raiser()
+        return _scripted_async_gen([("yield", s) for s in pinned_sentence])
+
+    def _flaky_synthesize(text_chunks):
+        n = synth_calls["n"]
+        synth_calls["n"] += 1
+        if source == "tts" and n == 0:
+
+            async def _raiser():
+                async for _ in text_chunks:
+                    pass
+                raise exc
+                yield  # pragma: no cover
+
+            return _raiser()
+
+        async def _passthrough():
+            async for _ in text_chunks:
+                pass
+            yield b"\x00"
+
+        return _passthrough()
+
+    captured_messages = _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_results=["hi", "second"],
+    )
+    # Override the two seams the triage test cares about with per-call
+    # fakes closed over the captured_messages list the installer returned.
+    monkeypatch.setattr("agent.loop.stream_sentences", _flaky_stream_sentences)
+    monkeypatch.setattr("agent.tts.synthesize", _flaky_synthesize)
+
+    from agent.loop import run
+
+    assert await run() == 2  # PTT exhausts after turn 2
+    out = capsys.readouterr().out
+    assert expected_tag in out
+    # Two Claude calls: turn 1 saw [{user:hi}] (pre-pop), turn 2 saw
+    # [{user:second}] — turn-1's "hi" was popped before turn 2.
+    assert len(captured_messages) == 2
+    assert captured_messages[0] == [{"role": "user", "content": "hi"}]
+    assert captured_messages[1] == [{"role": "user", "content": "second"}]
+
+
+# --- F2 regression: shared PTT source survives mid-turn watcher cancel --
+
+
+async def test_voice_mode_recovers_from_stt_error_before_release(monkeypatch, capsys):
+    """Recoverable STT error mid-turn must not brick the next turn.
+
+    Pre-F2, cancelling the per-turn ``_watch_release`` task while it was
+    suspended inside the shared ``ptt.events()`` generator ran the
+    generator's ``finally`` (stopping the pynput Listener). The next
+    Phase 1 iteration then saw ``StopAsyncIteration`` immediately and
+    returned 2 — the first recoverable STT hiccup silently bricked voice
+    mode. The pump pattern (``_ptt_pump`` → ``asyncio.Queue`` → consumers)
+    isolates the generator so cancellation only cancels the consumer's
+    ``queue.get()``, keeping the source alive for turn 2.
+
+    Script: turn 1 PRESSED → STTError (recoverable) → turn 2 PRESSED →
+    RELEASED → stt returns "second". Assertion: turn 2 reaches
+    ``stream_sentences`` with ``[{role:user, content:second}]``, proving
+    the pump survived turn 1's mid-turn watcher cancellation.
+    """
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+    captured_messages = _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_results=[stt.STTError("boom"), "second"],
+    )
+
+    from agent.loop import run
+
+    assert await run() == 2  # PTT exhausts after turn 2
+    out = capsys.readouterr().out
+    assert "[stt]" in out  # turn 1's recoverable error surfaced
+    # Turn 2 made it to Claude — turn-1's STT error did not close the
+    # shared PTT source. If F2 regresses, captured_messages is empty
+    # (Phase 1 after the error sees ``None`` from the dead pump and
+    # returns 2 before turn 2 can run).
+    assert len(captured_messages) == 1
+    assert captured_messages[0] == [{"role": "user", "content": "second"}]
