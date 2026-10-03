@@ -57,21 +57,7 @@ extend-exclude = [
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
 
-[tool.ruff.lint.per-file-ignores]
-# Tier-1 seam file agent/loop.py is on the "don't modify" list per
-# AGENT.md / user constraints until #55 refactors it for voice.
-# agent/claude.py's UP028 exemption was removed in #52 as a natural
-# consequence of the AsyncAnthropic swap. Grandfathering the one
-# remaining ruff violation so this PR's lint job doesn't force early
-# edits:
-#   agent/loop.py:6  I001  — import block layout (extra blank line)
-"agent/loop.py" = ["I001"]
-
 [tool.ruff.format]
-# agent/loop.py: shipped in Tier 1 (PR #35) and on the AGENT.md
-# "don't modify" list until Tier 3 refactors it for voice. Ruff format
-# wants two cosmetic changes there (collapse a wrapped string, tighten
-# a trailing-comment indent); grandfathered here as follow-up.
 # README.md: ruff v0.15 flags markdown content (line 121); markdown is
 # not ruff's job, exclude it to unblock CI.
-exclude = ["agent/loop.py", "README.md"]
+exclude = ["README.md"]
