@@ -35,6 +35,7 @@ boundary regex).
 import re
 from collections.abc import AsyncIterator
 
+import httpx2
 from anthropic import (
     APIConnectionError,
     AsyncAnthropic,
@@ -47,10 +48,29 @@ from agent.models import MODEL
 __all__ = [
     "APIConnectionError",
     "AuthenticationError",
+    "NetworkError",
     "RateLimitError",
     "stream_sentences",
     "stream_tokens",
 ]
+
+
+class NetworkError(Exception):
+    """Transport-level failure during LLM streaming (#55).
+
+    Wraps ``httpx2.TransportError`` so ``agent.loop`` can catch an
+    ``agent.claude``-owned type without importing ``httpx2`` directly.
+    Keeps ADR-0003's LLM seam intact: only ``agent.claude`` touches
+    ``anthropic``/``httpx2``.
+
+    Covers mid-stream SSE drops (``RemoteProtocolError``, ``ReadError``,
+    ``ReadTimeout``, ``ConnectError``, and other ``TransportError``
+    subclasses) that the SDK does NOT translate into
+    ``anthropic.APIConnectionError`` — the SDK's wrapping lives at
+    ``_base_client._request`` and runs at connect-time only, not mid-SSE.
+    See #55 investigation §5 for the empirical trace.
+    """
+
 
 _MAX_TOKENS: int = 1024
 
@@ -131,14 +151,22 @@ async def stream_tokens(messages: list[dict], system: str) -> AsyncIterator[str]
         anthropic.APIError: other API-side failures.
     """
     client = _get_client()
-    async with client.messages.stream(
-        model=MODEL,
-        max_tokens=_MAX_TOKENS,
-        system=system,
-        messages=messages,
-    ) as stream:
-        async for text in stream.text_stream:
-            yield text
+    try:
+        async with client.messages.stream(
+            model=MODEL,
+            max_tokens=_MAX_TOKENS,
+            system=system,
+            messages=messages,
+        ) as stream:
+            async for text in stream.text_stream:
+                yield text
+    except httpx2.TransportError as e:
+        # #55 D4: mid-stream SSE drops (TCP reset, DNS flap, read
+        # timeout, …) bubble out of the SDK as raw httpx2.* types —
+        # the SDK's APIConnectionError wrap only runs at connect-time.
+        # Translate at the seam so agent.loop can catch
+        # agent.claude.NetworkError without importing httpx2.
+        raise NetworkError(str(e)) from e
 
 
 async def _buffer_sentences(tokens: AsyncIterator[str]) -> AsyncIterator[str]:
@@ -245,7 +273,16 @@ async def stream_sentences(messages: list[dict], system: str) -> AsyncIterator[s
     """
     tokens = stream_tokens(messages, system)
     try:
-        async for chunk in _buffer_sentences(tokens):
-            yield chunk
+        try:
+            async for chunk in _buffer_sentences(tokens):
+                yield chunk
+        except httpx2.TransportError as e:
+            # #55 D4: mirror stream_tokens' translation here so a
+            # drop that surfaces inside _buffer_sentences' iteration
+            # (which drives tokens.__anext__) is caught at the seam.
+            # stream_tokens already wraps its own direct SSE
+            # iteration; this covers the case where the drop is
+            # observed by the sentence buffer's consumer side.
+            raise NetworkError(str(e)) from e
     finally:
         await tokens.aclose()

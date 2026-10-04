@@ -23,7 +23,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agent import ptt, stt, tts
+from agent import audio, ptt, stt, tts
 from agent.claude import APIConnectionError, AuthenticationError, RateLimitError
 
 # --- Fake async-iterator helpers ----------------------------------------
@@ -187,7 +187,9 @@ def _install_voice_pipeline_mocks(
 ):
     """Install default fakes for ``agent.ptt.events``, ``agent.audio.capture``,
     ``agent.stt.transcribe``, ``agent.claude.stream_sentences``,
-    ``agent.tts.synthesize``, and ``agent.audio.playback``.
+    ``agent.tts.synthesize``, ``agent.audio.playback``, and (#55 D5)
+    no-op the startup audio probes so headless CI doesn't hit real
+    PortAudio.
 
     Exactly one of ``stt_result`` (single value or exception, replayed on
     every turn) or ``stt_results`` (list indexed by call count, letting a
@@ -203,6 +205,11 @@ def _install_voice_pipeline_mocks(
 
     monkeypatch.setattr("agent.ptt.events", lambda: _scripted_async_gen(ptt_script))
     monkeypatch.setattr("agent.audio.capture", lambda *a, **kw: _scripted_async_gen([]))
+    # #55 D5: default to probes-pass so the voice branch is reached.
+    # Individual tests that exercise the fallback-to-text path
+    # override these afterwards.
+    monkeypatch.setattr("agent.audio.probe_input_device", lambda *a, **kw: None)
+    monkeypatch.setattr("agent.audio.probe_output_device", lambda *a, **kw: None)
 
     stt_call_count = {"n": 0}
 
@@ -694,3 +701,318 @@ async def test_voice_mode_recovers_from_stt_error_before_release(monkeypatch, ca
     # returns 2 before turn 2 can run).
     assert len(captured_messages) == 1
     assert captured_messages[0] == [{"role": "user", "content": "second"}]
+
+
+# --- Bundle 7+ (#55): new error paths -----------------------------------
+
+
+async def test_voice_mode_phase5_cancellederror_uncancels_and_continues(monkeypatch, capsys):
+    """#55 D3: mid-stream Ctrl+C → task.uncancel() → [stopped] + continue.
+
+    Two-turn script. Turn 1 injects asyncio.CancelledError into
+    audio.playback; voice_loop should catch, uncancel (count 0 →
+    swallow), print [stopped], pop the pending user turn, and keep
+    going. Turn 2 completes cleanly. stream_sentences sees the second
+    turn's user message only — proving pop happened before continue.
+    """
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    play_calls = {"n": 0}
+
+    async def _flaky_playback(chunks, *_a, **_kw):
+        async for _ in chunks:
+            pass
+        n = play_calls["n"]
+        play_calls["n"] += 1
+        if n == 0:
+            raise asyncio.CancelledError
+        return
+
+    captured_messages = _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_results=["hi", "second"],
+    )
+    monkeypatch.setattr("agent.audio.playback", _flaky_playback)
+
+    from agent.loop import run
+
+    assert await run() == 2  # PTT exhausts after turn 2
+    out = capsys.readouterr().out
+    assert "[stopped]" in out
+    assert len(captured_messages) == 2
+    assert captured_messages[0] == [{"role": "user", "content": "hi"}]
+    assert captured_messages[1] == [{"role": "user", "content": "second"}]
+
+
+async def test_voice_mode_phase5_cancellederror_external_reraises(monkeypatch, capsys):
+    """#55 D3: external cancellation (uncancel() > 0) must re-raise."""
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    async def _playback_double_cancels(chunks, *_a, **_kw):
+        async for _ in chunks:
+            pass
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        task.cancel()
+        raise asyncio.CancelledError
+
+    _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_result="hi",
+    )
+    monkeypatch.setattr("agent.audio.playback", _playback_double_cancels)
+
+    from agent.loop import run
+
+    with pytest.raises(asyncio.CancelledError):
+        await run()
+    out = capsys.readouterr().out
+    assert "[stopped]" not in out
+
+
+async def test_voice_mode_phase5_network_error_recovers(monkeypatch, capsys):
+    """#55 D4: NetworkError mid-Phase-5 → [net] + pop + continue."""
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    from agent.claude import NetworkError
+
+    captured_messages = _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_result="hi",
+        sentences=NetworkError("peer closed mid-SSE"),
+    )
+
+    from agent.loop import run
+
+    assert await run() == 2
+    out = capsys.readouterr().out
+    assert "[net] Lost connection mid-response" in out
+    assert captured_messages == [[{"role": "user", "content": "hi"}]]
+
+
+async def test_voice_mode_phase5_playback_error_prints_text_reply(monkeypatch, capsys):
+    """#55 D1 + R5: playback dies mid-stream → [audio] + text reply + keep assistant turn."""
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    async def _playback_dies(chunks, *_a, **_kw):
+        async for _ in chunks:
+            pass
+        raise audio.AudioPlaybackError("output stream stalled (10 consecutive underflows)")
+
+    _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_results=["hi", "next turn"],
+        sentences=("Hello.", " How can I help?"),
+    )
+    monkeypatch.setattr("agent.audio.playback", _playback_dies)
+
+    captured_messages: list = []
+
+    def _recording_stream_sentences(messages, _system):
+        captured_messages.append([dict(m) for m in messages])
+        return _scripted_async_gen([("yield", "Hello."), ("yield", " How can I help?")])
+
+    monkeypatch.setattr("agent.loop.stream_sentences", _recording_stream_sentences)
+
+    from agent.loop import run
+
+    assert await run() == 2
+    out = capsys.readouterr().out
+    assert "[audio]" in out
+    assert "friday > Hello. How can I help?" in out
+    assert len(captured_messages) == 2
+    assert captured_messages[1] == [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "Hello. How can I help?"},
+        {"role": "user", "content": "next turn"},
+    ]
+
+
+async def test_voice_mode_phase5_playback_error_empty_collect(monkeypatch, capsys):
+    """#55 R6: playback dies BEFORE any sentence emitted → pop user, no 'friday >' line."""
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    async def _playback_dies_before_any_chunk(chunks, *_a, **_kw):
+        raise audio.AudioPlaybackError("device unplugged before first frame")
+
+    captured_messages = _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_results=["hi", "retry"],
+    )
+    monkeypatch.setattr("agent.audio.playback", _playback_dies_before_any_chunk)
+
+    from agent.loop import run
+
+    assert await run() == 2
+    out = capsys.readouterr().out
+    assert "[audio]" in out
+    assert "friday >" not in out
+    assert len(captured_messages) == 2
+    assert captured_messages[1] == [{"role": "user", "content": "retry"}]
+
+
+async def test_voice_mode_phase5_tts_error_apologizes_textually(monkeypatch, capsys):
+    """#55 D2: TTSError → [tts] + [friday] text apology + pop + continue."""
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_result="hi",
+        synth_result=tts.TTSError("websocket dropped"),
+    )
+
+    from agent.loop import run
+
+    assert await run() == 2
+    out = capsys.readouterr().out
+    assert "[tts]" in out
+    assert "Sorry, I lost my voice. Try again." in out
+
+
+async def test_voice_mode_anthropic_auth_names_env_var(monkeypatch, capsys):
+    """#55 D6: mid-session AuthenticationError message names the env var."""
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_result="hi",
+        sentences=AuthenticationError("401", response=MagicMock(), body=None),
+    )
+
+    from agent.loop import run
+
+    assert await run() == 2
+    out = capsys.readouterr().out
+    assert "ANTHROPIC_API_KEY" in out
+    assert "[auth]" in out
+
+
+async def test_text_mode_cancellederror_mid_stream_exits_zero(monkeypatch, capsys):
+    """#55 D3: text_loop mid-stream CancelledError → [goodbye] + exit 0."""
+    _set_text_argv(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+    monkeypatch.setattr("builtins.input", MagicMock(return_value="hi"))
+
+    async def _raising_stream(_messages, _system):
+        yield "Hello "
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("agent.loop.stream_tokens", _raising_stream)
+
+    from agent.loop import run
+
+    assert await run() == 0
+    out = capsys.readouterr().out
+    assert "goodbye" in out
+
+
+async def test_text_mode_keyboardinterrupt_mid_stream_exits_zero(monkeypatch, capsys):
+    """#55 D3 (R4 defensive): text_loop mid-stream KeyboardInterrupt → exit 0."""
+    _set_text_argv(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+    monkeypatch.setattr("builtins.input", MagicMock(return_value="hi"))
+
+    async def _raising_stream(_messages, _system):
+        yield "Hello "
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("agent.loop.stream_tokens", _raising_stream)
+
+    from agent.loop import run
+
+    assert await run() == 0
+    out = capsys.readouterr().out
+    assert "goodbye" in out
+
+
+async def test_run_falls_back_to_text_on_mic_unavailable(monkeypatch, capsys):
+    """#55 D5: AudioDeviceUnavailable from input probe → text_loop dispatched."""
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    def _bad_input_probe(*_a, **_kw):
+        raise audio.AudioDeviceUnavailable("no usable input device: no default")
+
+    monkeypatch.setattr("agent.audio.probe_input_device", _bad_input_probe)
+    monkeypatch.setattr("agent.audio.probe_output_device", lambda *a, **kw: None)
+    monkeypatch.setattr("builtins.input", MagicMock(side_effect=KeyboardInterrupt))
+
+    from agent.loop import run
+
+    assert await run() == 0
+    out = capsys.readouterr().out
+    assert "[audio]" in out
+    assert "falling back to text mode" in out
+
+
+async def test_run_falls_back_to_text_on_speaker_unavailable(monkeypatch, capsys):
+    """#55 D5: AudioDeviceUnavailable from output probe → text_loop dispatched."""
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    def _bad_output_probe(*_a, **_kw):
+        raise audio.AudioDeviceUnavailable("no usable output device: no default")
+
+    monkeypatch.setattr("agent.audio.probe_input_device", lambda *a, **kw: None)
+    monkeypatch.setattr("agent.audio.probe_output_device", _bad_output_probe)
+    monkeypatch.setattr("builtins.input", MagicMock(side_effect=KeyboardInterrupt))
+
+    from agent.loop import run
+
+    assert await run() == 0
+    out = capsys.readouterr().out
+    assert "[audio]" in out
+    assert "falling back to text mode" in out

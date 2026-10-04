@@ -16,6 +16,7 @@ import warnings
 from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx2
 import pytest
 from anthropic import RateLimitError
 
@@ -138,6 +139,79 @@ async def test_stream_tokens_propagates_mid_stream_error(mock_claude_client):
 
     assert got == ["first ", "second "]
     assert exc_info.value is sentinel
+
+
+async def test_stream_tokens_wraps_httpx2_transport_error_as_network_error(mock_claude_client):
+    """#55 D4: mid-stream httpx2.TransportError bubbling out of
+    ``stream.text_stream`` is caught at the seam and re-raised as
+    ``agent.claude.NetworkError`` with the httpx2 exception on
+    ``__cause__``. Covers all four empirically-observed transport
+    types from the plan's §1 verification: ``RemoteProtocolError``,
+    ``ReadError``, ``ReadTimeout``, ``ConnectError``.
+    """
+    req = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+
+    for cls in (
+        httpx2.RemoteProtocolError,
+        httpx2.ReadError,
+        httpx2.ReadTimeout,
+        httpx2.ConnectError,
+    ):
+        injected = cls(f"simulated {cls.__name__}", request=req)
+
+        async def _dropping_iter(exc=injected) -> AsyncIterator[str]:
+            yield "Hello "
+            raise exc
+
+        ctx = _mk_stream_ctx(_dropping_iter())
+        mock_claude_client.messages.stream.return_value = ctx
+
+        got: list[str] = []
+        with pytest.raises(agent.claude.NetworkError) as exc_info:
+            async for c in agent.claude.stream_tokens([{"role": "user", "content": "hi"}], "sys"):
+                got.append(c)
+
+        assert got == ["Hello "]
+        assert exc_info.value.__cause__ is injected, (
+            f"{cls.__name__}: __cause__ not chained to the httpx2 exception"
+        )
+        # The wrapped message should include the httpx2 message text so
+        # agent.loop's [net] handler surfaces something informative.
+        assert str(injected) in str(exc_info.value) or f"simulated {cls.__name__}" in str(
+            exc_info.value
+        )
+
+
+async def test_stream_sentences_wraps_httpx2_transport_error_as_network_error(
+    mock_claude_client,
+):
+    """D4 mirror on the sentence-chunked seam: a mid-stream transport
+    error observed through ``_buffer_sentences``' consumer side is
+    also translated to ``NetworkError``. Guards the second wrap
+    added in ``stream_sentences`` (not just ``stream_tokens``).
+    """
+    req = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    injected = httpx2.ReadError("peer dropped mid-SSE", request=req)
+
+    async def _dropping_iter() -> AsyncIterator[str]:
+        # The dot after "World" needs an uppercase-M lookahead for the
+        # sentence-boundary regex to flush it as a second chunk — see
+        # _SENTENCE_BOUNDARY in agent/claude.py. Hence "Hello. World. More."
+        # in one delta: two boundaries fire against lookahead " W" and " M".
+        yield "Hello. World. More."
+        raise injected
+
+    ctx = _mk_stream_ctx(_dropping_iter())
+    mock_claude_client.messages.stream.return_value = ctx
+
+    got: list[str] = []
+    with pytest.raises(agent.claude.NetworkError) as exc_info:
+        async for c in agent.claude.stream_sentences([{"role": "user", "content": "hi"}], "sys"):
+            got.append(c)
+
+    # Two sentence boundaries fired on the single delta before the drop.
+    assert got == ["Hello.", " World."]
+    assert exc_info.value.__cause__ is injected
 
 
 async def test_stream_tokens_consumer_break_calls_aexit(mock_claude_client):
