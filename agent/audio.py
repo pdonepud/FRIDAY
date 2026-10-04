@@ -357,6 +357,7 @@ async def playback(chunks: AsyncIterator[bytes], device: int | None = None) -> N
     pump_task: asyncio.Task[None] | None = None
     watcher_task: asyncio.Task[None] | None = None
     silence_task: asyncio.Task[None] | None = None
+    feed_task: asyncio.Task[None] | None = None
     try:
         stream.start()
         # Reset the heartbeat after start(): the stream warm-up window
@@ -384,6 +385,16 @@ async def playback(chunks: AsyncIterator[bytes], device: int | None = None) -> N
         )
         if watcher_task in done:
             watcher_task.result()  # re-raises AudioPlaybackError
+        if feed_task in done:
+            # CodeRabbit catch (PR #68): re-raise any exception from the
+            # chunks iterator (TTSError, agent.claude.NetworkError, any
+            # generic Exception from Claude's streaming) so voice_loop's
+            # Phase 5 handlers can see it. Without this the None sentinel
+            # is never queued, pump blocks on queue.get(), watcher blocks
+            # on error_event, and the turn deadlocks. The voice-loop
+            # tests mocked playback entirely so this composition path
+            # was never exercised.
+            feed_task.result()  # re-raises if feed failed
 
         # Phase B (plan §3c PATCH 1): feed done. Wait for the pump to
         # drain OR the watcher to fire. Previous shape awaited the
@@ -419,7 +430,12 @@ async def playback(chunks: AsyncIterator[bytes], device: int | None = None) -> N
             # R3 hygiene: unblock the executor-blocked _error_watcher
             # even on clean completion so no thread-pool worker leaks.
             error_event.set()
-            for t in (pump_task, watcher_task, silence_task):
+            # feed_task is in the cleanup set too (CodeRabbit catch,
+            # PR #68) so a dangling feeder on any mid-stream exit path
+            # is cancelled and awaited rather than leaked. Order
+            # places it first so cancellation unblocks any outstanding
+            # `await queue.put(chunk)` before the pump is torn down.
+            for t in (feed_task, pump_task, watcher_task, silence_task):
                 if t is not None and not t.done():
                     t.cancel()
             # Plan §3c PATCH 2: suppress ONLY CancelledError on the
@@ -428,7 +444,7 @@ async def playback(chunks: AsyncIterator[bytes], device: int | None = None) -> N
             # propagate — that's the whole point of the dual-watchdog
             # mechanism. Any non-CancelledError bubbles out, and the
             # outer finally guarantees stream teardown still happens.
-            for t in (pump_task, watcher_task, silence_task):
+            for t in (feed_task, pump_task, watcher_task, silence_task):
                 if t is not None:
                     with contextlib.suppress(asyncio.CancelledError):
                         await t

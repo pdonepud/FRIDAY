@@ -851,18 +851,27 @@ class _UnderflowFakeOutputStream:
 
 
 async def test_playback_callback_underflow_signals_error(monkeypatch):
-    """Persistent underflow with pending audio → AudioPlaybackError."""
+    """Persistent underflow with pending audio → AudioPlaybackError.
+
+    Feeds a single large chunk upfront so the byte buffer stays
+    non-empty regardless of how fast the fake callback thread drains
+    relative to the asyncio feed loop. Prior version used a steady
+    feed with 10 ms sleeps + 2 KB chunks, which raced on 3.12 CI
+    runners: the sync callback thread drained the buffer between
+    asyncio ticks, flipping ``buffer_pending`` back to False and
+    resetting the underflow counter before the threshold tripped.
+    One 100 KB upfront chunk → ~100 callback drains before empty →
+    threshold (10) crosses deterministically.
+    """
     monkeypatch.setattr(agent.audio.sd, "RawOutputStream", _UnderflowFakeOutputStream)
 
     async def _gen() -> AsyncIterator[bytes]:
-        # Keep feeding so the buffer stays non-empty while the callback
-        # reports underflow. Yield steadily until the watcher wins.
+        yield b"\x00" * 100_000  # keep buffer non-empty across ≥10 callbacks
+        # Idle so the generator doesn't exhaust before the watcher wins.
         try:
-            while True:
-                yield b"\x00" * 2048
-                await asyncio.sleep(0.01)
-        except GeneratorExit:
-            return
+            await asyncio.sleep(5.0)
+        except asyncio.CancelledError:
+            raise
 
     with pytest.raises(AudioPlaybackError) as exc_info:
         await asyncio.wait_for(playback(_gen()), timeout=3.0)
@@ -1030,3 +1039,64 @@ async def test_playback_device_fails_mid_drain(monkeypatch):
     # Finally ran: stream was stopped + closed despite the re-raise.
     assert captured[0].stopped is True
     assert captured[0].closed is True
+
+
+# ---------------------------------------------------------------------------
+# Bundle 11 (#55 CodeRabbit catch on PR #68): feed_task exceptions must
+# surface to playback()'s caller rather than deadlocking Phase B.
+# ---------------------------------------------------------------------------
+
+
+async def test_playback_surfaces_chunk_iterator_exception(fake_output_stream):
+    """A chunks-iterator raise reaches playback()'s caller instead of hanging.
+
+    Pre-fix, Phase A only inspected ``watcher_task in done`` — when
+    ``feed_task`` finished with an exception, the exception was
+    silently dropped. Phase B then awaited the pump, which was
+    blocked on ``queue.get()`` because the ``None`` sentinel was
+    never queued (``_feed`` raised before putting it). The turn
+    deadlocked forever.
+
+    This test proves Phase A now re-raises ``feed_task.result()``.
+    """
+    sentinel = RuntimeError("tts went boom")
+
+    async def _flaky_chunks() -> AsyncIterator[bytes]:
+        yield b"\x00" * 480
+        raise sentinel
+
+    # 1 s guard proves no deadlock. Pre-fix this hangs until wait_for
+    # fires its own TimeoutError, which the test would surface as a
+    # distinct failure signature.
+    with pytest.raises(RuntimeError) as exc_info:
+        await asyncio.wait_for(playback(_flaky_chunks()), timeout=1.0)
+    assert exc_info.value is sentinel
+
+    # Stream still torn down cleanly.
+    assert fake_output_stream[0].stopped is True
+    assert fake_output_stream[0].closed is True
+
+
+async def test_playback_surfaces_tts_error_equivalent(fake_output_stream):
+    """Same path, exception type that matches the actual voice_loop
+    composition case (TTSError-equivalent). Documents the behavior
+    expected under production: when ``_tee`` propagates a TTSError
+    from the ``synthesize`` iterator, playback() must re-raise it
+    so Phase 5's ``except tts.TTSError`` handler can fire.
+    """
+
+    class _FakeTTSError(Exception):
+        """Stand-in matching the TTSError shape without importing tts here."""
+
+    boom = _FakeTTSError("websocket dropped mid-stream")
+
+    async def _tts_dies_mid_stream() -> AsyncIterator[bytes]:
+        yield b"\x00" * 480
+        yield b"\x00" * 480
+        raise boom
+
+    with pytest.raises(_FakeTTSError) as exc_info:
+        await asyncio.wait_for(playback(_tts_dies_mid_stream()), timeout=1.0)
+    assert exc_info.value is boom
+    assert fake_output_stream[0].stopped is True
+    assert fake_output_stream[0].closed is True
