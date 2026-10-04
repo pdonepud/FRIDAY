@@ -22,7 +22,7 @@ import pytest
 from pynput.keyboard import Key, KeyCode
 
 import agent.ptt
-from agent.ptt import EVENT_QUEUE_MAX, PTT_KEY, PTTEvent, events
+from agent.ptt import EVENT_QUEUE_MAX, PTT_KEYS, PTTEvent, events
 
 # --- Bundle 1: PTTEvent sanity ------------------------------------------
 
@@ -40,8 +40,22 @@ def test_ptt_event_is_intenum():
 # --- Bundle 2: constants sanity -----------------------------------------
 
 
-def test_ptt_key_is_right_alt():
-    assert PTT_KEY == Key.alt_r
+def test_ptt_keys_lists_both_right_alt_variants():
+    """PTT_KEYS lists both pynput reporting variants for Right Alt (see #66).
+
+    Note: this suite pins ``PYNPUT_BACKEND_KEYBOARD=dummy`` (conftest.py)
+    which aliases every ``Key`` member to a single singleton — so
+    distinctness assertions (e.g. ``Key.alt_l not in PTT_KEYS``) can't
+    be made here. We assert structure instead: both symbolic names are
+    present and the tuple is a 2-element sequence. On the native
+    Windows backend ``Key.alt_r`` and ``Key.alt_gr`` have distinct VK
+    codes (165 vs. the AltGr-mapped 165-via-alias — same vk, distinct
+    members), and the ``not in PTT_KEYS`` check in ``agent/ptt.py``
+    filters anything else correctly.
+    """
+    assert Key.alt_r in PTT_KEYS
+    assert Key.alt_gr in PTT_KEYS
+    assert len(PTT_KEYS) == 2
 
 
 def test_event_queue_max_value_and_shape():
@@ -156,21 +170,63 @@ async def test_emits_released_after_press_on_right_alt(fake_listener):
     await gen.aclose()
 
 
-# --- Bundle 6: ignore non-PTT keys --------------------------------------
+# --- Bundle 5.5: Right Alt is accepted under either pynput variant ------
+#
+# pynput reports Right Alt as Key.alt_r or Key.alt_gr depending on the
+# active keyboard layout (see #66 for the original E2E repro). Both
+# must drive the state machine through a full PRESSED → RELEASED pair.
 
 
-async def test_ignores_non_ptt_keys(fake_listener):
-    """Non-PTT key events must never surface via events()."""
+@pytest.mark.parametrize(
+    "right_alt",
+    [
+        pytest.param(Key.alt_r, id="alt_r"),
+        pytest.param(Key.alt_gr, id="alt_gr"),
+    ],
+)
+async def test_right_alt_variants_both_drive_press_release(fake_listener, right_alt):
+    """Each pynput Right Alt variant yields PRESSED then RELEASED."""
     gen = events()
     task = await _start_gen(gen)
     listener = fake_listener[0]
 
-    # Fire a spread of non-PTT keys: named key, char, and LEFT alt
-    # (distinct from alt_r).
+    listener.on_press(right_alt)
+    first = await asyncio.wait_for(task, timeout=1.0)
+    assert first == PTTEvent.PRESSED
+
+    task2 = asyncio.create_task(gen.__anext__())
+    await asyncio.sleep(0)
+    listener.on_release(right_alt)
+    second = await asyncio.wait_for(task2, timeout=1.0)
+    assert second == PTTEvent.RELEASED
+
+    await gen.aclose()
+
+
+# --- Bundle 6: ignore non-PTT keys --------------------------------------
+
+
+async def test_ignores_non_ptt_keys(fake_listener):
+    """Non-PTT key events must never surface via events().
+
+    Covers the explicit negative case for #66: Left Alt (``Key.alt_l``,
+    distinct from the ``Key.alt_r`` / ``Key.alt_gr`` pair accepted by
+    PTT_KEYS) stays filtered, alongside a named key, a character, and
+    the layout-agnostic ``Key.alt``.
+    """
+    gen = events()
+    task = await _start_gen(gen)
+    listener = fake_listener[0]
+
+    # Fire a spread of non-PTT keys: named key, char, LEFT alt
+    # (explicit alt_l so #66's widening doesn't accidentally cover it),
+    # and the layout-agnostic Key.alt.
     listener.on_press(Key.space)
     listener.on_release(Key.space)
     listener.on_press(KeyCode.from_char("a"))
     listener.on_release(KeyCode.from_char("a"))
+    listener.on_press(Key.alt_l)
+    listener.on_release(Key.alt_l)
     listener.on_press(Key.alt)
     listener.on_release(Key.alt)
 
