@@ -12,11 +12,16 @@ loop via ``call_soon_threadsafe``, which puts events onto a bounded
 drains the queue via ``await queue.get()``. Cancellation of the
 consuming task runs a ``finally`` block that stops the listener.
 
-Layout caveat: on many non-US keyboard layouts Right Alt is AltGr and
-gets consumed by the OS for character composition before pynput sees
-it. Windows-first (US layout) is verified per ADR-0003; other layouts
-are unverified for FRIDAY. Users on non-US layouts will need a
-different PTT key — filed as a follow-up if it comes up.
+Layout caveat: pynput's Windows backend reports Right Alt as
+``Key.alt_r`` on layouts where it's a plain modifier and as
+``Key.alt_gr`` on layouts that treat it as AltGr (US-International,
+many non-US layouts, some OEM preloaded layouts). We accept both
+enum values via ``PTT_KEYS`` so PTT works regardless of layout
+(see #66). ADR-0003's "Windows US layout verified" statement stays
+true for ``Key.alt_r``; this widens coverage without changing the
+design. Layouts where the OS consumes AltGr for character
+composition before pynput sees it at all will still not work —
+there's nothing userland Python can do about that.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ from pynput.keyboard import Key, Listener
 
 __all__ = [
     "EVENT_QUEUE_MAX",
-    "PTT_KEY",
+    "PTT_KEYS",
     "PTTEvent",
     "events",
 ]
@@ -46,10 +51,14 @@ class PTTEvent(IntEnum):
     RELEASED = 2
 
 
-# pynput exposes Right Alt as ``Key.alt_r``. Explicit constant avoids
-# scattering the raw pynput enum through consumer code and gives a
-# single point of change if the hotkey becomes configurable later.
-PTT_KEY = Key.alt_r
+# pynput's Windows backend reports Right Alt as Key.alt_r on layouts
+# where it's a plain modifier and Key.alt_gr on layouts that treat it
+# as AltGr (US-International, many non-US layouts, some OEM preloaded
+# layouts). We accept both so PTT works regardless of layout. See #66
+# for the original E2E repro. Explicit tuple also keeps the raw pynput
+# enums out of consumer code and gives a single point of change if the
+# hotkey becomes configurable later.
+PTT_KEYS: tuple[Key, ...] = (Key.alt_r, Key.alt_gr)
 
 # Bounded event queue: PTT events are rare (human keypress cadence),
 # so 32 is generous headroom. If it saturates, the consumer is broken
@@ -109,7 +118,7 @@ async def events() -> AsyncIterator[PTTEvent]:
 
     def _on_press(key) -> None:  # pynput Listener thread
         nonlocal last_emitted
-        if key != PTT_KEY:
+        if key not in PTT_KEYS:
             return
         if last_emitted == PTTEvent.PRESSED:
             return  # OS key-repeat; suppress
@@ -118,7 +127,7 @@ async def events() -> AsyncIterator[PTTEvent]:
 
     def _on_release(key) -> None:  # pynput Listener thread
         nonlocal last_emitted
-        if key != PTT_KEY:
+        if key not in PTT_KEYS:
             return
         if last_emitted != PTTEvent.PRESSED:
             return  # release without a prior PRESSED we emitted; suppress
