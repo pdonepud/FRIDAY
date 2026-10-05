@@ -511,6 +511,58 @@ async def test_chunks_iterator_raises_wraps_to_STTError(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Bundle 13b (#55 D7): _pump distinguishes chunk-source vs. send-side failures
+# ---------------------------------------------------------------------------
+
+
+async def test_pump_distinguishes_chunk_source_vs_send_failure(monkeypatch):
+    """Mid-turn transport-side failure during ``socket.send_media`` is
+    wrapped with the "audio send failed" wording — distinct from the
+    "chunk source failed" wording used when the chunks iterator itself
+    raises. Covers both branches of _pump's split try/except (#55 D7).
+    """
+
+    class _SendRaisingSocket(FakeAsyncSocket):
+        """FakeAsyncSocket whose ``send_media`` raises WebSocketException
+        on the second call (first call records, second drops the stream).
+        """
+
+        def __init__(self):
+            super().__init__()
+            self._send_calls = 0
+
+        async def send_media(self, chunk: bytes) -> None:
+            self._send_calls += 1
+            if self._send_calls >= 2:
+                # ConnectionClosedError is a WebSocketException subclass
+                # — matches one of _pump's inner concrete catch types.
+                from websockets.exceptions import ConnectionClosedError
+                from websockets.frames import Close
+
+                raise ConnectionClosedError(rcvd=Close(1006, "abnormal closure"), sent=None)
+            self.call_order.append(("send_media", chunk))
+            self.send_media_calls.append(chunk)
+
+    socket = _SendRaisingSocket()
+    _install_fake_client(monkeypatch, socket)
+
+    async def _steady_chunks() -> AsyncIterator[bytes]:
+        for _ in range(4):
+            yield b"AAAA"
+            await asyncio.sleep(0.001)
+
+    ptt_release = asyncio.Event()
+    with pytest.raises(STTError) as exc_info:
+        await asyncio.wait_for(transcribe(_steady_chunks(), ptt_release), timeout=1.0)
+    # D7's wording split: send-side failure, NOT "chunk source failed".
+    msg = str(exc_info.value)
+    assert "audio send failed" in msg, f"expected D7 send-side wording, got: {msg!r}"
+    assert "chunk source failed" not in msg, (
+        f"send-side failure mis-labelled as chunk-source: {msg!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Bundle 14a: cancellation mid-stream closes socket
 # ---------------------------------------------------------------------------
 

@@ -32,6 +32,7 @@ from agent import audio, ptt, stt, tts
 from agent.claude import (
     APIConnectionError,
     AuthenticationError,
+    NetworkError,
     RateLimitError,
     stream_sentences,
     stream_tokens,
@@ -173,26 +174,33 @@ async def text_loop() -> int:
         print("friday > ", end="", flush=True)
         chunks: list[str] = []
         try:
-            # NOTE: mid-stream Ctrl+C surfaces as asyncio.CancelledError under
-            # asyncio.run(), not KeyboardInterrupt — deferred to #55 with the
-            # rest of the voice-pipeline error handling (see PR #63 review).
             async for chunk in stream_tokens(messages, SYSTEM_PROMPT):
                 print(chunk, end="", flush=True)
                 chunks.append(chunk)
             print()
             messages.append({"role": "assistant", "content": "".join(chunks)})
-        except KeyboardInterrupt:
-            # Mid-stream interrupt — stay in the loop, drop the pending user
-            # turn so history stays consistent with what the model saw.
-            print("\n[stopped]")
-            messages.pop()
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # #55 D3 (R4): mid-stream Ctrl+C. Under asyncio.run (the
+            # only driver today) SIGINT delivers via main-task
+            # cancellation → CancelledError at the next await inside
+            # stream_tokens. KeyboardInterrupt is kept defensively for
+            # alternate drivers that don't install Runner's SIGINT
+            # handler. Text REPL users expect Ctrl+C to end the
+            # session (not interrupt the current token stream); the
+            # "interrupt what Friday is saying" UX lives in voice
+            # mode's Phase 5 handler.
+            print(_GOODBYE)
+            return 0
         except AuthenticationError:
-            print("\n[auth] API key isn't working. Check your .env and restart.")
+            print("\n[auth] ANTHROPIC_API_KEY isn't working. Check your .env and restart.")
             return 2
         except RateLimitError:
             print("\n[rate] Hit the rate limit — give it a moment.")
             messages.pop()
-        except APIConnectionError:
+        except (APIConnectionError, NetworkError):
+            # NetworkError covers mid-stream httpx2.TransportError
+            # drops the SDK does NOT translate into APIConnectionError
+            # (see agent/claude.py; verified empirically in #55 D4).
             print("\n[net] Can't reach Claude right now — check your connection.")
             messages.pop()
         except Exception as e:  # noqa: BLE001 — final safety net for text loop
@@ -308,12 +316,31 @@ async def voice_loop() -> int:
                 try:
                     sentence_iter = stream_sentences(messages, SYSTEM_PROMPT)
                     synth_iter = tts.synthesize(_tee(sentence_iter, collect))
-                    # NOTE: mid-stream Ctrl+C surfaces as asyncio.CancelledError
-                    # under asyncio.run(), not KeyboardInterrupt — deferred to
-                    # #55 with the rest of the voice-pipeline error handling.
                     await audio.playback(synth_iter)
+                except asyncio.CancelledError:
+                    # #55 D3: mid-response Ctrl+C. Under asyncio.run
+                    # SIGINT delivers as task cancellation → CancelledError
+                    # at the next await inside Phase 5. We check
+                    # current_task().uncancel(): if remaining > 0 some
+                    # OTHER source (TaskGroup / wait_for / direct
+                    # task.cancel) still wants us cancelled — don't
+                    # swallow. Zero means it was just our SIGINT and
+                    # we treat it as a per-turn abort: stop speaking,
+                    # drop the pending user turn, stay in the loop.
+                    # Second Ctrl+C still exits because Runner's
+                    # _interrupt_count goes to 2 and raises KI directly.
+                    task = asyncio.current_task()
+                    remaining = task.uncancel() if task is not None else 1
+                    if remaining > 0:
+                        raise
+                    print("\n[stopped]")
+                    messages.pop()
+                    continue
                 except AuthenticationError:
-                    print("\n[auth] API key isn't working. Check your .env and restart.")
+                    # #55 D6: name the env var so the user knows which
+                    # key to check in .env (parity with Deepgram/
+                    # ElevenLabs messages below).
+                    print("\n[auth] ANTHROPIC_API_KEY isn't working. Check your .env and restart.")
                     return 2  # A1: fatal, do NOT pop (match text_loop)
                 except tts.TTSAuthError as e:
                     print(f"\n[auth] {e}")
@@ -322,12 +349,42 @@ async def voice_loop() -> int:
                     print("\n[rate] Hit the rate limit — give it a moment.")
                     messages.pop()
                     continue
-                except APIConnectionError:
-                    print("\n[net] Can't reach Claude right now — check your connection.")
+                except (APIConnectionError, NetworkError):
+                    # #55 D4: NetworkError covers mid-stream
+                    # httpx2.TransportError drops the Anthropic SDK
+                    # does NOT translate (verified empirically — see
+                    # agent/claude.py). APIConnectionError still fires
+                    # at connect-time.
+                    print("\n[net] Lost connection mid-response — try again.")
                     messages.pop()
                     continue
+                except audio.AudioPlaybackError as e:
+                    # #55 D1: output device failed mid-stream. The
+                    # sentences the _tee collected so far ARE the
+                    # text the TTS seam tried to speak — print them
+                    # as a text fallback so the user still sees
+                    # Claude's reply even without audio.
+                    print(f"\n[audio] {e}")
+                    full_reply = "".join(collect).strip()
+                    if full_reply:
+                        # R5-locked: the user saw this text, so KEEP
+                        # the assistant turn on messages. Popping
+                        # here would desync the conversation ("why
+                        # doesn't she remember what she just told me?")
+                        # on the user's next turn. Comment must stay —
+                        # explains intent for future refactors.
+                        print(f"friday > {full_reply}")
+                        messages.append({"role": "assistant", "content": full_reply})
+                    else:
+                        # No sentence emitted before the device died;
+                        # drop the pending user turn and let them retry.
+                        messages.pop()
+                    continue
                 except tts.TTSError as e:
+                    # #55 D2: TTS stream died. Don't retry (circular +
+                    # burns credits). Text-only apology instead.
                     print(f"\n[tts] {e}")
+                    print("[friday] Sorry, I lost my voice. Try again.")
                     messages.pop()
                     continue
                 except Exception as e:  # noqa: BLE001 — final safety net for voice loop
@@ -408,4 +465,17 @@ async def run() -> int:
     if missing:
         print(_voice_missing_keys_message(missing))
         return 1
+
+    # #55 D5: startup probes before the voice banner. On device
+    # unavailability, fall back to text mode instead of trying to open
+    # a stream that will tight-loop into [stt chunk source failed] on
+    # every turn. ANTHROPIC_API_KEY is already present from the voice
+    # key check above, so text_loop's own key check is a no-op.
+    try:
+        audio.probe_input_device()
+        audio.probe_output_device()
+    except audio.AudioDeviceUnavailable as e:
+        print(f"[audio] {e}; falling back to text mode.")
+        return await text_loop()
+
     return await voice_loop()

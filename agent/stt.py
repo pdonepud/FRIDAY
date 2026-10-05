@@ -172,10 +172,31 @@ def _succeed(done_future: asyncio.Future[str], value: str) -> None:
 
 
 async def _pump(socket, chunks: AsyncIterator[bytes], done_future: asyncio.Future[str]) -> None:
-    """Send PCM chunks to Flux until the source exhausts or we're cancelled."""
+    """Send PCM chunks to Flux until the source exhausts or we're cancelled.
+
+    #55 D7: the outer try/except catches failures from iterating
+    ``chunks`` (the caller's audio source — typically
+    ``agent.audio.capture`` under voice_loop). An inner try/except
+    around the ``send_media`` call distinguishes socket-send
+    failures so error wording accurately reflects the actual seam
+    that broke, rather than labelling every mid-turn error as
+    "chunk source failed". Both paths route through ``_fail`` so
+    the shared future wins the race against ``_receive``/``_release``.
+    """
     try:
         async for chunk in chunks:
-            await socket.send_media(chunk)
+            try:
+                await socket.send_media(chunk)
+            except asyncio.CancelledError:
+                raise
+            except (OSError, TimeoutError, WebSocketException) as e:
+                # Transport-side failure during a WebSocket send — mirrors
+                # the same tuple ``transcribe`` catches at the handshake
+                # site (see line 456). Specific wording so a reviewer
+                # chasing a mid-turn error knows the send side died, not
+                # the mic source.
+                _fail(done_future, STTError(f"audio send failed: {e!r}"))
+                return
         # Chunks exhausted early is legal — just stop sending; receive
         # keeps listening for the eventual EndOfTurn.
     except asyncio.CancelledError:

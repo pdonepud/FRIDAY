@@ -618,3 +618,485 @@ async def test_playback_zero_pads_only_on_genuine_underrun(fake_output_stream):
     )
     # Payload byte count present in the output equals the input length.
     assert written.count(0xFF) == len(payload)
+
+
+# ---------------------------------------------------------------------------
+# Bundle 10 (#55 D1/D5): typed exceptions + probe helpers + playback
+# watchdogs. All paths exercised against fake streams; no PortAudio open.
+# ---------------------------------------------------------------------------
+
+
+from types import SimpleNamespace  # noqa: E402
+
+from agent.audio import (  # noqa: E402
+    AudioDeviceUnavailable,
+    AudioError,
+    AudioPlaybackError,
+    probe_input_device,
+    probe_output_device,
+)
+
+
+def test_audio_error_hierarchy_shape():
+    """Base + two leaves. AudioCaptureError was intentionally dropped (R2)."""
+    assert issubclass(AudioError, Exception)
+    assert issubclass(AudioDeviceUnavailable, AudioError)
+    assert issubclass(AudioPlaybackError, AudioError)
+    # The two leaves are distinct.
+    assert AudioDeviceUnavailable is not AudioPlaybackError
+
+
+# --- probe_input_device --------------------------------------------------
+
+
+def test_probe_input_device_ok_default(monkeypatch):
+    """Happy path: default input device reports enough channels + the
+    required (samplerate, dtype) combination is supported.
+    """
+    monkeypatch.setattr(agent.audio.sd, "default", SimpleNamespace(device=(0, 1)))
+    monkeypatch.setattr(
+        agent.audio.sd,
+        "query_devices",
+        lambda idx, kind=None: {
+            "name": f"dev{idx}",
+            "max_input_channels": 1,
+            "max_output_channels": 2,
+        },
+    )
+    monkeypatch.setattr(agent.audio.sd, "check_input_settings", lambda **_: None)
+
+    probe_input_device()  # must not raise
+
+
+def test_probe_input_device_portaudio_error(monkeypatch):
+    """``sd.query_devices`` raising PortAudioError → AudioDeviceUnavailable."""
+    monkeypatch.setattr(agent.audio.sd, "default", SimpleNamespace(device=(-1, -1)))
+
+    def _raising_query(*a, **kw):
+        raise agent.audio.sd.PortAudioError("no default device")
+
+    monkeypatch.setattr(agent.audio.sd, "query_devices", _raising_query)
+
+    with pytest.raises(AudioDeviceUnavailable) as exc_info:
+        probe_input_device()
+    assert "no usable input device" in str(exc_info.value)
+    assert "no default device" in str(exc_info.value)
+
+
+def test_probe_input_device_wrong_channels(monkeypatch):
+    """Device present but with 0 input channels → AudioDeviceUnavailable."""
+    monkeypatch.setattr(agent.audio.sd, "default", SimpleNamespace(device=(0, 1)))
+    monkeypatch.setattr(
+        agent.audio.sd,
+        "query_devices",
+        lambda idx, kind=None: {
+            "name": f"dev{idx}",
+            "max_input_channels": 0,
+            "max_output_channels": 2,
+        },
+    )
+
+    with pytest.raises(AudioDeviceUnavailable) as exc_info:
+        probe_input_device()
+    assert "0 input channels" in str(exc_info.value)
+
+
+def test_probe_input_device_bad_sample_rate(monkeypatch):
+    """``check_input_settings`` raising PortAudioError → AudioDeviceUnavailable."""
+    monkeypatch.setattr(agent.audio.sd, "default", SimpleNamespace(device=(0, 1)))
+    monkeypatch.setattr(
+        agent.audio.sd,
+        "query_devices",
+        lambda idx, kind=None: {
+            "name": f"dev{idx}",
+            "max_input_channels": 1,
+            "max_output_channels": 2,
+        },
+    )
+
+    def _bad_check(**_):
+        raise agent.audio.sd.PortAudioError("Invalid sample rate")
+
+    monkeypatch.setattr(agent.audio.sd, "check_input_settings", _bad_check)
+
+    with pytest.raises(AudioDeviceUnavailable) as exc_info:
+        probe_input_device()
+    assert "Invalid sample rate" in str(exc_info.value)
+
+
+def test_probe_input_device_value_error_from_query(monkeypatch):
+    """``query_devices`` raising ValueError → AudioDeviceUnavailable."""
+    monkeypatch.setattr(agent.audio.sd, "default", SimpleNamespace(device=(0, 1)))
+
+    def _raising_query(*a, **kw):
+        raise ValueError("No input device matching 'nope'")
+
+    monkeypatch.setattr(agent.audio.sd, "query_devices", _raising_query)
+
+    with pytest.raises(AudioDeviceUnavailable) as exc_info:
+        probe_input_device(device=99)
+    assert "input device query failed" in str(exc_info.value)
+
+
+# --- probe_output_device (symmetric) -------------------------------------
+
+
+def test_probe_output_device_ok_default(monkeypatch):
+    monkeypatch.setattr(agent.audio.sd, "default", SimpleNamespace(device=(0, 1)))
+    monkeypatch.setattr(
+        agent.audio.sd,
+        "query_devices",
+        lambda idx, kind=None: {
+            "name": f"dev{idx}",
+            "max_input_channels": 1,
+            "max_output_channels": 2,
+        },
+    )
+    monkeypatch.setattr(agent.audio.sd, "check_output_settings", lambda **_: None)
+
+    probe_output_device()  # must not raise
+
+
+def test_probe_output_device_portaudio_error(monkeypatch):
+    monkeypatch.setattr(agent.audio.sd, "default", SimpleNamespace(device=(-1, -1)))
+
+    def _raising_query(*a, **kw):
+        raise agent.audio.sd.PortAudioError("no default output")
+
+    monkeypatch.setattr(agent.audio.sd, "query_devices", _raising_query)
+
+    with pytest.raises(AudioDeviceUnavailable) as exc_info:
+        probe_output_device()
+    assert "no usable output device" in str(exc_info.value)
+
+
+def test_probe_output_device_wrong_channels(monkeypatch):
+    monkeypatch.setattr(agent.audio.sd, "default", SimpleNamespace(device=(0, 1)))
+    monkeypatch.setattr(
+        agent.audio.sd,
+        "query_devices",
+        lambda idx, kind=None: {
+            "name": f"dev{idx}",
+            "max_input_channels": 1,
+            "max_output_channels": 0,
+        },
+    )
+
+    with pytest.raises(AudioDeviceUnavailable) as exc_info:
+        probe_output_device()
+    assert "0 output channels" in str(exc_info.value)
+
+
+def test_probe_output_device_bad_sample_rate(monkeypatch):
+    monkeypatch.setattr(agent.audio.sd, "default", SimpleNamespace(device=(0, 1)))
+    monkeypatch.setattr(
+        agent.audio.sd,
+        "query_devices",
+        lambda idx, kind=None: {
+            "name": f"dev{idx}",
+            "max_input_channels": 1,
+            "max_output_channels": 2,
+        },
+    )
+
+    def _bad_check(**_):
+        raise agent.audio.sd.PortAudioError("Invalid output rate")
+
+    monkeypatch.setattr(agent.audio.sd, "check_output_settings", _bad_check)
+
+    with pytest.raises(AudioDeviceUnavailable):
+        probe_output_device()
+
+
+# --- Playback device-failure watchdogs -----------------------------------
+
+
+class _UnderflowFakeOutputStream:
+    """Output-stream fake whose callback reports ``output_underflow=True``
+    on every invocation. Used to drive the underflow-counter watchdog
+    past ``_PLAYBACK_UNDERFLOW_THRESHOLD``.
+    """
+
+    def __init__(self, *, samplerate, channels, dtype, device, callback):
+        self.callback = callback
+        self.started = False
+        self.stopped = False
+        self.closed = False
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def start(self):
+        self.started = True
+        buf = bytearray(1024)
+        status = SimpleNamespace(output_underflow=True)
+
+        def _pump():
+            mv = memoryview(buf)
+            while not self._stop.is_set():
+                buf[:] = b"\x00" * len(buf)
+                self.callback(mv, len(buf) // 2, None, status)
+                time.sleep(0.005)
+
+        self._thread = threading.Thread(target=_pump, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self.stopped = True
+        self._stop.set()
+
+    def close(self):
+        self.closed = True
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+
+
+async def test_playback_callback_underflow_signals_error(monkeypatch):
+    """Persistent underflow with pending audio → AudioPlaybackError.
+
+    Feeds a single large chunk upfront so the byte buffer stays
+    non-empty regardless of how fast the fake callback thread drains
+    relative to the asyncio feed loop. Prior version used a steady
+    feed with 10 ms sleeps + 2 KB chunks, which raced on 3.12 CI
+    runners: the sync callback thread drained the buffer between
+    asyncio ticks, flipping ``buffer_pending`` back to False and
+    resetting the underflow counter before the threshold tripped.
+    One 100 KB upfront chunk → ~100 callback drains before empty →
+    threshold (10) crosses deterministically.
+    """
+    monkeypatch.setattr(agent.audio.sd, "RawOutputStream", _UnderflowFakeOutputStream)
+
+    async def _gen() -> AsyncIterator[bytes]:
+        yield b"\x00" * 100_000  # keep buffer non-empty across ≥10 callbacks
+        # Idle so the generator doesn't exhaust before the watcher wins.
+        try:
+            await asyncio.sleep(5.0)
+        except asyncio.CancelledError:
+            raise
+
+    with pytest.raises(AudioPlaybackError) as exc_info:
+        await asyncio.wait_for(playback(_gen()), timeout=3.0)
+    assert "consecutive underflows" in str(exc_info.value)
+
+
+async def test_playback_normal_end_of_stream_does_not_signal(fake_output_stream):
+    """Natural end-of-stream underrun (empty buffer) must NOT trip the
+    underflow watchdog. The existing fake passes ``status=None`` and the
+    buffer is empty after drain — neither trigger condition met.
+    """
+    payload = b"\xff" * 640
+
+    async def _gen() -> AsyncIterator[bytes]:
+        yield payload
+
+    # Must not raise.
+    await playback(_gen())
+    assert fake_output_stream[0].stopped is True
+
+
+class _SilentFakeOutputStream:
+    """Output-stream fake whose callback is NEVER invoked after start().
+
+    Simulates the WASAPI-style device-unplug behavior where PortAudio
+    stops calling the callback entirely instead of keeping the
+    underflow flag live. Drives the no-callback silence watchdog.
+    """
+
+    def __init__(self, *, samplerate, channels, dtype, device, callback):
+        self.callback = callback
+        self.started = False
+        self.stopped = False
+        self.closed = False
+
+    def start(self):
+        self.started = True
+        # Deliberately do nothing — never call self.callback.
+
+    def stop(self):
+        self.stopped = True
+
+    def close(self):
+        self.closed = True
+
+
+async def test_playback_callback_silence_signals_error(monkeypatch):
+    """Callback silent + buffer pending → AudioPlaybackError (R3 watchdog).
+
+    Speeds up the watchdog's threshold via monkeypatch so the test
+    stays snappy. Covers the WASAPI unplug path.
+    """
+    monkeypatch.setattr(agent.audio, "_CALLBACK_SILENCE_S", 0.3)
+    monkeypatch.setattr(agent.audio.sd, "RawOutputStream", _SilentFakeOutputStream)
+
+    async def _gen() -> AsyncIterator[bytes]:
+        # Push just enough bytes to keep the buffer non-empty for the
+        # watchdog's inspection, then idle.
+        yield b"\x00" * 2048
+        await asyncio.sleep(2.0)
+        yield b"\x00" * 2048
+
+    with pytest.raises(AudioPlaybackError) as exc_info:
+        await asyncio.wait_for(playback(_gen()), timeout=3.0)
+    assert "callback silent" in str(exc_info.value)
+
+
+async def test_playback_cleanup_sets_error_event_on_clean_exit(fake_output_stream):
+    """On clean completion, playback() must not leak the
+    executor-blocked ``_error_watcher`` worker. Guarded by asserting
+    that no new asyncio tasks remain post-call (R3 hygiene).
+    """
+    payload = b"\x00" * 480
+
+    async def _gen() -> AsyncIterator[bytes]:
+        yield payload
+
+    before = {t for t in asyncio.all_tasks() if not t.done()}
+    await playback(_gen())
+    after = {t for t in asyncio.all_tasks() if not t.done()}
+    leaked = after - before
+    # Current test task itself is in both sets; subtract gives only
+    # genuinely new tasks. Expect none.
+    assert not leaked, f"playback leaked tasks: {[t.get_name() for t in leaked]}"
+
+
+class _ThenSilentFakeOutputStream:
+    """Fake stream whose callback fires for the first N invocations
+    then goes silent. Used by the mid-drain regression test to prove
+    PATCH 1 (watcher-aware wait during drain) and PATCH 2 (narrowed
+    suppress in finally) are both wired correctly.
+    """
+
+    def __init__(self, *, samplerate, channels, dtype, device, callback):
+        self.callback = callback
+        self.started = False
+        self.stopped = False
+        self.closed = False
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._calls = 0
+        self._call_limit = 10  # fires 10 times then halts
+
+    def start(self):
+        self.started = True
+        buf = bytearray(1024)
+
+        def _pump():
+            mv = memoryview(buf)
+            while not self._stop.is_set():
+                if self._calls >= self._call_limit:
+                    # Device "unplugged" — go silent.
+                    time.sleep(0.05)
+                    continue
+                buf[:] = b"\x00" * len(buf)
+                self.callback(mv, len(buf) // 2, None, None)
+                self._calls += 1
+                time.sleep(0.005)
+
+        self._thread = threading.Thread(target=_pump, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self.stopped = True
+        self._stop.set()
+
+    def close(self):
+        self.closed = True
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+
+
+async def test_playback_device_fails_mid_drain(monkeypatch):
+    """R3+PATCH1+PATCH2 regression: device dies mid-drain and the
+    silence watchdog surfaces an AudioPlaybackError that:
+
+    - Propagates out of playback() instead of hanging the drain loop
+      (PATCH 1: Phase C polls watcher_task.done() each tick).
+    - Is NOT swallowed by the finally's task-cleanup awaits
+      (PATCH 2: contextlib.suppress scoped to CancelledError only).
+    - Still lets the finally close the stream cleanly.
+    """
+    monkeypatch.setattr(agent.audio, "_CALLBACK_SILENCE_S", 0.3)
+    captured: list[_ThenSilentFakeOutputStream] = []
+
+    def _factory(**kwargs):
+        s = _ThenSilentFakeOutputStream(**kwargs)
+        captured.append(s)
+        return s
+
+    monkeypatch.setattr(agent.audio.sd, "RawOutputStream", _factory)
+
+    async def _gen() -> AsyncIterator[bytes]:
+        # Feed enough chunks that the pump finishes draining the queue
+        # BEFORE the callback stops (so Phase A completes cleanly and
+        # we reach Phase B/C where the drain happens with watcher polling).
+        for _ in range(20):
+            yield b"\x00" * 2048
+
+    with pytest.raises(AudioPlaybackError) as exc_info:
+        await asyncio.wait_for(playback(_gen()), timeout=3.0)
+    assert "callback silent" in str(exc_info.value), (
+        f"expected the silence-watchdog branch, got: {exc_info.value!r}"
+    )
+    # Finally ran: stream was stopped + closed despite the re-raise.
+    assert captured[0].stopped is True
+    assert captured[0].closed is True
+
+
+# ---------------------------------------------------------------------------
+# Bundle 11 (#55 CodeRabbit catch on PR #68): feed_task exceptions must
+# surface to playback()'s caller rather than deadlocking Phase B.
+# ---------------------------------------------------------------------------
+
+
+async def test_playback_surfaces_chunk_iterator_exception(fake_output_stream):
+    """A chunks-iterator raise reaches playback()'s caller instead of hanging.
+
+    Pre-fix, Phase A only inspected ``watcher_task in done`` — when
+    ``feed_task`` finished with an exception, the exception was
+    silently dropped. Phase B then awaited the pump, which was
+    blocked on ``queue.get()`` because the ``None`` sentinel was
+    never queued (``_feed`` raised before putting it). The turn
+    deadlocked forever.
+
+    This test proves Phase A now re-raises ``feed_task.result()``.
+    """
+    sentinel = RuntimeError("tts went boom")
+
+    async def _flaky_chunks() -> AsyncIterator[bytes]:
+        yield b"\x00" * 480
+        raise sentinel
+
+    # 1 s guard proves no deadlock. Pre-fix this hangs until wait_for
+    # fires its own TimeoutError, which the test would surface as a
+    # distinct failure signature.
+    with pytest.raises(RuntimeError) as exc_info:
+        await asyncio.wait_for(playback(_flaky_chunks()), timeout=1.0)
+    assert exc_info.value is sentinel
+
+    # Stream still torn down cleanly.
+    assert fake_output_stream[0].stopped is True
+    assert fake_output_stream[0].closed is True
+
+
+async def test_playback_surfaces_tts_error_equivalent(fake_output_stream):
+    """Same path, exception type that matches the actual voice_loop
+    composition case (TTSError-equivalent). Documents the behavior
+    expected under production: when ``_tee`` propagates a TTSError
+    from the ``synthesize`` iterator, playback() must re-raise it
+    so Phase 5's ``except tts.TTSError`` handler can fire.
+    """
+
+    class _FakeTTSError(Exception):
+        """Stand-in matching the TTSError shape without importing tts here."""
+
+    boom = _FakeTTSError("websocket dropped mid-stream")
+
+    async def _tts_dies_mid_stream() -> AsyncIterator[bytes]:
+        yield b"\x00" * 480
+        yield b"\x00" * 480
+        raise boom
+
+    with pytest.raises(_FakeTTSError) as exc_info:
+        await asyncio.wait_for(playback(_tts_dies_mid_stream()), timeout=1.0)
+    assert exc_info.value is boom
+    assert fake_output_stream[0].stopped is True
+    assert fake_output_stream[0].closed is True
