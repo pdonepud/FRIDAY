@@ -25,9 +25,16 @@ PTT is the explicit "I am starting a new turn" signal when FRIDAY is not already
 
 During SPEAKING, the mic stays open without PTT. Barge-in is not a new PTT press — it is the user speaking over Lily. PTT is NOT required to interrupt playback. The signal that triggers barge-in is covered in Decision 2.
 
-**2. During SPEAKING, `StartOfTurn` is the barge-in trigger.**
+**2. During SPEAKING, `StartOfTurn` is the barge-in trigger — confirmed before cancellation.**
 
-This aligns with ADR-0003, which reserves `StartOfTurn` for the barge-in interrupt and `EagerEndOfTurn` for speculative LLM execution. When Flux emits `StartOfTurn` while the state machine is in SPEAKING, FRIDAY cancels TTS playback and transitions out of SPEAKING immediately. A short audio-confirmation window (initial value: 150 ms, tunable via `_BARGEIN_CONFIRM_MS`) filters false positives from throat clears, bleedthrough from Lily's own voice, or brief room noise — if no sustained speech follows the `StartOfTurn` within that window, playback resumes and no state transition occurs.
+This aligns with ADR-0003, which reserves `StartOfTurn` for the barge-in interrupt and `EagerEndOfTurn` for speculative LLM execution. The sequence is strictly:
+
+1. Flux emits `StartOfTurn` while the state machine is in SPEAKING.
+2. FRIDAY opens a short confirmation window (initial value: 150 ms, tunable via `_BARGEIN_CONFIRM_MS`). Playback continues uninterrupted during this window.
+3. If sustained speech is observed within the window, FRIDAY cancels TTS playback and transitions out of SPEAKING. The cancel path is the destructive cancel from Decision 3 — the ElevenLabs stream drains, PortAudio closes via the nested try/finally pattern from #55, and SPEAKING ends.
+4. If no sustained speech is observed, the `StartOfTurn` is treated as a false trigger (throat clear, Lily's own voice bleeding through, brief room noise). No state transition occurs. No cancellation runs. Playback has already been playing throughout, so nothing resumes — nothing was paused.
+
+This ordering means the user experiences a short lag (up to `_BARGEIN_CONFIRM_MS` ms) between starting to speak and Lily stopping. This is accepted for v1 (see Negative Consequences). The alternative — pausing playback immediately on `StartOfTurn` and resuming on rejection — would require a non-destructive "paused" state in the playback pump that does not exist in the Tier 3 contract and is explicitly deferred to a follow-up ADR.
 
 `EagerEndOfTurn` and `TurnResumed` continue to serve their Decision 1 role (speculative finalization and retraction during PTT-framed turns). They are not barge-in triggers.
 
@@ -56,6 +63,7 @@ The `httpx` cancel semantics exercised in #55 cover this. When BARGE_IN fires du
 **Negative:**
 
 - STT is now double-duplex with TTS. On devices without headphones or hardware echo cancellation, Lily's own voice may trigger `StartOfTurn` and cause spurious barge-in. The 150 ms confirmation window from Decision 2 is the first-line mitigation; the README must additionally recommend headphones. Deeper mitigation (output-aware STT gating or software AEC) is explicitly deferred.
+- Up to 150 ms of perceived lag between the user starting to speak and Lily stopping. This is a direct consequence of the confirm-before-cancel ordering in Decision 2. Reducing the confirmation window reduces the lag but increases the false-positive rate; the right tradeoff is unknown until we use it. If tuning the window reveals that the lag is unacceptable at any defensible false-positive rate, a follow-up ADR will introduce a non-destructive "paused" playback state so cancellation can be delayed until confirmation without the user hearing continued speech. This is deliberately not v1.
 - The voice-turn state machine is new surface area; test coverage must be strict (legal transitions + rejected illegal transitions).
 - Partial ElevenLabs generations still bill when playback is cancelled. Cost is bounded by typical reply length and user interruption rate; acceptable.
 - Barge-in grace period (300 ms) is a knob. Too short → false interruptions on breath pauses. Too long → feels unresponsive. Tuning expected after real-world use.
@@ -102,6 +110,7 @@ Would make PTT the gate for every turn, requiring the user to press PTT a second
 
 - Should FRIDAY speak a short acknowledgment when barge-in fires ("oh, sorry") or just stop? Current decision: just stop. Revisit after use.
 - Does barge-in during THINKING (before any audio has played) warrant different treatment than barge-in during SPEAKING? Current decision: same path. Revisit if the UX feels off.
+- If the 150 ms (or tuned-lower) confirm-before-cancel lag is perceptibly bad during #70 implementation, follow up with an ADR introducing a pause-and-resume playback state so the destructive cancel can be delayed until barge-in is confirmed. Track as a tuning issue separate from #70/#71.
 
 ## References
 
