@@ -21,7 +21,11 @@ The question is not whether to migrate, but how the migration composes with the 
 
 **1. PTT frames turns that originate from IDLE; during SPEAKING, the mic stays open.**
 
-PTT is the explicit "I am starting a new turn" signal when FRIDAY is not already talking: PRESS opens the window, RELEASE closes it, and STT runs continuously inside that window. In this flow, `EagerEndOfTurn` finalizes the turn speculatively and a subsequent `TurnResumed` retracts the finalization and keeps the turn open. This replaces the current `ForceEndTurn`-on-release behavior for IDLE-origin turns.
+PTT is the explicit "I am starting a new turn" signal when FRIDAY is not already talking: PRESS opens the window, RELEASE closes it, and STT runs continuously inside that window. In this flow, `EagerEndOfTurn` finalizes the turn speculatively and a subsequent `TurnResumed` retracts the finalization and keeps the turn open.
+
+On RELEASE, FRIDAY stops forwarding new audio to Flux but keeps the receive path open for a bounded grace period (`_PTT_RELEASE_GRACE_MS`, default 500 ms, tunable). The grace lets Flux's natural turn-finalization events (`EagerEndOfTurn` → `EndOfTurn`, or an already-in-flight `TurnResumed` → `EndOfTurn`) complete without being cut short. If `EndOfTurn` arrives within the grace, the turn finalizes normally and no `ForceEndTurn` is sent. If the grace expires without `EndOfTurn`, FRIDAY sends `ForceEndTurn` as a bounded liveness fallback to prevent the receive path and `transcribe()`'s `done_future` from hanging indefinitely. Total receive wait from RELEASE is therefore bounded by `_PTT_RELEASE_GRACE_MS` plus Flux's `ForceEndTurn` ack time.
+
+This differs from the current Tier 3 `ForceEndTurn`-on-release behavior, which fires immediately regardless of in-flight events. The new flow gives Flux a chance to close naturally — preserving the accuracy of speculative finalization and respecting `TurnResumed` retractions — while retaining `ForceEndTurn` strictly as a bounded liveness guarantee.
 
 During SPEAKING, the mic stays open without PTT. Barge-in is not a new PTT press — it is the user speaking over Lily. PTT is NOT required to interrupt playback. The signal that triggers barge-in is covered in Decision 2.
 
@@ -48,9 +52,19 @@ The current `voice_loop()` carries control flow in-line. Barge-in adds enough ed
 
 Only the state owner mutates the state. Everything else observes.
 
-**5. Mid-stream LLM cancellation is now a real path.**
+**5. Mid-stream LLM cancellation on barge-in preserves the pending turn.**
 
-The `httpx` cancel semantics exercised in #55 cover this. When BARGE_IN fires during THINKING or SPEAKING, the in-flight Anthropic stream is cancelled via `task.cancel()`; the `CancelledError` is caught at the LLM seam and surfaced as a clean turn abort.
+Barge-in during SPEAKING cancels the in-flight LLM stream. This cancellation must be distinguishable from error-caused cancellation (network failure, provider drop — the #55 flow) so that `voice_loop` does not treat barge-in as a failed turn and drop the user's input.
+
+The pattern:
+
+1. The LLM stream (`stream_sentences()`) and its downstream TTS feed run in a dedicated subtask spawned by `voice_loop`, not inline in the voice_loop task itself. `voice_loop` supervises the subtask and owns state transitions.
+2. When `BARGE_IN` fires, only the stream subtask is cancelled via `task.cancel()`. The `voice_loop` task continues running — it awaits the subtask's cleanup and drives the transition to LISTENING.
+3. The subtask's `CancelledError` is caught at the LLM seam and surfaced as a clean turn abort. The `httpx` cancel semantics exercised in #55 cover the actual stream close.
+4. `voice_loop` distinguishes barge-in abort from error abort by the originating state (BARGE_IN), not by `task.uncancel()` return values. On barge-in abort, `voice_loop` does NOT remove the pending user message and does NOT drop the barge-in-triggering utterance — that utterance becomes the input for the next turn.
+5. Error-caused cancellation (network drop, provider failure) continues to follow the #55 pattern unchanged: surface as `NetworkError`, apology TTS via Decision 3's destructive cancel path, return to LISTENING with the pending user message removed per #55's existing semantics.
+
+Barge-in applies to the SPEAKING state only in v1, matching Decision 4's state machine (`SPEAKING ↔ BARGE_IN → LISTENING`). During THINKING, no audio is playing, so there is nothing to barge in on; a user who wants to cancel a pending response during THINKING is performing a different interaction, deferred to a follow-up (see Open Questions).
 
 ## Consequences
 
@@ -103,7 +117,9 @@ Would make PTT the gate for every turn, requiring the user to press PTT a second
 - #70 handles STT-side event migration.
 - #71 handles playback cancel wiring.
 - #72 handles the state machine refactor and must land last so it absorbs both.
-- Barge-in confirmation window (150 ms) belongs in `agent/stt.py` as a module-level `_BARGEIN_CONFIRM_MS` with a `TODO(#70-tuning)` comment. `EagerEndOfTurn` grace behavior for turn finalization has its own tunable, out of scope for this ADR.
+- Barge-in confirmation window (150 ms) belongs in `agent/stt.py` as a module-level `_BARGEIN_CONFIRM_MS` with a `TODO(#70-tuning)` comment.
+- PTT release grace (500 ms) belongs in `agent/stt.py` as a module-level `_PTT_RELEASE_GRACE_MS` with a `TODO(#70-tuning)` comment. Governs the bounded wait for Flux to emit `EndOfTurn` naturally before `ForceEndTurn` fires as a liveness fallback (Decision 1).
+- The LLM stream subtask pattern (Decision 5) is implemented in `agent/loop.py::voice_loop()`: `stream_sentences()` + TTS feed run under an `asyncio.create_task()` whose lifetime is scoped to the SPEAKING state. `voice_loop` holds the task handle and is the only caller of `task.cancel()` on it; barge-in triggers that cancel, nothing else does.
 - README section on headphone recommendation added as part of #72 or a follow-up docs issue.
 
 ## Open Questions (Not Blocking)
@@ -111,6 +127,7 @@ Would make PTT the gate for every turn, requiring the user to press PTT a second
 - Should FRIDAY speak a short acknowledgment when barge-in fires ("oh, sorry") or just stop? Current decision: just stop. Revisit after use.
 - Does barge-in during THINKING (before any audio has played) warrant different treatment than barge-in during SPEAKING? Current decision: same path. Revisit if the UX feels off.
 - If the 150 ms (or tuned-lower) confirm-before-cancel lag is perceptibly bad during #70 implementation, follow up with an ADR introducing a pause-and-resume playback state so the destructive cancel can be delayed until barge-in is confirmed. Track as a tuning issue separate from #70/#71.
+- PTT-during-THINKING cancellation: if the user presses PTT while FRIDAY is in THINKING (waiting for the LLM to respond), they likely want to cancel the pending turn and say something else. Not supported in v1 — Decision 5 scopes barge-in to SPEAKING only. If this gap is felt during real use, address with a follow-up that either (a) adds a THINKING-origin cancel path distinct from barge-in, or (b) extends the state machine to allow BARGE_IN from THINKING. File a tuning issue if observed.
 
 ## References
 
