@@ -19,13 +19,17 @@ The question is not whether to migrate, but how the migration composes with the 
 
 ## Decision
 
-**1. Keep PTT as the "I am talking to you" gate, but widen what happens inside the gate.**
+**1. PTT frames turns that originate from IDLE; during SPEAKING, the mic stays open.**
 
-PTT still frames every user utterance (PRESS opens the window, RELEASE closes it). STT runs continuously inside that window and honors `EagerEndOfTurn` to finalize turns speculatively. A subsequent `TurnResumed` retracts the finalization and the turn continues. This replaces the current `ForceEndTurn`-on-release behavior.
+PTT is the explicit "I am starting a new turn" signal when FRIDAY is not already talking: PRESS opens the window, RELEASE closes it, and STT runs continuously inside that window. In this flow, `EagerEndOfTurn` finalizes the turn speculatively and a subsequent `TurnResumed` retracts the finalization and keeps the turn open. This replaces the current `ForceEndTurn`-on-release behavior for IDLE-origin turns.
 
-**2. During TTS playback, STT continues running.**
+During SPEAKING, the mic stays open without PTT. Barge-in is not a new PTT press — it is the user speaking over Lily. PTT is NOT required to interrupt playback. The signal that triggers barge-in is covered in Decision 2.
 
-A detected `EagerEndOfTurn` that is not retracted within a short grace period (initial value: 300 ms, tunable) cancels playback and starts the next user turn. This is the actual barge-in moment.
+**2. During SPEAKING, `StartOfTurn` is the barge-in trigger.**
+
+This aligns with ADR-0003, which reserves `StartOfTurn` for the barge-in interrupt and `EagerEndOfTurn` for speculative LLM execution. When Flux emits `StartOfTurn` while the state machine is in SPEAKING, FRIDAY cancels TTS playback and transitions out of SPEAKING immediately. A short audio-confirmation window (initial value: 150 ms, tunable via `_BARGEIN_CONFIRM_MS`) filters false positives from throat clears, bleedthrough from Lily's own voice, or brief room noise — if no sustained speech follows the `StartOfTurn` within that window, playback resumes and no state transition occurs.
+
+`EagerEndOfTurn` and `TurnResumed` continue to serve their Decision 1 role (speculative finalization and retraction during PTT-framed turns). They are not barge-in triggers.
 
 **3. Playback cancellation is cooperative, not forced.**
 
@@ -51,7 +55,7 @@ The `httpx` cancel semantics exercised in #55 cover this. When BARGE_IN fires du
 
 **Negative:**
 
-- STT is now double-duplex with TTS. On devices without headphones or hardware echo cancellation, Lily's own voice may trigger `EagerEndOfTurn`. The README must recommend headphones; a mitigation (output-aware STT gating or software AEC) is explicitly deferred.
+- STT is now double-duplex with TTS. On devices without headphones or hardware echo cancellation, Lily's own voice may trigger `StartOfTurn` and cause spurious barge-in. The 150 ms confirmation window from Decision 2 is the first-line mitigation; the README must additionally recommend headphones. Deeper mitigation (output-aware STT gating or software AEC) is explicitly deferred.
 - The voice-turn state machine is new surface area; test coverage must be strict (legal transitions + rejected illegal transitions).
 - Partial ElevenLabs generations still bill when playback is cancelled. Cost is bounded by typical reply length and user interruption rate; acceptable.
 - Barge-in grace period (300 ms) is a knob. Too short → false interruptions on breath pauses. Too long → feels unresponsive. Tuning expected after real-world use.
@@ -81,9 +85,9 @@ PTT-with-barge-in is a strict improvement over status quo without taking on thes
 
 Keeps the Tier 3 design but adds a second gesture. Rejected — feels unnatural, defeats the point (natural conversation shouldn't require learning a gesture), and does nothing for the user who starts speaking without pressing anything.
 
-### D. Hybrid: PTT required to interrupt during playback, EagerEndOfTurn only during THINKING
+### D. PTT required for every utterance, including barge-in
 
-Half-step toward barge-in. Rejected — users will try to interrupt by speaking, not by pressing. Matching user expectation beats halving the complexity.
+Would make PTT the gate for every turn, requiring the user to press PTT a second time to interrupt during playback. Rejected — users interrupt by speaking, not by pressing. Matching user expectation beats preserving a uniform PTT model, and the SPEAKING-state mic-open window from Decision 1 handles the hot-mic concern because playback already masks ambient speech from most false-trigger conditions.
 
 ## Implementation Notes
 
@@ -91,7 +95,7 @@ Half-step toward barge-in. Rejected — users will try to interrupt by speaking,
 - #70 handles STT-side event migration.
 - #71 handles playback cancel wiring.
 - #72 handles the state machine refactor and must land last so it absorbs both.
-- Grace period constant (300 ms) belongs in `agent/stt.py` as a module-level `_EAGER_GRACE_MS` with a `TODO(#NN-tuning)` comment.
+- Barge-in confirmation window (150 ms) belongs in `agent/stt.py` as a module-level `_BARGEIN_CONFIRM_MS` with a `TODO(#70-tuning)` comment. `EagerEndOfTurn` grace behavior for turn finalization has its own tunable, out of scope for this ADR.
 - README section on headphone recommendation added as part of #72 or a follow-up docs issue.
 
 ## Open Questions (Not Blocking)
@@ -104,3 +108,4 @@ Half-step toward barge-in. Rejected — users will try to interrupt by speaking,
 - Deepgram Flux docs — EagerEndOfTurn and TurnResumed events: <https://developers.deepgram.com/docs/flux>
 - PR #55 — Graceful error handling for voice pipeline (introduces `AudioPlaybackError`, playback dual-watchdog, nested-finally stream teardown, and `httpx` mid-stream cancellation path that this ADR builds on).
 - ADR-0003 — Voice architecture (the pre-commitment this ADR cashes in).
+- ADR-0003 §Tier-4 migration path for STT — defines the Flux event vocabulary (StartOfTurn / EagerEndOfTurn / TurnResumed / EndOfTurn) and reserves StartOfTurn for the barge-in interrupt.
