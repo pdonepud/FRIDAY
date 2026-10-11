@@ -69,7 +69,7 @@ The pattern:
 2. When `BARGE_IN` fires, only the stream subtask is cancelled via `task.cancel()`. The `voice_loop` task continues running — it awaits the subtask's cleanup and drives the transition to LISTENING.
 3. The subtask's `CancelledError` is caught at the LLM seam and surfaced as a clean turn abort. The `httpx` cancel semantics exercised in #55 cover the actual stream close.
 4. `voice_loop` distinguishes barge-in abort from error abort by the originating state (BARGE_IN), not by `task.uncancel()` return values. On barge-in abort, `voice_loop` does NOT remove the pending user message and does NOT drop the barge-in-triggering utterance — that utterance becomes the input for the next turn.
-5. Error-caused cancellation (network drop, provider failure) continues to follow the #55 pattern unchanged: surface as `NetworkError`, apology TTS via Decision 3's destructive cancel path, return to LISTENING with the pending user message removed per #55's existing semantics.
+5. Error-caused cancellation (LLM-side network drop or provider failure during `stream_sentences`) continues to follow the #55 pattern unchanged. Per `agent/loop.py`'s existing error branch (`except (APIConnectionError, NetworkError):`): FRIDAY prints `[net] Lost connection mid-response — try again.` to the console, removes the pending user message, and returns to LISTENING. No voice apology is played on LLM-side errors. The `[friday] Sorry, I lost my voice. Try again.` line that fires on TTS-side errors in #55 is itself a plain stdout print, not a TTS synthesis, and is scoped to the `except tts.TTSError` branch only — it is not the LLM-error path. Whether LLM-side errors should also get a voice apology is a separate design question deferred to a follow-up (see Open Questions).
 
 Barge-in applies to the SPEAKING state only in v1, matching Decision 4's state machine (`SPEAKING ↔ BARGE_IN → LISTENING`). During THINKING, no audio is playing, so there is nothing to barge in on; a user who wants to cancel a pending response during THINKING is performing a different interaction, deferred to a follow-up (see Open Questions).
 
@@ -121,7 +121,7 @@ Keeps the Tier 3 design but adds a second gesture. Rejected — feels unnatural,
 
 ### D. PTT required for every utterance, including barge-in
 
-Would make PTT the gate for every turn, requiring the user to press PTT a second time to interrupt during playback. Rejected — users interrupt by speaking, not by pressing. Matching user expectation beats preserving a uniform PTT model, and the SPEAKING-state mic-open window from Decision 1 handles the hot-mic concern because playback already masks ambient speech from most false-trigger conditions.
+Would make PTT the gate for every turn, requiring the user to press PTT a second time to interrupt during playback. Rejected — users interrupt by speaking, not by pressing. Matching user expectation beats preserving a uniform PTT model. The hot-mic concern raised by Decision 1's SPEAKING-state mic-open window is real and is tracked in Negative Consequences (echo-cancellation false triggers on Lily's own voice); the 150 ms confirmation window from Decision 2 and the headphone recommendation together mitigate it. Playback does NOT mask ambient speech from Flux's input, since the mic stays open throughout SPEAKING.
 
 ## Implementation Notes
 
@@ -142,6 +142,7 @@ Would make PTT the gate for every turn, requiring the user to press PTT a second
 - Does barge-in during THINKING (before any audio has played) warrant different treatment than barge-in during SPEAKING? Current decision: same path. Revisit if the UX feels off.
 - If the 150 ms (or tuned-lower) confirm-before-cancel lag is perceptibly bad during #70 implementation, follow up with an ADR introducing a pause-and-resume playback state so the destructive cancel can be delayed until barge-in is confirmed. Track as a tuning issue separate from #70/#71.
 - PTT-during-THINKING cancellation: if the user presses PTT while FRIDAY is in THINKING (waiting for the LLM to respond), they likely want to cancel the pending turn and say something else. Not supported in v1 — Decision 5 scopes barge-in to SPEAKING only. If this gap is felt during real use, address with a follow-up that either (a) adds a THINKING-origin cancel path distinct from barge-in, or (b) extends the state machine to allow BARGE_IN from THINKING. File a tuning issue if observed.
+- Should LLM-side network errors get a voice apology similar to the TTS-side apology from #55 ("Sorry, I lost my voice")? Current ADR follows the existing agent/loop.py behavior (console message, no TTS). If voice feedback for all failure classes is a UX goal, add it in a focused follow-up; the plumbing (apology-TTS path) already exists on the TTS side and can be extended to the LLM-error branch.
 
 ## References
 
