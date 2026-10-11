@@ -51,7 +51,7 @@ This ordering means the user experiences a short lag (up to `_BARGEIN_CONFIRM_MS
 
 **3. Playback cancellation is cooperative, not forced.**
 
-A new `BargeInEvent` (or a shared `asyncio.Event` — chosen at implementation time) signals the playback pump. The pump drains the ElevenLabs stream and closes the PortAudio stream through the nested `try`/`finally` pattern established in #55, then signals `voice_loop` that playback has ended. `voice_loop`, as the sole state owner per Decisions 4 and 5, performs the SPEAKING → LISTENING (or SPEAKING → BARGE_IN → LISTENING) transition. The `AudioPlaybackError`/watchdog plumbing from #55 covers the hard-failure path; barge-in is the soft-cancel path.
+A new `BargeInEvent` (or a shared `asyncio.Event` — chosen at implementation time) signals the playback pump. The pump stops writing to the PortAudio stream, discards any queued ElevenLabs chunks (without waiting for the iterator to exhaust), and closes the PortAudio stream through the nested `try`/`finally` pattern established in #55. It then signals `voice_loop` that playback has ended. `voice_loop`, as the sole state owner per Decisions 4 and 5, performs the SPEAKING → LISTENING (or SPEAKING → BARGE_IN → LISTENING) transition. The `AudioPlaybackError`/watchdog plumbing from #55 covers the hard-failure path; barge-in is the soft-cancel path.
 
 **4. A single state machine owns voice-turn transitions.**
 
