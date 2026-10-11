@@ -1,4 +1,4 @@
-# ADR 0005 — Barge-in via Flux EagerEndOfTurn
+# ADR 0005 — Barge-in via Flux StartOfTurn (with speculative EagerEndOfTurn / TurnResumed)
 
 **Status:** Proposed
 **Date:** 2026-10-05
@@ -51,7 +51,7 @@ This ordering means the user experiences a short lag (up to `_BARGEIN_CONFIRM_MS
 
 **3. Playback cancellation is cooperative, not forced.**
 
-A new `BargeInEvent` (or a shared `asyncio.Event` — chosen at implementation time) signals the playback pump. The pump drains the ElevenLabs stream, closes the PortAudio stream through the nested `try`/`finally` pattern established in #55, and transitions out of the SPEAKING state. The `AudioPlaybackError`/watchdog plumbing from #55 covers the hard-failure path; barge-in is the soft-cancel path.
+A new `BargeInEvent` (or a shared `asyncio.Event` — chosen at implementation time) signals the playback pump. The pump drains the ElevenLabs stream and closes the PortAudio stream through the nested `try`/`finally` pattern established in #55, then signals `voice_loop` that playback has ended. `voice_loop`, as the sole state owner per Decisions 4 and 5, performs the SPEAKING → LISTENING (or SPEAKING → BARGE_IN → LISTENING) transition. The `AudioPlaybackError`/watchdog plumbing from #55 covers the hard-failure path; barge-in is the soft-cancel path.
 
 **4. A single state machine owns voice-turn transitions.**
 
@@ -134,7 +134,7 @@ Would make PTT the gate for every turn, requiring the user to press PTT a second
 - Flux session configuration (per Decision 1 Prerequisite): both `eot_threshold` and `eager_eot_threshold` must be explicitly set when opening the Flux session in `agent/stt.py`. Current state (per ADR-0003 and `deepgram-sdk==7.8.1` in `pyproject.toml`): `eot_threshold = 1.0`, `eager_eot_threshold` unset. Starting values are a tuning task inside #70 — expected to land somewhere below Flux's default `eot_threshold` of ~0.7 (to make natural `EndOfTurn` fire on conversational pauses rather than long silences) and with `eager_eot_threshold` set low enough to produce useful speculative events without excessive `TurnResumed` churn.
 - Flux constraint `eager_eot_threshold <= eot_threshold` must hold; a higher eager value is a session-open configuration error. #70 includes a startup assertion in `agent/stt.py` that both values are set and the ordering holds, so the pairing cannot silently regress through a future SDK default change. Both threshold values are TODO(#70-tuning). Reference Deepgram's Flux eager-mode guidance for the ranges that behave sensibly together.
 - Flux's EOT safety net (`eot_timeout_ms`, currently `30,000 ms` per `agent/stt.py:86 EOT_TIMEOUT_MS = 30000`) is distinct from `eot_threshold`. `eot_threshold` governs confidence-based detection; `eot_timeout_ms` is a hard fallback that fires `EndOfTurn` after a fixed silence duration regardless of confidence. #70 should consider whether to lower `eot_timeout_ms` alongside `eot_threshold` so the safety net is useful inside RELEASE grace in pathological cases (e.g., prolonged background noise preventing confidence from clearing the threshold). Value is TODO(#70-tuning).
-- The LLM stream subtask pattern (Decision 5) is implemented in `agent/loop.py::voice_loop()`: `stream_sentences()` + TTS feed run under an `asyncio.create_task()` whose lifetime is scoped to the SPEAKING state. `voice_loop` holds the task handle and is the only caller of `task.cancel()` on it; barge-in triggers that cancel, nothing else does.
+- The LLM stream subtask pattern (Decision 5) is the required future design for `agent/loop.py::voice_loop()`, implemented as part of #70. Current `voice_loop()` calls `stream_sentences()` and the TTS feed inline. The target: `stream_sentences()` + TTS feed run under an `asyncio.create_task()` whose lifetime is scoped to the SPEAKING state; `voice_loop` holds the task handle and is the only caller of `task.cancel()` on it; barge-in triggers that cancel, nothing else does.
 - README section on headphone recommendation added as part of #72 or a follow-up docs issue.
 
 ## Open Questions (Not Blocking)
