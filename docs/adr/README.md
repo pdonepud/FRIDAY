@@ -21,6 +21,7 @@ ADRs are numbered sequentially starting at 0001. Filenames follow `NNNN-kebab-ca
 - [0004 — TTS provider concrete choices](./0004-tts-provider-concrete-choices.md) — Accepted (refines 0003 §TTS)
 - [0005 — Barge-in via Flux StartOfTurn (with speculative EagerEndOfTurn / TurnResumed)](./0005-barge-in-via-flux-eager-end-of-turn.md) — Proposed (refines 0003 §voice-pipeline)
 - [0006 — Memory architecture](./0006-memory-architecture.md) — Proposed
+- [0007 — Context assembly and token budget](./0007-context-assembly.md) — Proposed
 
 ## When to write an ADR
 
