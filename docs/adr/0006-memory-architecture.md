@@ -22,7 +22,7 @@ The project is single-user, local-first, no cloud sync, no server. Dependencies 
 - **Bounds:** configurable turn-count ceiling (default 20) and a token soft cap (default 4,000 tokens, enforced by context assembly per ADR-0007). Eviction is FIFO on turn count; token-aware pruning is ADR-0007's job.
 - **Persistence:** serialized to `<data_dir>/session.json` on clean shutdown and `atexit`. Loaded on startup. Atomic write via temp file + `os.replace`. On corrupt or missing file, log a warning and start empty.
 - **Location:** `agent/buffer.py` (or `agent/memory.py` if we fold both there — implementation decides).
-- **Ownership:** the voice loop appends; context assembly reads. No other module writes.
+- **Ownership:** both `voice_loop` and `text_loop` append to the buffer; context assembly reads. The buffer is loop-agnostic conversational context — a user who tests in text mode and switches to voice (or vice versa) should see FRIDAY remember what they just said. No module other than the two loops writes.
 
 ### Long-term: SQLite via aiosqlite
 
@@ -75,6 +75,7 @@ The two paths co-exist. Explicit cues always write. Classifier writes are additi
 ### Retriever: FTS5 keyword, k=5 default
 
 - Called by context assembly (ADR-0007) with the user's current turn as the query.
+- `search_memories` accepts raw conversational text — context assembly does NOT need to know FTS5 syntax. Internally, `search_memories` normalizes the input before passing to `MATCH`: strips FTS5 operator characters (`AND`, `OR`, `NOT`, `NEAR`, `*`, `"`, `(`, `)`, `:`, `-`, `^`), collapses whitespace, and wraps the result as a quoted phrase match (`"<normalized text>"`). This treats the user's turn as a bag-of-terms keyword query rather than a structured FTS5 expression. If a normalized query is empty after stripping (user turn was pure punctuation / operator noise), `search_memories` returns an empty list without calling MATCH.
 - Returns top-k ranked results. k is tunable.
 - Vector embeddings are **deferred**. If keyword retrieval produces visibly poor results during real use, a follow-up ADR introduces embeddings (likely `sentence-transformers` local, or a hosted embedding model) and extends the schema.
 
@@ -95,7 +96,7 @@ Both `session.json` and `memory.db` live in this directory. First run bootstraps
 
 - Clear separation between conversational context (buffer) and durable knowledge (SQLite). Each is tuned to its access pattern.
 - SQLite is boring, atomic, inspectable with any SQLite client, backed up by a file copy. All desirable for a solo local-first project.
-- FTS5 ships with the Python stdlib `sqlite3` on all supported platforms; no native extensions to compile.
+- FTS5 ships with most mainstream Python distributions' stdlib `sqlite3` (python.org installers, Debian/Ubuntu packages, Homebrew Python, pyenv-built Python on macOS), with no native extensions to compile in the common case. However, FTS5 is a SQLite build-time flag — minimal or stripped Python builds may omit it. Mitigation: `agent/memory.py` runs a startup capability check (`CREATE VIRTUAL TABLE IF NOT EXISTS _fts5_probe USING fts5(x)` on an in-memory connection) and fails loudly with a clear error message if FTS5 is unavailable, pointing the user at installing a Python with FTS5 support. #77 owns the probe implementation.
 - `agent/memory.py` as single owner mirrors the proven ADR-0002 pattern; keeps testing tractable.
 - Hybrid writer gives the user explicit control (the cue) and ambient help (the classifier) without choosing one.
 
