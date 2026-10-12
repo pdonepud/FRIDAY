@@ -56,7 +56,7 @@ One line, structured enough to grep, tuned to help us notice when the budget is 
 ### Module location and purity
 
 - `agent/context.py` owns assembly.
-- Public surface: `async def build_messages(current_turn: str) -> list[dict]`.
+- Public surface: `async def build_messages(current_turn: str) -> tuple[str, list[dict]]` returning `(system_prompt, messages)`. The two values map directly onto Anthropic's `messages.create(system=..., messages=...)` parameter shape: the assembled system prompt (base system text + the "Things I remember about Preetam:" memory section from Decision item 3) is the first element; the chronologically-ordered buffer turns plus the current user turn are the second. Callers pass each to its own `messages.create()` parameter — the ADR deliberately does NOT fold system content into the `messages` list, because the Anthropic API treats `system` as a top-level parameter distinct from the conversation turns.
 - Pure after retrieval — no I/O inside the budget loop. Memory retrieval runs **before** assembly, after STT finalization in the current `agent/loop.py` flow. Retrieval latency therefore adds to end-to-end turn time (one `search_memories` call per turn, bounded by SQLite + FTS5 performance; typically a few milliseconds on local disk). Overlapping retrieval with STT would require an earlier stable transcript input (ADR-0005's `EagerEndOfTurn` is a natural hook); deferred to a follow-up optimization if the added latency is perceptible in practice.
 - No LLM call inside assembly. Assembly is deterministic, synchronous after retrieval, and testable with fixtures.
 
@@ -67,7 +67,7 @@ One line, structured enough to grep, tuned to help us notice when the budget is 
 - Does not rank memories (that is FTS5's job, ADR-0006).
 - Does not maintain the buffer (that is `agent/buffer.py`'s job, ADR-0006).
 
-Assembly is a reducer: inputs → one `list[dict]` ready for `messages.create()`.
+Assembly is a reducer: inputs → one `(system_prompt, messages)` tuple ready to splat into `messages.create(system=..., messages=...)`.
 
 ## Consequences
 
