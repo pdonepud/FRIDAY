@@ -15,15 +15,21 @@ tasks are:
   each to Flux via ``send_media``.
 * ``_release`` — wait on the caller's ``ptt_release`` event; cancel
   and await ``_pump`` (so no ``send_media`` call reaches the socket
-  after release), then send a ``ForceEndTurn`` control message and
-  set ``force_end_sent``. This arms the receive watchdog.
+  after release); then wait up to ``PTT_RELEASE_GRACE_MS`` for a
+  natural ``EndOfTurn`` signalled by ``_receive``. If the signal
+  fires in grace, no ``ForceEndTurn`` is sent. If grace expires,
+  ``ForceEndTurn`` fires as a bounded liveness fallback and
+  ``force_end_sent`` is set, arming the receive watchdog.
 * ``_receive`` — iterate the raw websocket, watching for the terminal
   ``EndOfTurn`` (or a ``FatalError``, a ``Warning`` announcing the
   turn was silent, connection close, or the post-release watchdog).
+  Also tracks the speculative-finalization flag driven by
+  ``EagerEndOfTurn`` / ``TurnResumed`` so pending-eager retractions
+  are a no-op on ``done_future``.
 
-Turn detection is fully suppressed on the Flux side
-(``eot_threshold=1.0``) so the application layer owns the turn
-boundary. ``eot_timeout_ms=30000`` is the server-side safety net;
+Flux is configured with ``eot_threshold=EOT_THRESHOLD`` and
+``eager_eot_threshold=EAGER_EOT_THRESHOLD`` (see ADR-0005 Decision 1).
+``eot_timeout_ms=30000`` is the server-side safety net;
 ``RECEIVE_TIMEOUT_S=35`` is our own outer guard, but it only arms
 AFTER ``ForceEndTurn`` is sent — an active turn can legitimately run
 for as long as the user is speaking.
@@ -31,8 +37,10 @@ for as long as the user is speaking.
 Audio format is a byte-for-byte match with ``agent.audio``'s capture:
 16 kHz mono s16le. No resampling.
 
-See ADR-0003 §STT for design rationale and the migration path to
-barge-in in Tier 4.
+See ADR-0003 §STT and ADR-0005 for design rationale. The
+StartOfTurn-during-SPEAKING barge-in detection ADR-0005 Decision 1
+describes is #72's work; this module handles the Flux-config and
+event-recognition prerequisites.
 """
 
 from __future__ import annotations
@@ -52,10 +60,12 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 from agent.audio import INPUT_SAMPLE_RATE
 
 __all__ = [
+    "EAGER_EOT_THRESHOLD",
     "ENCODING",
     "EOT_THRESHOLD",
     "EOT_TIMEOUT_MS",
     "MODEL",
+    "PTT_RELEASE_GRACE_MS",
     "RECEIVE_TIMEOUT_S",
     "SAMPLE_RATE",
     "STTAuthError",
@@ -69,26 +79,51 @@ __all__ = [
 _log = logging.getLogger(__name__)
 
 # --- Flux config --------------------------------------------------------
-# ADR-0003 §STT locks these values. Do not tune without an ADR update.
+# Values are the Tier-4a baseline per ADR-0005 Decision 1; the
+# TODO(#70-tuning) markers below call out the ones expected to move
+# as real-world use surfaces data.
 
 MODEL = "flux-general-en"
 ENCODING = "linear16"
 # Reuse agent.audio's constant so a single edit changes both sides of
 # the seam. Currently 16 000 Hz.
 SAMPLE_RATE = INPUT_SAMPLE_RATE
-# 1.0 fully suppresses Flux's native end-of-turn detection; the
-# application drives turn endings via ForceEndTurn per ADR-0003.
-EOT_THRESHOLD = 1.0
+# Lowered from 1.0 (Tier 3's "Flux-side turn detection off" posture, per
+# ADR-0003 §STT) back toward Flux's ~0.7 default so natural EndOfTurn fires
+# on conversational silences. ForceEndTurn is retained as a bounded
+# liveness fallback via PTT_RELEASE_GRACE_MS.
+# TODO(#70-tuning): revisit after real-world use.
+EOT_THRESHOLD = 0.7
+# Speculative turn finalization during active PTT. Must satisfy
+# EAGER_EOT_THRESHOLD <= EOT_THRESHOLD (not SDK-enforced in
+# deepgram-sdk==7.8.1 — asserted below).
+# TODO(#70-tuning): revisit after real-world use.
+EAGER_EOT_THRESHOLD = 0.5
 # Server-side safety net: Flux will force an EndOfTurn after this
 # many milliseconds of silence even without a ForceEndTurn message.
 # Prevents the server-side turn from hanging if a PTT release event
 # is lost or never fires.
 EOT_TIMEOUT_MS = 30000
+# Bounded wait after PTT RELEASE for Flux to emit EndOfTurn naturally
+# (via EagerEndOfTurn confirmation or on sustained silence) before
+# ForceEndTurn fires as a liveness fallback. Per ADR-0005 Decision 1.
+# TODO(#70-tuning): revisit after real-world use.
+PTT_RELEASE_GRACE_MS = 500
 # Outer safety net around the receive loop, armed only AFTER
 # ForceEndTurn is sent. Bounds "how long to wait for the terminal
 # event"; the active-turn window (before ForceEndTurn) has no such
 # bound and can run indefinitely while the user speaks.
 RECEIVE_TIMEOUT_S = 35
+
+# Client-side invariant: Flux requires eager <= eot but the current
+# deepgram-sdk==7.8.1 ships ListenV2ConfigureThresholds with
+# Optional[Any] fields and no validator. This bare assert is the
+# only client-side guard; it fires at import time so a bad commit
+# can't ship behind a lazy code path.
+assert EAGER_EOT_THRESHOLD <= EOT_THRESHOLD, (
+    f"Flux config invariant violated: EAGER_EOT_THRESHOLD={EAGER_EOT_THRESHOLD} "
+    f"must be <= EOT_THRESHOLD={EOT_THRESHOLD}"
+)
 
 
 # --- Exceptions ---------------------------------------------------------
@@ -212,9 +247,19 @@ async def _release(
     ptt_release: asyncio.Event,
     pump_task: asyncio.Task[None],
     force_end_sent: asyncio.Event,
+    eot_received: asyncio.Event,
     done_future: asyncio.Future[str],
 ) -> None:
-    """Wait for PTT release, quiesce ``_pump``, then send ForceEndTurn.
+    """Wait for PTT release, quiesce ``_pump``, then either observe a natural
+    ``EndOfTurn`` within ``PTT_RELEASE_GRACE_MS`` or send ``ForceEndTurn``.
+
+    ADR-0005 Decision 1 (bounded release grace): with
+    ``EOT_THRESHOLD=0.7`` Flux can finalize naturally on
+    conversational silence after release, so a smooth turn end gets
+    the SPEAKING state transition without a server round-trip. The
+    grace is strictly bounded — if ``eot_received`` has not fired
+    within ``PTT_RELEASE_GRACE_MS``, ``ForceEndTurn`` is sent as the
+    liveness fallback (Tier-3 posture preserved).
 
     Invariant preservation: if ``_pump`` failed before ``cancel()``
     took effect, its exception was already recorded on ``done_future``
@@ -229,7 +274,7 @@ async def _release(
     except asyncio.CancelledError:
         raise
 
-    # Cancel ``_pump`` BEFORE sending ForceEndTurn (Finding 1). No
+    # Cancel ``_pump`` BEFORE anything else (Finding 1). No
     # send_media() call may reach the socket after the release signal.
     pump_task.cancel()
     try:
@@ -241,6 +286,33 @@ async def _release(
     # normally. If a future edit removes that swallow, the exception
     # would propagate here — that is desirable; do not add a
     # blanket except that would relabel it.
+
+    # Bounded wait for a natural EndOfTurn from _receive. If one
+    # arrives, ForceEndTurn is skipped entirely — _receive has
+    # already resolved done_future with the transcript. If the grace
+    # expires, fall through to the ForceEndTurn liveness fallback.
+    loop = asyncio.get_running_loop()
+    start_t = loop.time()
+    try:
+        await asyncio.wait_for(
+            eot_received.wait(),
+            timeout=PTT_RELEASE_GRACE_MS / 1000,
+        )
+    except asyncio.CancelledError:
+        raise
+    except TimeoutError:
+        elapsed_ms = int((loop.time() - start_t) * 1000)
+        _log.warning(
+            "stt: PTT release grace expired after %dms, sending ForceEndTurn liveness fallback",
+            elapsed_ms,
+        )
+    else:
+        elapsed_ms = int((loop.time() - start_t) * 1000)
+        _log.debug(
+            "stt: natural EndOfTurn arrived %dms after PTT release, skipping ForceEndTurn",
+            elapsed_ms,
+        )
+        return
 
     try:
         await socket.send_force_end_turn()
@@ -256,7 +328,12 @@ async def _release(
     force_end_sent.set()
 
 
-async def _receive(socket, force_end_sent: asyncio.Event, done_future: asyncio.Future[str]) -> None:
+async def _receive(
+    socket,
+    force_end_sent: asyncio.Event,
+    eot_received: asyncio.Event,
+    done_future: asyncio.Future[str],
+) -> None:
     """Consume raw websocket JSON until a terminal event, close, or watchdog.
 
     Iterates ``socket._websocket`` (a private-but-stable Fern-generated
@@ -270,6 +347,19 @@ async def _receive(socket, force_end_sent: asyncio.Event, done_future: asyncio.F
     resolved upstream, migrate back to the typed iterator and delete
     this workaround. The ``deepgram-sdk==7.8.1`` pin in
     ``agent/requirements.txt`` bounds the coupling.
+
+    ADR-0005 Decision 1 event handling:
+
+    * ``EagerEndOfTurn`` — speculative finalization. Sets a local
+      ``pending_eager`` flag; done_future is NOT resolved until a
+      confirming ``EndOfTurn`` arrives.
+    * ``TurnResumed`` — retracts a pending speculative finalization.
+      If no ``EagerEndOfTurn`` was pending, a WARNING is logged with
+      the turn_index and the event is otherwise ignored (resilience
+      over strictness).
+    * ``EndOfTurn`` — terminal. Sets ``eot_received`` BEFORE
+      resolving ``done_future`` so ``_release``'s grace-window
+      ``wait_for`` sees the signal in-grace and skips ForceEndTurn.
     """
     if not hasattr(socket, "_websocket"):
         _fail(
@@ -292,6 +382,7 @@ async def _receive(socket, force_end_sent: asyncio.Event, done_future: asyncio.F
             STTError(f"no EndOfTurn within {RECEIVE_TIMEOUT_S}s of ForceEndTurn"),
         )
 
+    pending_eager = False
     watchdog_task = asyncio.create_task(_watchdog(), name="stt-receive-watchdog")
     try:
         async for raw in ws:
@@ -302,16 +393,54 @@ async def _receive(socket, force_end_sent: asyncio.Event, done_future: asyncio.F
             msg = json.loads(raw)
             msg_type = msg.get("type")
 
-            if msg_type == "TurnInfo" and msg.get("event") == "EndOfTurn":
-                _handle_end_of_turn(msg, done_future)
-                return
+            if msg_type == "TurnInfo":
+                event = msg.get("event")
+                if event == "EndOfTurn":
+                    pending_eager = False
+                    # Signal _release BEFORE resolving done_future so
+                    # a release-task waiting on grace sees eot_received
+                    # in-grace and skips ForceEndTurn even if the
+                    # done_future resolution unblocks transcribe()
+                    # first.
+                    eot_received.set()
+                    _handle_end_of_turn(msg, done_future)
+                    return
+                if event == "EagerEndOfTurn":
+                    _log.debug(
+                        "stt: EagerEndOfTurn (turn_index=%r); speculative, pending confirmation",
+                        msg.get("turn_index"),
+                    )
+                    pending_eager = True
+                    continue
+                if event == "TurnResumed":
+                    if pending_eager:
+                        _log.debug(
+                            "stt: TurnResumed (turn_index=%r); retracted pending EagerEndOfTurn",
+                            msg.get("turn_index"),
+                        )
+                        pending_eager = False
+                    else:
+                        _log.warning(
+                            "stt: TurnResumed (turn_index=%r) with no pending EagerEndOfTurn; "
+                            "ignoring",
+                            msg.get("turn_index"),
+                        )
+                    continue
+                # Update, StartOfTurn: log and keep listening.
+                _log.debug("stt receive: non-terminal TurnInfo event=%r", event)
+                continue
 
             if msg_type == "Warning":
                 code = msg.get("code")
                 if code == "FORCE_END_TURN_NO_ACTIVE_TURN":
                     # Finding 2: ForceEndTurn arrived before StartOfTurn.
                     # Silent PTT turn — no active turn to end, no
-                    # transcript to return. Treat as clean empty success.
+                    # transcript to return. Treat as clean empty
+                    # success. Set eot_received so a release still in
+                    # grace exits cleanly (it won't be — this warning
+                    # is a response to a ForceEndTurn that already
+                    # went out — but keep the signal consistent).
+                    eot_received.set()
                     _succeed(done_future, "")
                     return
                 _log.warning(
@@ -341,8 +470,7 @@ async def _receive(socket, force_end_sent: asyncio.Event, done_future: asyncio.F
                     )
                 return
 
-            # Update, StartOfTurn, EagerEndOfTurn, TurnResumed, Connected,
-            # ConfigureSuccess, ConfigureFailure: log-only, keep listening.
+            # Connected, ConfigureSuccess, ConfigureFailure: log-only.
             _log.debug("stt receive: non-terminal type=%r", msg_type)
 
         # Finding 5: iterator exhausted without a terminal event.
@@ -438,6 +566,7 @@ async def transcribe(chunks: AsyncIterator[bytes], ptt_release: asyncio.Event) -
             encoding=ENCODING,
             sample_rate=SAMPLE_RATE,
             eot_threshold=EOT_THRESHOLD,
+            eager_eot_threshold=EAGER_EOT_THRESHOLD,
             eot_timeout_ms=EOT_TIMEOUT_MS,
         )
     except ApiError as e:
@@ -448,14 +577,26 @@ async def transcribe(chunks: AsyncIterator[bytes], ptt_release: asyncio.Event) -
             loop = asyncio.get_running_loop()
             done_future: asyncio.Future[str] = loop.create_future()
             force_end_sent = asyncio.Event()
+            # eot_received bridges _receive -> _release so a natural
+            # EndOfTurn within PTT_RELEASE_GRACE_MS can skip
+            # ForceEndTurn entirely (ADR-0005 Decision 1).
+            eot_received = asyncio.Event()
 
             pump_task = asyncio.create_task(_pump(socket, chunks, done_future), name="stt-pump")
             release_task = asyncio.create_task(
-                _release(socket, ptt_release, pump_task, force_end_sent, done_future),
+                _release(
+                    socket,
+                    ptt_release,
+                    pump_task,
+                    force_end_sent,
+                    eot_received,
+                    done_future,
+                ),
                 name="stt-release",
             )
             receive_task = asyncio.create_task(
-                _receive(socket, force_end_sent, done_future), name="stt-receive"
+                _receive(socket, force_end_sent, eot_received, done_future),
+                name="stt-receive",
             )
             tasks = (pump_task, release_task, receive_task)
 

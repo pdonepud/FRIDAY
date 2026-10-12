@@ -27,6 +27,9 @@ dependencies = { file = "agent/requirements.txt" }
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "no_fast_grace: opt out of tests/test_stt.py's PTT_RELEASE_GRACE_MS autouse override",
+]
 
 [tool.coverage.run]
 source = ["agent"]
