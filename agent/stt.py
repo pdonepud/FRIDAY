@@ -330,6 +330,7 @@ async def _release(
 
 async def _receive(
     socket,
+    ptt_release: asyncio.Event,
     force_end_sent: asyncio.Event,
     eot_received: asyncio.Event,
     done_future: asyncio.Future[str],
@@ -357,9 +358,16 @@ async def _receive(
       If no ``EagerEndOfTurn`` was pending, a WARNING is logged with
       the turn_index and the event is otherwise ignored (resilience
       over strictness).
-    * ``EndOfTurn`` — terminal. Sets ``eot_received`` BEFORE
-      resolving ``done_future`` so ``_release``'s grace-window
-      ``wait_for`` sees the signal in-grace and skips ForceEndTurn.
+    * ``EndOfTurn`` with ``trigger="manual"`` — terminal (response to
+      our ``ForceEndTurn``). Sets ``eot_received`` and resolves
+      ``done_future``.
+    * ``EndOfTurn`` with ``trigger="model"`` — Flux native detection.
+      Terminal ONLY if ``ptt_release`` is already set (the user has
+      released and we're inside the release grace). Otherwise ignored
+      with a DEBUG log — the user is mid-utterance and we keep
+      listening until they stop. This is the ADR-0005 Decision 1
+      posture: ``EOT_THRESHOLD=0.7`` lets Flux end turns naturally
+      POST-release, not DURING the user's active hold.
     """
     if not hasattr(socket, "_websocket"):
         _fail(
@@ -396,6 +404,23 @@ async def _receive(
             if msg_type == "TurnInfo":
                 event = msg.get("event")
                 if event == "EndOfTurn":
+                    trigger = msg.get("trigger")
+                    if trigger == "model" and not ptt_release.is_set():
+                        # Flux native EndOfTurn fired on a mid-utterance
+                        # silence while the user is still holding PTT.
+                        # Ignore and keep listening — the user hasn't
+                        # finished their turn yet. When PTT releases,
+                        # _release()'s grace will wait for the next
+                        # natural EndOfTurn (or send ForceEndTurn as the
+                        # bounded liveness fallback). ADR-0005
+                        # Decision 1.
+                        _log.debug(
+                            "stt: ignoring model-triggered EndOfTurn "
+                            "(turn_index=%r) during active PTT; user still speaking",
+                            msg.get("turn_index"),
+                        )
+                        pending_eager = False
+                        continue
                     pending_eager = False
                     # Signal _release BEFORE resolving done_future so
                     # a release-task waiting on grace sees eot_received
@@ -595,7 +620,7 @@ async def transcribe(chunks: AsyncIterator[bytes], ptt_release: asyncio.Event) -
                 name="stt-release",
             )
             receive_task = asyncio.create_task(
-                _receive(socket, force_end_sent, eot_received, done_future),
+                _receive(socket, ptt_release, force_end_sent, eot_received, done_future),
                 name="stt-receive",
             )
             tasks = (pump_task, release_task, receive_task)

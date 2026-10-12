@@ -1444,3 +1444,109 @@ async def test_ptt_release_eager_then_eot_in_grace(monkeypatch):
 
     assert result == "eager-then-eot"
     assert socket.force_end_turn_count == 0
+
+
+async def test_model_triggered_eot_ignored_during_active_ptt(monkeypatch, caplog):
+    """Model-trigger EndOfTurn during active PTT is ignored; manual wins.
+
+    Flux can emit ``EndOfTurn{trigger="model"}`` on a mid-utterance
+    silence while the user is still holding PTT (``EOT_THRESHOLD=0.7``
+    makes that possible). Pre-fix, this cut transcription off and
+    returned only the first part. Post-fix, the model-triggered
+    event is ignored with a DEBUG log; ``_receive`` keeps listening
+    until the release-driven ``ForceEndTurn`` elicits a terminal
+    ``trigger="manual"`` EndOfTurn.
+    """
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_end_of_turn(transcript="partial", trigger="model"),
+        ],
+        post_force_end=[
+            _turn_info_end_of_turn(transcript="full utterance", trigger="manual"),
+        ],
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    with caplog.at_level(logging.DEBUG, logger="agent.stt"):
+        task = asyncio.create_task(transcribe(_empty_chunks(), ptt_release))
+        # Let _receive consume the pre-release model-triggered EOT first.
+        await asyncio.sleep(0.02)
+        ptt_release.set()
+        result = await asyncio.wait_for(task, timeout=1.0)
+
+    assert result == "full utterance"
+    ignore_debug = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and "ignoring model-triggered EndOfTurn" in r.getMessage()
+    ]
+    assert ignore_debug, "expected DEBUG log for ignored model-trigger EndOfTurn"
+    assert socket.force_end_turn_count > 0, (
+        "release should have fallen through to ForceEndTurn after grace expiry; "
+        f"call_order={socket.call_order}"
+    )
+
+
+async def test_model_triggered_eot_terminal_after_release(monkeypatch):
+    """``trigger="model"`` is terminal once ``ptt_release`` is set.
+
+    Post-release, Flux native EOT is the designed natural-finalization
+    path. ``_receive`` falls through to ``_handle_end_of_turn`` and
+    ``eot_received`` signals ``_release`` in-grace → no
+    ``ForceEndTurn``.
+    """
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_end_of_turn(transcript="post-release natural", trigger="model"),
+        ],
+        exhaust_after_messages=True,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    ptt_release.set()  # release is already signalled when transcribe starts
+
+    result = await asyncio.wait_for(transcribe(_empty_chunks(), ptt_release), timeout=1.0)
+
+    assert result == "post-release natural"
+    assert socket.force_end_turn_count == 0, (
+        f"post-release natural EOT must not provoke ForceEndTurn; call_order={socket.call_order}"
+    )
+
+
+async def test_sequential_model_eots_during_hold_then_manual(monkeypatch, caplog):
+    """Multiple pre-release model EOTs are all ignored; post-release manual wins.
+
+    Simulates two mid-utterance silences during a single hold. Both
+    model-trigger events are ignored (one DEBUG per event). On
+    release, ``ForceEndTurn`` elicits the manual terminal event.
+    """
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_end_of_turn(transcript="silence 1", trigger="model"),
+            _turn_info_end_of_turn(transcript="silence 2", trigger="model"),
+        ],
+        post_force_end=[
+            _turn_info_end_of_turn(transcript="final after release", trigger="manual"),
+        ],
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    with caplog.at_level(logging.DEBUG, logger="agent.stt"):
+        task = asyncio.create_task(transcribe(_empty_chunks(), ptt_release))
+        await asyncio.sleep(0.02)
+        ptt_release.set()
+        result = await asyncio.wait_for(task, timeout=1.0)
+
+    assert result == "final after release"
+    ignore_debug = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and "ignoring model-triggered EndOfTurn" in r.getMessage()
+    ]
+    assert len(ignore_debug) == 2, (
+        f"expected 2 DEBUG logs for ignored model-trigger EndOfTurns, got {len(ignore_debug)}"
+    )
+    assert socket.force_end_turn_count > 0
