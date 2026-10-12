@@ -12,14 +12,14 @@ ADR-0006 introduces a short-term conversation buffer and a long-term SQLite memo
 3. Short-term buffer turns (variable count, variable size)
 4. The user's current turn (always present)
 
-Without discipline, the message list grows unboundedly. Sonnet's 200k context window is generous but not free — cost scales with input tokens, and large contexts hurt latency and accuracy ("context rot" at the tail). We need a deterministic, measurable, tunable assembly rule.
+Without discipline, the message list grows unboundedly. claude-sonnet-4-6's 1M-token context window (behind a beta header — see Anthropic's current model documentation) is generous but not free — cost scales with input tokens, and large contexts hurt latency and accuracy ("context rot" at the tail). We need a deterministic, measurable, tunable assembly rule.
 
 ## Decision
 
 ### Target budget
 
 - **8,000 tokens of input context per turn.**
-- Chosen as a conservative upper bound: well under Sonnet's limit, keeps per-turn cost predictable, keeps latency acceptable for a voice-first UX.
+- Chosen as a conservative soft target: well under claude-sonnet-4-6's 1M-token context window (which requires a beta header; see Anthropic's current model documentation), keeps per-turn cost predictable, keeps latency acceptable for a voice-first UX. The budget is a target not an upper bound — see the exception in Decision item 2.
 - The budget is a module-level constant (`_CONTEXT_BUDGET_TOKENS = 8000`) with a `TODO(#NN-tuning)` comment. Expected to move; the point is that one number controls it.
 
 ### Assembly order (highest priority first)
@@ -29,14 +29,23 @@ Each component is appended in order; whatever budget remains after a higher-prio
 1. **System prompt.** Fixed. Measured once at startup. Always present in full.
 2. **User's current turn.** Always present in full. Never pruned. If a single user turn exceeds the remaining budget, assembly logs a warning and sends it anyway — truncating the user's words is worse than exceeding budget.
 3. **Top-K retrieved long-term memories.** K defaults to 5. Memories are retrieved via `search_memories(current_turn_text, k=5)` from ADR-0006. Injected into the system prompt as a bulleted "Things I remember about Preetam:" section. Lower-ranked memories are dropped first if the group doesn't fit.
-4. **Recent short-term buffer turns.** Newest first. Oldest dropped first when the remaining budget runs out.
+4. **Recent short-term buffer turns.** Serialized in chronological order (oldest to newest, as appended by `voice_loop` / `text_loop` per ADR-0006). Pruning is oldest-first: when the remaining budget runs out, the oldest buffer turns are dropped first, so the newest turns are the last to go. The order sent to Claude's `messages.create()` is always chronological regardless of pruning.
 
 ### Token counting
 
-- **Primary:** Anthropic's token-counting endpoint (`client.messages.count_tokens`). Accurate, matches billing.
-- **Fallback:** `tiktoken` with the `cl100k_base` encoding as a rough approximation if the endpoint is unavailable. Logs a warning. Approximation is within ~10% of actual for typical text — acceptable for budgeting.
-- Counting happens once per assembly, cached per-request. Not re-counted per candidate component (would be expensive).
+- **Primary:** Anthropic's token-counting endpoint (`client.messages.count_tokens`). An estimate, not exact billing match, but close enough for budget decisions.
+- **Fallback:** `tiktoken` with the `cl100k_base` encoding as a rougher approximation if the endpoint is unavailable. Logs a warning. Per Anthropic's guidance, `tiktoken` can undercount typical English text by ~15-20%, with larger error on code and non-English text. The fallback is for budget approximation, not precision; the pruning algorithm (see per-candidate accounting below) applies a safety margin to compensate.
 - Pre-sized estimates (characters / 4) are not used — too lossy for a budget-critical path.
+
+### Per-candidate token accounting (for deterministic pruning)
+
+`count_tokens` returns one aggregate value for the whole request. It does not tell us the per-candidate cost of a memory or a buffer turn, which pruning decisions need. The accounting strategy is two-tiered:
+
+1. **Per-candidate estimation (during pruning):** `tiktoken` is called locally for each candidate (each memory, each buffer turn) to estimate its individual token cost. These estimates are ordinal — used to compare candidates and decide which to drop — not to enforce the budget exactly. Because `tiktoken` can undercount by ~15-20%, pruning applies a **20% safety margin** to the budget: pruning targets `_CONTEXT_BUDGET_TOKENS * 0.80` (6,400 tokens for the default 8,000) during candidate selection, leaving headroom for the undercount.
+
+2. **Final verification (once per assembly):** after candidate selection, `count_tokens` is called ONCE on the fully assembled message list. If the result exceeds `_CONTEXT_BUDGET_TOKENS`, the assembly logs a warning and sends anyway (consistent with Decision 2's never-prune-user-turn rule). If `count_tokens` is unavailable, `tiktoken` runs on the full assembled list and the result is treated as approximate — the budget stays a target either way.
+
+This replaces the earlier "count once per assembly, cached per-request" wording, which was correct for budget verification but didn't address per-candidate decisions.
 
 ### Pruning telemetry
 
@@ -48,7 +57,7 @@ One line, structured enough to grep, tuned to help us notice when the budget is 
 
 - `agent/context.py` owns assembly.
 - Public surface: `async def build_messages(current_turn: str) -> list[dict]`.
-- Pure after retrieval — no I/O inside the budget loop. Memory retrieval runs **before** assembly, in parallel with STT finalization once the user's text is known. This hides retrieval latency behind STT latency we already pay.
+- Pure after retrieval — no I/O inside the budget loop. Memory retrieval runs **before** assembly, after STT finalization in the current `agent/loop.py` flow. Retrieval latency therefore adds to end-to-end turn time (one `search_memories` call per turn, bounded by SQLite + FTS5 performance; typically a few milliseconds on local disk). Overlapping retrieval with STT would require an earlier stable transcript input (ADR-0005's `EagerEndOfTurn` is a natural hook); deferred to a follow-up optimization if the added latency is perceptible in practice.
 - No LLM call inside assembly. Assembly is deterministic, synchronous after retrieval, and testable with fixtures.
 
 ### What assembly does NOT do
@@ -64,7 +73,7 @@ Assembly is a reducer: inputs → one `list[dict]` ready for `messages.create()`
 
 **Positive:**
 
-- Every LLM request has a knowable upper bound on input size.
+- Every LLM request has a knowable soft budget on input size, with one documented exception (Decision 2's user-turn-is-always-sent rule). Final-verification telemetry logs any over-budget assembly so these events are visible.
 - Pruning is deterministic and auditable. When we hit "wait, why did FRIDAY forget that," the telemetry says exactly what got dropped.
 - Priority order codifies our values: never truncate the user's words, prefer explicit memory to older buffer turns.
 - One constant (`_CONTEXT_BUDGET_TOKENS`) controls the whole system; easy to adjust once we have real usage data.
@@ -78,8 +87,8 @@ Assembly is a reducer: inputs → one `list[dict]` ready for `messages.create()`
 
 **Neutral:**
 
-- `tiktoken` becomes a dev dependency for the fallback path. Small, well-maintained.
-- The 8k budget means we are deliberately leaving ~192k tokens of model capacity unused for most turns. That is fine — more context is not always better, and cost control is a real constraint for a solo project.
+- `tiktoken` becomes a runtime dependency (not dev-only), because the fallback path runs in production when Anthropic's token-counting endpoint is unavailable. Also used for per-candidate estimation during pruning (see Per-candidate token accounting). Small, well-maintained, no native extensions required for the `cl100k_base` encoding.
+- The 8k budget means we are deliberately leaving the vast majority of claude-sonnet-4-6's 1M-token context capacity unused for most turns. That is fine — more context is not always better, and cost control is a real constraint for a solo project.
 
 ## Alternatives Considered
 
@@ -135,6 +144,7 @@ Rejected — the voice loop and text loop share enough that two system prompts w
 - Is 8k the right starting number? Will know after a week of real use. Fine to tune.
 - Should K (top memories retrieved) scale with available budget, or stay fixed at 5? Current decision: fixed. Revisit after real use.
 - Should assembly tag which memories were included, so the memory CLI can show "last used" statistics? Nice-to-have, not required for v1.
+- Retrieval-STT overlap: current design serializes STT then retrieval. If per-turn latency from the added retrieval call is perceptible during Tier 4 use, follow up with an ADR introducing an earlier transcript input (likely ADR-0005's `EagerEndOfTurn` as the hook) so retrieval can start before STT finalizes. Track as a tuning issue once memory is live.
 
 ## References
 
