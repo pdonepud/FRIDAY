@@ -67,8 +67,8 @@ The project is single-user, local-first, no cloud sync, no server. Dependencies 
 
 Two paths write to long-term memory:
 
-1. **Explicit cue** — the user says "remember that X", "take a note that X", "don't forget X". A lightweight phrase detector in the voice loop catches these and writes directly. Deterministic, instant, user-controlled.
-2. **Post-turn classifier** — after each turn resolves, a background task hands the turn to a small Claude call via the `agent/claude.py` seam, asking "is there a durable fact worth remembering here?" and expecting a structured response. Non-blocking on the voice loop. Failures log and do not surface to the user.
+1. **Explicit cue** — the user says "remember that X", "take a note that X", "don't forget X". A lightweight phrase detector runs on turn text from both `voice_loop` and `text_loop` and writes directly on a match. Modality-agnostic by design: the detector is a text pattern match, not a voice feature, so it works identically on turns transcribed from STT or typed into the text REPL. Deterministic, instant, user-controlled. The matching logic lives in a shared helper (e.g., `agent/memory.py::detect_explicit_cue()`) called from both loops to prevent drift between the two paths.
+2. **Post-turn classifier** — after each turn resolves (in either loop), a background task hands the turn to a small Claude call via the `agent/claude.py` seam, asking "is there a durable fact worth remembering here?" and expecting a structured response. Non-blocking by design in both loops, though the constraint carries different weight: in `voice_loop` it is critical because a blocking classifier would starve TTS playback or delay the next PTT turn, producing audible gaps; in `text_loop` it is a responsiveness concern — the user shouldn't wait on classification before being able to type the next turn. Same fire-and-forget scheduling pattern in both, lives in a shared helper alongside `detect_explicit_cue()`. Failures log and do not surface to the user.
 
 The two paths co-exist. Explicit cues always write. Classifier writes are additive and can be audited/corrected via the memory CLI (issue #80).
 
