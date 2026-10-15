@@ -497,14 +497,25 @@ async def _receive(
                 code = msg.get("code")
                 if code == "FORCE_END_TURN_NO_ACTIVE_TURN":
                     # Finding 2: ForceEndTurn arrived before StartOfTurn.
-                    # Silent PTT turn — no active turn to end, no
-                    # transcript to return. Treat as clean empty
-                    # success. Set eot_received so a release still in
-                    # grace exits cleanly (it won't be — this warning
-                    # is a response to a ForceEndTurn that already
-                    # went out — but keep the signal consistent).
+                    # Silent PTT turn — no active turn to end. Set
+                    # eot_received so a release still in grace exits
+                    # cleanly (it won't be — this warning is a response
+                    # to a ForceEndTurn that already went out — but
+                    # keep the signal consistent).
+                    #
+                    # Also returns any transcripts accumulated from
+                    # mid-hold ignored model-triggered EndOfTurns:
+                    # those closed Flux turns with real speech, so the
+                    # fact that no active turn remained when
+                    # ForceEndTurn arrived (user fell silent after
+                    # Flux's last natural EOT) must not drop them.
+                    # Truly silent PTT (empty accumulator) still
+                    # returns "".
                     eot_received.set()
-                    _succeed(done_future, "")
+                    final = (
+                        " ".join(accumulated_transcripts).strip() if accumulated_transcripts else ""
+                    )
+                    _succeed(done_future, final)
                     return
                 _log.warning(
                     "stt: Warning code=%r description=%r",

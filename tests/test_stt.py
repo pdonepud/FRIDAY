@@ -1583,3 +1583,35 @@ async def test_model_triggered_eot_transcript_preserved_via_accumulation(monkeyp
 
     assert result == "hello there how are you"
     assert socket.force_end_turn_count > 0
+
+
+async def test_force_end_no_active_turn_returns_accumulated_transcript(monkeypatch):
+    """User speaks, Flux closes the turn on silence (model EOT accumulated),
+    user stays silent, releases. ``ForceEndTurn`` finds no active turn;
+    accumulated transcript is returned instead of empty string.
+
+    Baseline (empty-accumulator) silent-PTT behaviour is still
+    covered by ``test_pre_set_ptt_release_returns_empty_on_no_active_turn``
+    in Bundle 16 — that test's expectation (``""``) is preserved.
+    """
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_end_of_turn(transcript="hello", trigger="model"),
+        ],
+        post_force_end=[
+            _warning(
+                "FORCE_END_TURN_NO_ACTIVE_TURN",
+                "no active turn when ForceEndTurn arrived",
+            ),
+        ],
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    task = asyncio.create_task(transcribe(_empty_chunks(), ptt_release))
+    await asyncio.sleep(0.02)
+    ptt_release.set()
+    result = await asyncio.wait_for(task, timeout=1.0)
+
+    assert result == "hello"
+    assert socket.force_end_turn_count > 0
