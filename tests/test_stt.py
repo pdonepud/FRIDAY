@@ -264,17 +264,44 @@ async def _empty_chunks() -> AsyncIterator[bytes]:
         yield b""
 
 
+@pytest.fixture(autouse=True)
+def _fast_ptt_grace(request, monkeypatch):
+    """Shrink ``PTT_RELEASE_GRACE_MS`` for tests that do not opt out.
+
+    The production grace is 500 ms (ADR-0005 Decision 1); every
+    pre-existing test in this file that uses ``post_force_end=[...]``
+    now waits the full grace before ``ForceEndTurn`` fires, which
+    would add ~500 ms × N tests of pure wall-clock overhead. 10 ms
+    keeps the grace semantics (natural EOT in-grace vs. timeout
+    fallback) exercisable while keeping the suite fast. Tests that
+    care about the production value or the elapsed-ms warning text
+    mark themselves ``@pytest.mark.no_fast_grace`` to opt out, or
+    monkeypatch to a specific larger value.
+    """
+    if "no_fast_grace" in request.keywords:
+        return
+    monkeypatch.setattr(agent.stt, "PTT_RELEASE_GRACE_MS", 10)
+
+
 # ---------------------------------------------------------------------------
 # Bundle 1: constants
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.no_fast_grace
 def test_config_constants():
     assert MODEL == "flux-general-en"
     assert ENCODING == "linear16"
     assert SAMPLE_RATE == 16000
-    assert EOT_THRESHOLD == 1.0
+    # ADR-0005 Decision 1: EOT_THRESHOLD lowered from the Tier-3 1.0 to
+    # 0.7 so natural EndOfTurn fires on conversational silences;
+    # EAGER_EOT_THRESHOLD must be <= EOT_THRESHOLD (module-level assert
+    # at import).
+    assert EOT_THRESHOLD == 0.7
+    assert agent.stt.EAGER_EOT_THRESHOLD == 0.5
+    assert agent.stt.EAGER_EOT_THRESHOLD <= EOT_THRESHOLD
     assert EOT_TIMEOUT_MS == 30000
+    assert agent.stt.PTT_RELEASE_GRACE_MS == 500
     assert RECEIVE_TIMEOUT_S == 35
 
 
@@ -367,6 +394,7 @@ async def test_connect_kwargs_forwarded(monkeypatch):
         "encoding": ENCODING,
         "sample_rate": SAMPLE_RATE,
         "eot_threshold": EOT_THRESHOLD,
+        "eager_eot_threshold": agent.stt.EAGER_EOT_THRESHOLD,
         "eot_timeout_ms": EOT_TIMEOUT_MS,
     }
     assert cm.entered is True
@@ -1202,3 +1230,388 @@ async def test_main_does_not_consume_capture_before_pressed(monkeypatch):
         f"audio.capture started at {first_capture_at[0]} before "
         f"PRESSED at {press_at[0]} — Finding 6 regression"
     )
+
+
+# ---------------------------------------------------------------------------
+# #70 / ADR-0005 Decision 1: eager mode, speculative finalization, PTT grace
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.no_fast_grace
+def test_config_assertion_rejects_eager_above_eot():
+    """Module-level ``assert`` rejects ``EAGER_EOT_THRESHOLD > EOT_THRESHOLD``.
+
+    The invariant is enforced at import time inside ``agent.stt``.
+    Exercising it with bad values requires rebuilding the module
+    with ``EAGER_EOT_THRESHOLD`` raised above ``EOT_THRESHOLD`` —
+    ``importlib.reload`` re-executes with source values, so we go
+    one level lower via ``compile`` + ``exec`` of the source with
+    the constant rewritten.
+    """
+    import pathlib
+
+    source = pathlib.Path(agent.stt.__file__).read_text(encoding="utf-8")
+    patched = source.replace(
+        "EAGER_EOT_THRESHOLD = 0.5",
+        "EAGER_EOT_THRESHOLD = 0.9",
+    )
+    assert "EAGER_EOT_THRESHOLD = 0.9" in patched, "patch failed"
+
+    namespace: dict = {"__name__": "agent.stt_bad_variant", "__file__": agent.stt.__file__}
+    with pytest.raises(AssertionError, match=r"Flux config invariant violated"):
+        exec(compile(patched, agent.stt.__file__, "exec"), namespace)
+
+
+async def test_connect_passes_eager_eot_threshold(monkeypatch):
+    """``client.listen.v2.connect`` receives the eager-mode kwarg."""
+    socket = FakeAsyncSocket(
+        post_force_end=[_turn_info_end_of_turn(transcript="ok", trigger="manual")]
+    )
+    proxy = _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    task = asyncio.create_task(transcribe(_empty_chunks(), ptt_release))
+    await asyncio.sleep(0.02)
+    ptt_release.set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    cm = proxy._holder[-1]
+    assert cm.kwargs["eager_eot_threshold"] == agent.stt.EAGER_EOT_THRESHOLD
+    assert cm.kwargs["eot_threshold"] == agent.stt.EOT_THRESHOLD
+    # Invariant upheld in the forwarded call too.
+    assert cm.kwargs["eager_eot_threshold"] <= cm.kwargs["eot_threshold"]
+
+
+async def test_eager_end_of_turn_is_speculative(monkeypatch, caplog):
+    """``EagerEndOfTurn`` must NOT resolve done_future; ``EndOfTurn`` does.
+
+    Scripts [EagerEndOfTurn, EndOfTurn] back-to-back. The assertion
+    is positional (EndOfTurn's transcript wins, not the Eager event's)
+    plus a DEBUG log line from the eager handler so a regression
+    collapsing the two paths is visible.
+    """
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_update("EagerEndOfTurn"),
+            _turn_info_end_of_turn(transcript="confirmed", trigger="manual"),
+        ],
+        exhaust_after_messages=True,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    with caplog.at_level(logging.DEBUG, logger="agent.stt"):
+        result = await transcribe(_empty_chunks(), ptt_release)
+
+    assert result == "confirmed"
+    eager_records = [r for r in caplog.records if "EagerEndOfTurn" in r.getMessage()]
+    assert eager_records, "no DEBUG log for EagerEndOfTurn"
+    assert all(r.levelno == logging.DEBUG for r in eager_records)
+
+
+async def test_turn_resumed_retracts_pending_eager(monkeypatch, caplog):
+    """``TurnResumed`` after ``EagerEndOfTurn`` retracts the speculative finalization.
+
+    Scripts [EagerEndOfTurn, TurnResumed, EndOfTurn(final)]. The
+    final transcript wins; both the eager and the resume events log
+    at DEBUG.
+    """
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_update("EagerEndOfTurn"),
+            _turn_info_update("TurnResumed"),
+            _turn_info_end_of_turn(transcript="final transcript", trigger="manual"),
+        ],
+        exhaust_after_messages=True,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    with caplog.at_level(logging.DEBUG, logger="agent.stt"):
+        result = await transcribe(_empty_chunks(), ptt_release)
+
+    assert result == "final transcript"
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("EagerEndOfTurn" in m for m in messages), "no DEBUG log for EagerEndOfTurn"
+    assert any("retracted pending EagerEndOfTurn" in m for m in messages), (
+        "no DEBUG log for TurnResumed retraction"
+    )
+    # Neither event should have raised a WARNING in this ordered sequence.
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings == []
+
+
+async def test_turn_resumed_without_pending_eager_logs_warning(monkeypatch, caplog):
+    """``TurnResumed`` with no pending eager event logs WARNING and is ignored.
+
+    Resilience over strictness: the stream is not aborted; EndOfTurn
+    still resolves done_future normally.
+    """
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_update("TurnResumed"),
+            _turn_info_end_of_turn(transcript="ok", trigger="manual"),
+        ],
+        exhaust_after_messages=True,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    with caplog.at_level(logging.DEBUG, logger="agent.stt"):
+        result = await transcribe(_empty_chunks(), ptt_release)
+
+    assert result == "ok"
+    warn_records = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "TurnResumed" in r.getMessage()
+    ]
+    assert warn_records, "expected WARNING for unmatched TurnResumed"
+    # turn_index placeholder from _turn_info_update is 0; message should carry it.
+    assert "turn_index=0" in warn_records[0].getMessage()
+
+
+async def test_ptt_release_eot_in_grace_no_force_end(monkeypatch):
+    """Natural EndOfTurn inside ``PTT_RELEASE_GRACE_MS`` skips ``ForceEndTurn``.
+
+    The autouse fixture already pins the grace at 10 ms. Script
+    EndOfTurn as a pre-message so ``_receive`` sees it immediately
+    after the socket opens; set ``ptt_release`` and verify the
+    release-task observes ``eot_received`` in-grace and never sends
+    ``ForceEndTurn``.
+    """
+    socket = FakeAsyncSocket(
+        pre_messages=[_turn_info_end_of_turn(transcript="natural eot", trigger="manual")],
+        exhaust_after_messages=True,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    ptt_release.set()  # release is already signalled when transcribe starts
+
+    result = await asyncio.wait_for(transcribe(_empty_chunks(), ptt_release), timeout=1.0)
+
+    assert result == "natural eot"
+    assert socket.force_end_turn_count == 0, (
+        f"ForceEndTurn fired despite in-grace natural EOT: call_order={socket.call_order}"
+    )
+
+
+async def test_ptt_release_grace_expires_sends_force_end(monkeypatch, caplog):
+    """Grace expires with no natural EOT → WARNING logged + ``ForceEndTurn`` sent."""
+    socket = FakeAsyncSocket(
+        post_force_end=[_turn_info_end_of_turn(transcript="forced", trigger="manual")]
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    with caplog.at_level(logging.WARNING, logger="agent.stt"):
+        task = asyncio.create_task(transcribe(_empty_chunks(), ptt_release))
+        await asyncio.sleep(0.02)
+        ptt_release.set()
+        result = await asyncio.wait_for(task, timeout=1.0)
+
+    assert result == "forced"
+    assert socket.force_end_turn_count == 1
+    grace_warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "PTT release grace expired" in r.getMessage()
+    ]
+    assert grace_warnings, "expected WARNING on grace expiry"
+
+
+async def test_ptt_release_eager_then_eot_in_grace(monkeypatch):
+    """Eager + natural EOT inside grace: ``ForceEndTurn`` still skipped.
+
+    The eager event sets ``pending_eager`` but does NOT resolve
+    done_future; the subsequent EndOfTurn does. Both land before the
+    grace timer expires.
+    """
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_update("EagerEndOfTurn"),
+            _turn_info_end_of_turn(transcript="eager-then-eot", trigger="manual"),
+        ],
+        exhaust_after_messages=True,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    ptt_release.set()
+
+    result = await asyncio.wait_for(transcribe(_empty_chunks(), ptt_release), timeout=1.0)
+
+    assert result == "eager-then-eot"
+    assert socket.force_end_turn_count == 0
+
+
+async def test_model_triggered_eot_ignored_during_active_ptt(monkeypatch, caplog):
+    """Model-trigger EndOfTurn during active PTT is ignored; manual wins.
+
+    Flux can emit ``EndOfTurn{trigger="model"}`` on a mid-utterance
+    silence while the user is still holding PTT (``EOT_THRESHOLD=0.7``
+    makes that possible). Pre-fix, this cut transcription off and
+    returned only the first part. Post-fix, the model-triggered
+    event is ignored with a DEBUG log; ``_receive`` keeps listening
+    until the release-driven ``ForceEndTurn`` elicits a terminal
+    ``trigger="manual"`` EndOfTurn.
+    """
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_end_of_turn(transcript="partial", trigger="model"),
+        ],
+        post_force_end=[
+            _turn_info_end_of_turn(transcript="full utterance", trigger="manual"),
+        ],
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    with caplog.at_level(logging.DEBUG, logger="agent.stt"):
+        task = asyncio.create_task(transcribe(_empty_chunks(), ptt_release))
+        # Let _receive consume the pre-release model-triggered EOT first.
+        await asyncio.sleep(0.02)
+        ptt_release.set()
+        result = await asyncio.wait_for(task, timeout=1.0)
+
+    # Pre-release model EOT's transcript "partial" is accumulated and
+    # space-joined with the terminal manual EOT's "full utterance".
+    assert result == "partial full utterance"
+    ignore_debug = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and "ignoring model-triggered EndOfTurn" in r.getMessage()
+    ]
+    assert ignore_debug, "expected DEBUG log for ignored model-trigger EndOfTurn"
+    assert socket.force_end_turn_count > 0, (
+        "release should have fallen through to ForceEndTurn after grace expiry; "
+        f"call_order={socket.call_order}"
+    )
+
+
+async def test_model_triggered_eot_terminal_after_release(monkeypatch):
+    """``trigger="model"`` is terminal once ``ptt_release`` is set.
+
+    Post-release, Flux native EOT is the designed natural-finalization
+    path. ``_receive`` falls through to ``_handle_end_of_turn`` and
+    ``eot_received`` signals ``_release`` in-grace → no
+    ``ForceEndTurn``.
+    """
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_end_of_turn(transcript="post-release natural", trigger="model"),
+        ],
+        exhaust_after_messages=True,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    ptt_release.set()  # release is already signalled when transcribe starts
+
+    result = await asyncio.wait_for(transcribe(_empty_chunks(), ptt_release), timeout=1.0)
+
+    assert result == "post-release natural"
+    assert socket.force_end_turn_count == 0, (
+        f"post-release natural EOT must not provoke ForceEndTurn; call_order={socket.call_order}"
+    )
+
+
+async def test_sequential_model_eots_during_hold_then_manual(monkeypatch, caplog):
+    """Multiple pre-release model EOTs are all ignored; post-release manual wins.
+
+    Simulates two mid-utterance silences during a single hold. Both
+    model-trigger events are ignored (one DEBUG per event). On
+    release, ``ForceEndTurn`` elicits the manual terminal event.
+    """
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_end_of_turn(transcript="silence 1", trigger="model"),
+            _turn_info_end_of_turn(transcript="silence 2", trigger="model"),
+        ],
+        post_force_end=[
+            _turn_info_end_of_turn(transcript="final after release", trigger="manual"),
+        ],
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    with caplog.at_level(logging.DEBUG, logger="agent.stt"):
+        task = asyncio.create_task(transcribe(_empty_chunks(), ptt_release))
+        await asyncio.sleep(0.02)
+        ptt_release.set()
+        result = await asyncio.wait_for(task, timeout=1.0)
+
+    # Both "silence 1" and "silence 2" are accumulated and joined with
+    # the terminal manual EOT's "final after release".
+    assert result == "silence 1 silence 2 final after release"
+    ignore_debug = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and "ignoring model-triggered EndOfTurn" in r.getMessage()
+    ]
+    assert len(ignore_debug) == 2, (
+        f"expected 2 DEBUG logs for ignored model-trigger EndOfTurns, got {len(ignore_debug)}"
+    )
+    assert socket.force_end_turn_count > 0
+
+
+async def test_model_triggered_eot_transcript_preserved_via_accumulation(monkeypatch):
+    """The transcript from an ignored model EOT survives into the terminal transcript.
+
+    Direct smoke of the accumulator: Flux emits ``hello there`` with
+    a mid-utterance ``trigger="model"`` EndOfTurn (would be dropped
+    without the accumulator), then after release emits ``how are
+    you`` with the terminal ``trigger="manual"``. The returned
+    transcript must contain both halves space-joined.
+    """
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_end_of_turn(transcript="hello there", trigger="model"),
+        ],
+        post_force_end=[
+            _turn_info_end_of_turn(transcript="how are you", trigger="manual"),
+        ],
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    task = asyncio.create_task(transcribe(_empty_chunks(), ptt_release))
+    await asyncio.sleep(0.02)
+    ptt_release.set()
+    result = await asyncio.wait_for(task, timeout=1.0)
+
+    assert result == "hello there how are you"
+    assert socket.force_end_turn_count > 0
+
+
+async def test_force_end_no_active_turn_returns_accumulated_transcript(monkeypatch):
+    """User speaks, Flux closes the turn on silence (model EOT accumulated),
+    user stays silent, releases. ``ForceEndTurn`` finds no active turn;
+    accumulated transcript is returned instead of empty string.
+
+    Baseline (empty-accumulator) silent-PTT behaviour is still
+    covered by ``test_pre_set_ptt_release_returns_empty_on_no_active_turn``
+    in Bundle 16 — that test's expectation (``""``) is preserved.
+    """
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_end_of_turn(transcript="hello", trigger="model"),
+        ],
+        post_force_end=[
+            _warning(
+                "FORCE_END_TURN_NO_ACTIVE_TURN",
+                "no active turn when ForceEndTurn arrived",
+            ),
+        ],
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    task = asyncio.create_task(transcribe(_empty_chunks(), ptt_release))
+    await asyncio.sleep(0.02)
+    ptt_release.set()
+    result = await asyncio.wait_for(task, timeout=1.0)
+
+    assert result == "hello"
+    assert socket.force_end_turn_count > 0
