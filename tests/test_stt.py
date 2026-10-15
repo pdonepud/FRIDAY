@@ -1475,7 +1475,9 @@ async def test_model_triggered_eot_ignored_during_active_ptt(monkeypatch, caplog
         ptt_release.set()
         result = await asyncio.wait_for(task, timeout=1.0)
 
-    assert result == "full utterance"
+    # Pre-release model EOT's transcript "partial" is accumulated and
+    # space-joined with the terminal manual EOT's "full utterance".
+    assert result == "partial full utterance"
     ignore_debug = [
         r
         for r in caplog.records
@@ -1540,7 +1542,9 @@ async def test_sequential_model_eots_during_hold_then_manual(monkeypatch, caplog
         ptt_release.set()
         result = await asyncio.wait_for(task, timeout=1.0)
 
-    assert result == "final after release"
+    # Both "silence 1" and "silence 2" are accumulated and joined with
+    # the terminal manual EOT's "final after release".
+    assert result == "silence 1 silence 2 final after release"
     ignore_debug = [
         r
         for r in caplog.records
@@ -1549,4 +1553,33 @@ async def test_sequential_model_eots_during_hold_then_manual(monkeypatch, caplog
     assert len(ignore_debug) == 2, (
         f"expected 2 DEBUG logs for ignored model-trigger EndOfTurns, got {len(ignore_debug)}"
     )
+    assert socket.force_end_turn_count > 0
+
+
+async def test_model_triggered_eot_transcript_preserved_via_accumulation(monkeypatch):
+    """The transcript from an ignored model EOT survives into the terminal transcript.
+
+    Direct smoke of the accumulator: Flux emits ``hello there`` with
+    a mid-utterance ``trigger="model"`` EndOfTurn (would be dropped
+    without the accumulator), then after release emits ``how are
+    you`` with the terminal ``trigger="manual"``. The returned
+    transcript must contain both halves space-joined.
+    """
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_end_of_turn(transcript="hello there", trigger="model"),
+        ],
+        post_force_end=[
+            _turn_info_end_of_turn(transcript="how are you", trigger="manual"),
+        ],
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    ptt_release = asyncio.Event()
+    task = asyncio.create_task(transcribe(_empty_chunks(), ptt_release))
+    await asyncio.sleep(0.02)
+    ptt_release.set()
+    result = await asyncio.wait_for(task, timeout=1.0)
+
+    assert result == "hello there how are you"
     assert socket.force_end_turn_count > 0

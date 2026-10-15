@@ -368,6 +368,14 @@ async def _receive(
       listening until they stop. This is the ADR-0005 Decision 1
       posture: ``EOT_THRESHOLD=0.7`` lets Flux end turns naturally
       POST-release, not DURING the user's active hold.
+
+    Transcripts from ignored model-triggered EndOfTurns are
+    accumulated locally and prepended (space-joined) to the
+    terminal EndOfTurn's transcript before done_future resolves.
+    Flux emits one EndOfTurn per detected turn and starts fresh
+    after each; without accumulation, every mid-utterance silence
+    Flux decides is a turn boundary would silently truncate the
+    returned transcript.
     """
     if not hasattr(socket, "_websocket"):
         _fail(
@@ -391,6 +399,12 @@ async def _receive(
         )
 
     pending_eager = False
+    # Transcripts from EndOfTurns we ignore because they fired on a
+    # mid-utterance silence during active PTT. Flux starts a fresh
+    # turn after each EndOfTurn, so without this accumulator the
+    # terminal EndOfTurn would only carry speech from after the last
+    # ignored silence and everything earlier would be lost.
+    accumulated_transcripts: list[str] = []
     watchdog_task = asyncio.create_task(_watchdog(), name="stt-receive-watchdog")
     try:
         async for raw in ws:
@@ -408,19 +422,43 @@ async def _receive(
                     if trigger == "model" and not ptt_release.is_set():
                         # Flux native EndOfTurn fired on a mid-utterance
                         # silence while the user is still holding PTT.
-                        # Ignore and keep listening — the user hasn't
-                        # finished their turn yet. When PTT releases,
+                        # Keep the transcript Flux emitted so it survives
+                        # the next turn boundary, then ignore the event
+                        # and keep listening. When PTT releases,
                         # _release()'s grace will wait for the next
                         # natural EndOfTurn (or send ForceEndTurn as the
                         # bounded liveness fallback). ADR-0005
                         # Decision 1.
+                        ignored_transcript = msg.get("transcript", "") or ""
+                        if ignored_transcript:
+                            accumulated_transcripts.append(ignored_transcript)
                         _log.debug(
                             "stt: ignoring model-triggered EndOfTurn "
-                            "(turn_index=%r) during active PTT; user still speaking",
+                            "(turn_index=%r, transcript_len=%d) during active PTT; "
+                            "user still speaking",
                             msg.get("turn_index"),
+                            len(ignored_transcript),
                         )
                         pending_eager = False
                         continue
+                    # Terminal path: trigger="manual", trigger="model"
+                    # post-release, trigger="timeout", or unknown. Join
+                    # any transcripts accumulated from mid-hold ignored
+                    # EndOfTurns with this terminal transcript so the
+                    # full utterance survives Flux's per-turn transcript
+                    # model. Mutate a shallow copy so the original msg
+                    # isn't altered for anything inspecting it later.
+                    if accumulated_transcripts:
+                        final_transcript = msg.get("transcript", "") or ""
+                        joined = " ".join(accumulated_transcripts + [final_transcript]).strip()
+                        msg = dict(msg)
+                        msg["transcript"] = joined
+                        _log.debug(
+                            "stt: joined %d ignored model EndOfTurn transcript(s) "
+                            "with terminal transcript; final length=%d",
+                            len(accumulated_transcripts),
+                            len(joined),
+                        )
                     pending_eager = False
                     # Signal _release BEFORE resolving done_future so
                     # a release-task waiting on grace sees eot_received
