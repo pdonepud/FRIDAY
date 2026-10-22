@@ -441,8 +441,18 @@ async def voice_loop() -> int:
                     synth_iter = tts.synthesize(_tee(sentence_iter, collect))
                     machine.transition(TurnState.SPEAKING, trigger="loop")
 
+                    # Hoist the mic generator so we can explicitly
+                    # ``aclose()`` it in the finally after cancelling
+                    # the detector task. ``async for`` inside
+                    # ``_mic_pump`` does NOT call ``aclose()`` on
+                    # cancellation, so the ``RawInputStream`` held by
+                    # ``audio.capture()`` would stay open until the
+                    # async generator's finalization runs — unbounded
+                    # delay on Windows. Mirrors the ``ptt_iter.aclose()``
+                    # pattern in voice_loop's outer finally.
+                    barge_in_mic = audio.capture()
                     detect_task = asyncio.create_task(
-                        stt.detect_barge_in(audio.capture(), machine.barge_in_event),
+                        stt.detect_barge_in(barge_in_mic, machine.barge_in_event),
                         name="voice-loop-barge-in-detector",
                     )
                     playback_task = asyncio.create_task(
@@ -509,6 +519,12 @@ async def voice_loop() -> int:
                                 # exceptions have already been
                                 # surfaced via the done-set check or
                                 # cancel propagation.
+                        # Explicit aclose so the RawInputStream inside
+                        # audio.capture() releases now, not at async-
+                        # generator finalization time (which can be
+                        # unbounded on Windows). CodeRabbit #86 F2.
+                        with contextlib.suppress(Exception):
+                            await barge_in_mic.aclose()
                     if barged_in:
                         # BARGE_IN -> LISTENING follows the cancel.
                         # #71 will own the ordering with the real
