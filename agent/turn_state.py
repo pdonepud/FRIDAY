@@ -73,10 +73,18 @@ The ``trigger`` arg is first-class — logged on every transition,
 tested against the canonical set. Valid values:
 
 * ``"model"`` — Flux ``trigger="model"`` natural end-of-turn
-* ``"manual"`` — Flux ``trigger="manual"`` (response to ForceEndTurn)
-* ``"force"`` — explicit application-driven transition
+* ``"manual"`` — loop-driven after a Phase-5 error recovery (chosen
+  so logs separate "something went wrong, back to resting" from
+  normal flow)
+* ``"loop"`` — ``voice_loop`` drove this transition at a phase
+  boundary (clean turn progression: IDLE→LISTENING on first PRESS,
+  LISTENING→THINKING at LLM start, THINKING→SPEAKING at playback
+  start, SPEAKING→LISTENING on clean end, BARGE_IN→LISTENING after
+  cancel completes)
 * ``"vad"`` — voice-activity-detector signal (reserved for future)
-* ``"flux"`` — Flux-emitted event (StartOfTurn, EagerEndOfTurn)
+* ``"flux"`` — Flux-emitted event (StartOfTurn confirmation,
+  EagerEndOfTurn, TurnResumed). SPEAKING→BARGE_IN fires with this
+  trigger from the ``detect_barge_in`` path.
 * ``"timeout"`` — timeout / disconnect
 """
 
@@ -107,8 +115,8 @@ class TurnState(Enum):
     BARGE_IN = "barge_in"
 
 
-Trigger = Literal["model", "manual", "force", "vad", "flux", "timeout"]
-TRIGGERS: tuple[str, ...] = ("model", "manual", "force", "vad", "flux", "timeout")
+Trigger = Literal["model", "manual", "loop", "vad", "flux", "timeout"]
+TRIGGERS: tuple[str, ...] = ("model", "manual", "loop", "vad", "flux", "timeout")
 
 Observer = Callable[[TurnState, TurnState, str, Any], None]
 

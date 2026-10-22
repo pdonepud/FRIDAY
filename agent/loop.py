@@ -37,6 +37,7 @@ from agent.claude import (
     stream_sentences,
     stream_tokens,
 )
+from agent.events import BargeInEvent
 from agent.system_prompt import SYSTEM_PROMPT
 from agent.turn_state import TurnState, TurnStateMachine
 
@@ -376,7 +377,7 @@ async def voice_loop() -> int:
             # keeps subsequent PRESSEDs from attempting an illegal
             # self-transition.
             if machine.current() == TurnState.IDLE:
-                machine.transition(TurnState.LISTENING, trigger="force")
+                machine.transition(TurnState.LISTENING, trigger="loop")
 
             # Spawn the per-turn RELEASED watcher. Watcher consumes the
             # pumped queue, so cancelling it mid-``get()`` only
@@ -413,19 +414,126 @@ async def voice_loop() -> int:
                 # --- Phase 5: Claude + TTS + playback --------------
                 collect: list[str] = []
                 # #72 commit 3: LISTENING -> THINKING at Phase 5
-                # entry (LLM call about to start); THINKING ->
-                # SPEAKING right before audio.playback (TTS pump
-                # starts producing); SPEAKING -> LISTENING on clean
-                # end. Error paths route back to LISTENING via
-                # _recover_to_listening_from_phase5.
-                machine.transition(TurnState.THINKING, trigger="force")
+                # entry (LLM call about to start). #72 commit 4
+                # (ADR-0005 Decision 4): THINKING -> SPEAKING spawns
+                # a sibling ``detect_barge_in`` task on the open mic;
+                # ``asyncio.wait`` races playback completion against
+                # the state-machine's ``barge_in_event``. SPEAKING ->
+                # LISTENING fires on clean end; SPEAKING ->
+                # BARGE_IN -> LISTENING on confirmed barge-in (TTS
+                # cancel plumbing is #71 — commit 4 stubs it via
+                # ``playback_task.cancel()``). Error paths route back
+                # to LISTENING via _recover_to_listening_from_phase5.
+                #
+                # TODO(#72-echo): the barge-in detector currently
+                # relies on commit 2's confirmation window as the
+                # only echo-filter. Flux doesn't surface a per-event
+                # confidence we can gate on. Real-world testing with
+                # Lily's output into an open mic may show self-echo
+                # confirming spuriously; if so, file a follow-up to
+                # add a feature flag defaulting to the mic-closed
+                # behaviour (current pre-#72-commit-4) and ship the
+                # mic-open flip behind it when EC lands.
+                machine.transition(TurnState.THINKING, trigger="loop")
+                barged_in = False
                 try:
                     sentence_iter = stream_sentences(messages, SYSTEM_PROMPT)
                     synth_iter = tts.synthesize(_tee(sentence_iter, collect))
-                    machine.transition(TurnState.SPEAKING, trigger="force")
-                    await audio.playback(synth_iter)
-                    transcript_store.last_elapsed_text = "".join(collect)
-                    machine.transition(TurnState.LISTENING, trigger="force")
+                    machine.transition(TurnState.SPEAKING, trigger="loop")
+
+                    detect_task = asyncio.create_task(
+                        stt.detect_barge_in(audio.capture(), machine.barge_in_event),
+                        name="voice-loop-barge-in-detector",
+                    )
+                    playback_task = asyncio.create_task(
+                        audio.playback(synth_iter),
+                        name="voice-loop-playback",
+                    )
+                    barge_in_waiter = asyncio.create_task(
+                        machine.barge_in_event.wait(),
+                        name="voice-loop-barge-in-waiter",
+                    )
+                    phase5_tasks = (detect_task, playback_task, barge_in_waiter)
+                    try:
+                        done, _pending = await asyncio.wait(
+                            {playback_task, barge_in_waiter},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if barge_in_waiter in done:
+                            # Barge-in: fire SPEAKING -> BARGE_IN with
+                            # the BargeInEvent payload observers need
+                            # (metrics, transcript store).
+                            barged_in = True
+                            transcript_store.last_elapsed_text = "".join(collect)
+                            machine.transition(
+                                TurnState.BARGE_IN,
+                                trigger="flux",
+                                payload=BargeInEvent(
+                                    at=asyncio.get_running_loop().time(),
+                                    source="flux",
+                                    confidence=None,
+                                ),
+                            )
+                            # Cancel playback as the (#71-stubbed) TTS
+                            # cancel. #71 replaces this with the
+                            # destructive-cancel ADR-0005 Decision 3
+                            # specifies.
+                            if not playback_task.done():
+                                playback_task.cancel()
+                        else:
+                            # Clean playback end — surface any error
+                            # the playback task raised (would be a
+                            # Phase-5-handled exception type).
+                            if playback_task.exception() is not None:
+                                raise playback_task.exception()
+                            transcript_store.last_elapsed_text = "".join(collect)
+                            machine.transition(TurnState.LISTENING, trigger="loop")
+                    finally:
+                        # Drain all three sibling tasks. detect_task
+                        # exceptions are swallowed with WARNING — a
+                        # dead Flux session during SPEAKING is
+                        # recoverable (user hears Lily, loses only
+                        # the barge-in capability for that turn).
+                        for t in phase5_tasks:
+                            if not t.done():
+                                t.cancel()
+                        for t in phase5_tasks:
+                            try:
+                                await t
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception as e:  # noqa: BLE001 — defensive
+                                if t is detect_task:
+                                    print(f"[bargein] detector raised: {e!r}")
+                                # playback_task / barge_in_waiter
+                                # exceptions have already been
+                                # surfaced via the done-set check or
+                                # cancel propagation.
+                    if barged_in:
+                        # BARGE_IN -> LISTENING follows the cancel.
+                        # #71 will own the ordering with the real
+                        # destructive-cancel plumbing; here it fires
+                        # after the finally drains the sibling tasks.
+                        machine.transition(TurnState.LISTENING, trigger="loop")
+                        print("\n[barged in]")
+                        # Discard the pending user turn (option a).
+                        # Phase 6 has NOT run (we never reached the
+                        # clean path), so ``messages`` currently ends
+                        # with the Phase-4-appended user turn and no
+                        # assistant counterpart. Popping it matches
+                        # the SIGINT-stopped and other per-turn-abort
+                        # paths; the alternative — keep user, append
+                        # the partial assistant reply from ``collect``
+                        # — is a UX-nicer "preserve mid-utterance
+                        # context" design but belongs in a focused
+                        # follow-up PR with its own ADR consideration
+                        # (how to mark the partial, interaction with
+                        # ADR-0007's context-rot semantics). Leaving
+                        # user alive without a popped-or-appended
+                        # assistant would violate Anthropic's role-
+                        # alternation requirement on the next turn.
+                        messages.pop()
+                        continue
                 except asyncio.CancelledError:
                     # #55 D3: mid-response Ctrl+C. Under asyncio.run
                     # SIGINT delivers as task cancellation → CancelledError

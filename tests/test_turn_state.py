@@ -70,7 +70,7 @@ def _walk_to(sm: TurnStateMachine, target: TurnState) -> None:
     dispatch on trigger; it only enforces legal ``(from, to)`` pairs.
     """
     for step in _SHORTEST_PATH_TO[target]:
-        ok = sm.transition(step, trigger="force")
+        ok = sm.transition(step, trigger="loop")
         assert ok, f"walk-to setup failed at {step.name}; current={sm.current().name}"
 
 

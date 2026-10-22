@@ -19,6 +19,7 @@ which seam raises.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from unittest.mock import MagicMock
 
 import pytest
@@ -184,6 +185,7 @@ def _install_voice_pipeline_mocks(
     stt_results=None,
     sentences=("ok.",),
     synth_result=(b"a",),
+    barge_in=None,
 ):
     """Install default fakes for ``agent.ptt.events``, ``agent.audio.capture``,
     ``agent.stt.transcribe``, ``agent.claude.stream_sentences``,
@@ -268,6 +270,32 @@ def _install_voice_pipeline_mocks(
             pass
 
     monkeypatch.setattr("agent.audio.playback", _fake_playback)
+
+    # #72 commit 4: stub detect_barge_in so tests don't attempt a real
+    # Flux connection. Default behaviour: wait on the shared event
+    # forever (caller cancels on teardown — matches production shape).
+    # Tests can override via ``barge_in`` which runs on top of the
+    # default (e.g. firing the event after a short delay).
+    async def _fake_detect_barge_in(mic_chunks, barge_in_event, **_kw):
+        # Drain the mic iter so audio.capture()'s generator sees the
+        # same lifecycle as production. Running concurrently with the
+        # waiting-on-event task is what the real detect_barge_in does.
+        async def _drain() -> None:
+            async for _ in mic_chunks:
+                pass
+
+        drain_task = asyncio.create_task(_drain(), name="fake-detect-mic-drain")
+        if barge_in is not None:
+            await barge_in(barge_in_event)
+        try:
+            await asyncio.Event().wait()  # block until cancelled
+        finally:
+            if not drain_task.done():
+                drain_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await drain_task
+
+    monkeypatch.setattr("agent.stt.detect_barge_in", _fake_detect_barge_in)
 
     return captured_messages
 
@@ -753,18 +781,39 @@ async def test_voice_mode_phase5_cancellederror_uncancels_and_continues(monkeypa
 
 
 async def test_voice_mode_phase5_cancellederror_external_reraises(monkeypatch, capsys):
-    """#55 D3: external cancellation (uncancel() > 0) must re-raise."""
+    """#55 D3 / #72 commit 4: external cancellation of the voice_loop
+    task (uncancel() > 0) must re-raise.
+
+    Mechanism change in #72 commit 4: pre-restructure, Phase 5 ran
+    ``audio.playback`` as an inline await, so ``task.cancel()`` inside
+    the playback body cancelled the voice_loop task itself. Post-
+    restructure, playback runs under its own ``asyncio.Task`` as a
+    sibling to the barge-in detector, so inner ``task.cancel()`` only
+    cancels the playback task — exactly the "per-turn interrupt" path
+    the production code handles via uncancel() returning 0.
+
+    This test now cancels the OUTER task directly, which is the real
+    "external cancellation" scenario (TaskGroup child cancel, direct
+    task.cancel from a supervisor). The double-cancel on the outer
+    task pushes uncancel() to return 1, re-raising from Phase 5.
+    """
     _set_voice_argv(monkeypatch)
     _set_all_keys(monkeypatch)
     monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
 
-    async def _playback_double_cancels(chunks, *_a, **_kw):
+    outer_ref: list[asyncio.Task | None] = [None]
+
+    async def _playback_cancels_outer(chunks, *_a, **_kw):
         async for _ in chunks:
             pass
-        task = asyncio.current_task()
-        assert task is not None
-        task.cancel()
-        task.cancel()
+        outer = outer_ref[0]
+        assert outer is not None, "outer task ref not populated"
+        outer.cancel()
+        outer.cancel()
+        # Yield once so the double-cancel takes effect on the outer
+        # task's next await (which is the asyncio.wait inside
+        # voice_loop's Phase 5).
+        await asyncio.sleep(0)
         raise asyncio.CancelledError
 
     _install_voice_pipeline_mocks(
@@ -775,12 +824,14 @@ async def test_voice_mode_phase5_cancellederror_external_reraises(monkeypatch, c
         ],
         stt_result="hi",
     )
-    monkeypatch.setattr("agent.audio.playback", _playback_double_cancels)
+    monkeypatch.setattr("agent.audio.playback", _playback_cancels_outer)
 
     from agent.loop import run
 
+    outer = asyncio.create_task(run())
+    outer_ref[0] = outer
     with pytest.raises(asyncio.CancelledError):
-        await run()
+        await outer
     out = capsys.readouterr().out
     assert "[stopped]" not in out
 
@@ -1022,6 +1073,7 @@ async def test_run_falls_back_to_text_on_speaker_unavailable(monkeypatch, capsys
 # #72 commit 3: state machine refactor — observer stubs + recovery helper
 # ---------------------------------------------------------------------------
 
+from agent.events import BargeInEvent  # noqa: E402
 from agent.loop import (  # noqa: E402
     _recover_to_listening_from_phase5,
     _TranscriptStore,
@@ -1034,7 +1086,7 @@ def _walk_sm(sm: TurnStateMachine, *steps: TurnState) -> None:
     """Walk the machine through the given states, each as a legal
     transition with trigger='force'. Setup helper for observer tests."""
     for s in steps:
-        assert sm.transition(s, trigger="force"), (
+        assert sm.transition(s, trigger="loop"), (
             f"walk failed at {s.name}; current={sm.current().name}"
         )
 
@@ -1057,7 +1109,7 @@ def test_transcript_store_marks_spoken_on_clean_speaking_to_listening():
     _walk_sm(sm, TurnState.LISTENING, TurnState.THINKING, TurnState.SPEAKING)
     assert store.last_outcome is None  # still unset — no SPEAKING-origin edge yet
 
-    sm.transition(TurnState.LISTENING, trigger="force")
+    sm.transition(TurnState.LISTENING, trigger="loop")
     assert store.last_outcome == "spoken"
 
 
@@ -1081,7 +1133,7 @@ def test_transcript_store_ignores_non_speaking_origin_transitions():
     sm.on_change(store.observe)
     _walk_sm(sm, TurnState.LISTENING, TurnState.THINKING)
     assert store.last_outcome is None
-    sm.transition(TurnState.LISTENING, trigger="force")  # THINKING -> LISTENING
+    sm.transition(TurnState.LISTENING, trigger="loop")  # THINKING -> LISTENING
     assert store.last_outcome is None
 
 
@@ -1113,7 +1165,7 @@ def test_turn_metrics_illegal_transition_does_not_increment():
     _walk_sm(sm, TurnState.LISTENING)
     assert metrics.transitions_seen == 1
     # SPEAKING from LISTENING is illegal — observer should not fire.
-    accepted = sm.transition(TurnState.SPEAKING, trigger="force")
+    accepted = sm.transition(TurnState.SPEAKING, trigger="loop")
     assert accepted is False
     assert metrics.transitions_seen == 1
 
@@ -1301,3 +1353,178 @@ async def test_text_mode_generic_exception_pops_and_continues(monkeypatch, capsy
     out = capsys.readouterr().out
     assert "[err]" in out
     assert "RuntimeError" in out
+
+
+# ---------------------------------------------------------------------------
+# #72 commit 4: SPEAKING -> BARGE_IN -> LISTENING on confirmed barge-in
+# ---------------------------------------------------------------------------
+
+
+async def test_voice_mode_barge_in_fires_speaking_to_barge_in(monkeypatch, capsys):
+    """A confirmed barge-in (shared asyncio.Event set during SPEAKING)
+    fires SPEAKING -> BARGE_IN with a BargeInEvent payload, then
+    BARGE_IN -> LISTENING after the (stubbed) TTS cancel completes."""
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    seen: list[tuple[TurnState, TurnState, str, object]] = []
+
+    class _TappedMachine(TurnStateMachine):
+        def __init__(self) -> None:
+            super().__init__()
+            self.on_change(lambda f, t, trig, p: seen.append((f, t, trig, p)))
+
+    monkeypatch.setattr("agent.loop.TurnStateMachine", _TappedMachine)
+
+    async def _fire_barge_in(event: asyncio.Event) -> None:
+        # Give playback a tick to start, then fire the shared event.
+        await asyncio.sleep(0.001)
+        event.set()
+
+    # Pre-roll the ptt script so the loop progresses past Phase 1 and
+    # into Phase 5 before we fire the barge-in signal. After the
+    # barge-in-driven continue, exhaust the ptt stream so run()
+    # returns 2.
+    _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_result="hi",
+        sentences=("Hello.",),
+        barge_in=_fire_barge_in,
+    )
+
+    # Make playback long enough that the barge-in event fires BEFORE
+    # playback completes naturally — otherwise the race could resolve
+    # as a clean turn end.
+    async def _slow_playback(chunks, *_a, **_kw):
+        async for _ in chunks:
+            pass
+        await asyncio.sleep(0.1)
+
+    monkeypatch.setattr("agent.audio.playback", _slow_playback)
+
+    from agent.loop import run
+
+    assert await run() == 2  # ptt exhausts after the barged-in turn
+    out = capsys.readouterr().out
+    assert "[barged in]" in out
+
+    # The sequence must contain SPEAKING -> BARGE_IN with trigger="flux"
+    # and then BARGE_IN -> LISTENING with trigger="loop".
+    edges = [(f, t, trig) for (f, t, trig, _p) in seen]
+    assert (TurnState.SPEAKING, TurnState.BARGE_IN, "flux") in edges
+    assert (TurnState.BARGE_IN, TurnState.LISTENING, "loop") in edges
+
+    # Payload on SPEAKING -> BARGE_IN must be a BargeInEvent with
+    # source="flux", confidence None, and a monotonic timestamp.
+    (bargein_payload,) = [
+        p for (f, t, _trig, p) in seen if f == TurnState.SPEAKING and t == TurnState.BARGE_IN
+    ]
+    assert isinstance(bargein_payload, BargeInEvent)
+    assert bargein_payload.source == "flux"
+    assert bargein_payload.confidence is None
+    assert isinstance(bargein_payload.at, float)
+
+
+async def test_voice_mode_barge_in_discards_user_turn(monkeypatch, capsys):
+    """BARGE_IN pops the pending user turn from messages — the user
+    interrupted, so the half-spoken reply doesn't commit to history
+    for Claude's next turn. Matches the SIGINT-stopped pattern."""
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    captured_messages_ref = {"val": None}
+
+    async def _fire_barge_in(event: asyncio.Event) -> None:
+        await asyncio.sleep(0.001)
+        event.set()
+
+    captured_messages_ref["val"] = _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_results=["first turn", "second turn"],
+        sentences=("ok.",),
+        barge_in=_fire_barge_in,
+    )
+
+    async def _slow_playback(chunks, *_a, **_kw):
+        async for _ in chunks:
+            pass
+        await asyncio.sleep(0.1)
+
+    monkeypatch.setattr("agent.audio.playback", _slow_playback)
+
+    from agent.loop import run
+
+    assert await run() == 2
+    out = capsys.readouterr().out
+    assert "[barged in]" in out
+
+    # First turn: user said "first turn", barged in, pop.
+    # Second turn: user said "second turn", claude's _fake_stream_sentences
+    # captures messages snapshot. The second turn's captured messages
+    # must NOT contain "first turn" as a prior user turn (barge-in
+    # discarded it).
+    captured = captured_messages_ref["val"]
+    assert len(captured) == 2
+    assert captured[0] == [{"role": "user", "content": "first turn"}]
+    assert captured[1] == [{"role": "user", "content": "second turn"}]
+
+
+async def test_voice_mode_barge_in_marks_transcript_store_interrupted(monkeypatch, capsys):
+    """_TranscriptStore.last_outcome must flip to 'interrupted' on the
+    SPEAKING -> BARGE_IN edge; last_elapsed_text records what the
+    user heard before the cut."""
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    captured_store: dict[str, _TranscriptStore] = {}
+
+    original_store_cls = _TranscriptStore
+
+    class _CapturingStore(original_store_cls):
+        def __init__(self) -> None:
+            super().__init__()
+            captured_store["val"] = self
+
+    monkeypatch.setattr("agent.loop._TranscriptStore", _CapturingStore)
+
+    async def _fire_barge_in(event: asyncio.Event) -> None:
+        await asyncio.sleep(0.001)
+        event.set()
+
+    _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_result="hi",
+        sentences=("Hello there.",),
+        barge_in=_fire_barge_in,
+    )
+
+    async def _slow_playback(chunks, *_a, **_kw):
+        async for _ in chunks:
+            pass
+        await asyncio.sleep(0.1)
+
+    monkeypatch.setattr("agent.audio.playback", _slow_playback)
+
+    from agent.loop import run
+
+    assert await run() == 2
+    store = captured_store["val"]
+    assert store.last_outcome == "interrupted"
+    assert store.last_elapsed_text == "Hello there."
