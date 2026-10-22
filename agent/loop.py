@@ -38,6 +38,7 @@ from agent.claude import (
     stream_tokens,
 )
 from agent.system_prompt import SYSTEM_PROMPT
+from agent.turn_state import TurnState, TurnStateMachine
 
 # --- Banners + stock messages -------------------------------------------
 _BANNER: str = "FRIDAY — Tier 1 baseline. Type to talk. Ctrl+C to exit."
@@ -69,6 +70,82 @@ def _voice_missing_keys_message(missing: list[str]) -> str:
     lines = [f"{var} isn't set; see .env.example." for var in missing]
     lines.append("Copy .env.example to .env and add your keys.")
     return "\n".join(lines)
+
+
+class _TranscriptStore:
+    """Minimal transcript-store observer (#72 commit 3).
+
+    Full persistence (#76 SQLite) lands later. This stub records the
+    last turn's outcome and elapsed text so tests can assert the
+    sealing decision at each state transition — in particular, the
+    SPEAKING -> BARGE_IN edge (commit 4 fires it) must mark the
+    assistant turn as ``"interrupted"`` with the elapsed sentence
+    text, not ``"spoken"``.
+
+    Fields:
+
+    * ``last_outcome``: ``"spoken"`` on clean SPEAKING -> LISTENING;
+      ``"interrupted"`` on SPEAKING -> BARGE_IN. ``None`` before the
+      first SPEAKING-origin transition.
+    * ``last_elapsed_text``: the sentence text accumulated into the
+      TTS stream so far. ``voice_loop`` sets this imperatively before
+      firing the SPEAKING-origin transition (text is a per-turn
+      local, not something the observer can read from state alone).
+    """
+
+    def __init__(self) -> None:
+        self.last_outcome: str | None = None
+        self.last_elapsed_text: str | None = None
+
+    def observe(
+        self,
+        from_state: TurnState,
+        to_state: TurnState,
+        trigger: str,
+        payload: object,
+    ) -> None:
+        if from_state != TurnState.SPEAKING:
+            return
+        if to_state == TurnState.LISTENING:
+            self.last_outcome = "spoken"
+        elif to_state == TurnState.BARGE_IN:
+            self.last_outcome = "interrupted"
+
+
+class _TurnMetrics:
+    """Minimal metrics observer (#72 commit 3).
+
+    Counts transitions per ``(from, to)`` edge for diagnostics. Real
+    metrics plumbing (OpenTelemetry etc.) is explicitly out of scope.
+    """
+
+    def __init__(self) -> None:
+        self.transitions_seen: int = 0
+        self.by_edge: dict[tuple[TurnState, TurnState], int] = {}
+
+    def observe(
+        self,
+        from_state: TurnState,
+        to_state: TurnState,
+        trigger: str,
+        payload: object,
+    ) -> None:
+        self.transitions_seen += 1
+        key = (from_state, to_state)
+        self.by_edge[key] = self.by_edge.get(key, 0) + 1
+
+
+def _recover_to_listening_from_phase5(machine: TurnStateMachine, trigger: str = "manual") -> None:
+    """Transition the machine back to LISTENING from a Phase 5
+    intermediate state (THINKING or SPEAKING) after a recoverable
+    error. No-op if we're not in either — the error fired before
+    THINKING was entered, or we never left LISTENING.
+    """
+    current = machine.current()
+    if current == TurnState.THINKING:
+        machine.transition(TurnState.LISTENING, trigger=trigger)
+    elif current == TurnState.SPEAKING:
+        machine.transition(TurnState.LISTENING, trigger=trigger)
 
 
 async def _tee(src: AsyncIterator[str], collect: list[str]) -> AsyncIterator[str]:
@@ -233,6 +310,17 @@ async def voice_loop() -> int:
     """
     print(_VOICE_BANNER)
     messages: list[dict] = []
+    # #72 commit 3: voice_loop is the single owner of the state
+    # machine. Observers (transcript store, metrics) register at
+    # setup and never fire or hold state outside their own objects.
+    # Commit 4 wires detect_barge_in to the machine's barge_in_event
+    # and introduces the SPEAKING -> BARGE_IN transition; commit 3
+    # keeps behaviour identical to the pre-refactor loop.
+    machine = TurnStateMachine()
+    transcript_store = _TranscriptStore()
+    turn_metrics = _TurnMetrics()
+    machine.on_change(transcript_store.observe)
+    machine.on_change(turn_metrics.observe)
     ptt_iter = ptt.events()
     ptt_queue: asyncio.Queue[ptt.PTTEvent | None] = asyncio.Queue(
         maxsize=ptt.EVENT_QUEUE_MAX,
@@ -279,6 +367,17 @@ async def voice_loop() -> int:
                 print(f"[ptt] {type(e).__name__}: {e}")
                 return 2
 
+            # #72 commit 3: first PRESSED of the session takes the
+            # machine out of IDLE. Later turns stay in LISTENING
+            # between press/release cycles (SPEAKING -> LISTENING at
+            # Phase 5 clean end is the resting-state return path), so
+            # the IDLE -> LISTENING transition fires exactly once per
+            # voice_loop entry. The ``if current == IDLE`` guard
+            # keeps subsequent PRESSEDs from attempting an illegal
+            # self-transition.
+            if machine.current() == TurnState.IDLE:
+                machine.transition(TurnState.LISTENING, trigger="force")
+
             # Spawn the per-turn RELEASED watcher. Watcher consumes the
             # pumped queue, so cancelling it mid-``get()`` only
             # cancels its own task — the shared ``ptt.events()``
@@ -313,10 +412,20 @@ async def voice_loop() -> int:
 
                 # --- Phase 5: Claude + TTS + playback --------------
                 collect: list[str] = []
+                # #72 commit 3: LISTENING -> THINKING at Phase 5
+                # entry (LLM call about to start); THINKING ->
+                # SPEAKING right before audio.playback (TTS pump
+                # starts producing); SPEAKING -> LISTENING on clean
+                # end. Error paths route back to LISTENING via
+                # _recover_to_listening_from_phase5.
+                machine.transition(TurnState.THINKING, trigger="force")
                 try:
                     sentence_iter = stream_sentences(messages, SYSTEM_PROMPT)
                     synth_iter = tts.synthesize(_tee(sentence_iter, collect))
+                    machine.transition(TurnState.SPEAKING, trigger="force")
                     await audio.playback(synth_iter)
+                    transcript_store.last_elapsed_text = "".join(collect)
+                    machine.transition(TurnState.LISTENING, trigger="force")
                 except asyncio.CancelledError:
                     # #55 D3: mid-response Ctrl+C. Under asyncio.run
                     # SIGINT delivers as task cancellation → CancelledError
@@ -334,6 +443,7 @@ async def voice_loop() -> int:
                     if remaining > 0:
                         raise
                     print("\n[stopped]")
+                    _recover_to_listening_from_phase5(machine)
                     messages.pop()
                     continue
                 except AuthenticationError:
@@ -347,6 +457,7 @@ async def voice_loop() -> int:
                     return 2  # A1: fatal
                 except RateLimitError:
                     print("\n[rate] Hit the rate limit — give it a moment.")
+                    _recover_to_listening_from_phase5(machine)
                     messages.pop()
                     continue
                 except (APIConnectionError, NetworkError):
@@ -356,6 +467,7 @@ async def voice_loop() -> int:
                     # agent/claude.py). APIConnectionError still fires
                     # at connect-time.
                     print("\n[net] Lost connection mid-response — try again.")
+                    _recover_to_listening_from_phase5(machine)
                     messages.pop()
                     continue
                 except audio.AudioPlaybackError as e:
@@ -365,6 +477,7 @@ async def voice_loop() -> int:
                     # as a text fallback so the user still sees
                     # Claude's reply even without audio.
                     print(f"\n[audio] {e}")
+                    _recover_to_listening_from_phase5(machine)
                     full_reply = "".join(collect).strip()
                     if full_reply:
                         # R5-locked: the user saw this text, so KEEP
@@ -385,10 +498,12 @@ async def voice_loop() -> int:
                     # burns credits). Text-only apology instead.
                     print(f"\n[tts] {e}")
                     print("[friday] Sorry, I lost my voice. Try again.")
+                    _recover_to_listening_from_phase5(machine)
                     messages.pop()
                     continue
                 except Exception as e:  # noqa: BLE001 — final safety net for voice loop
                     print(f"\n[err] {type(e).__name__}: {e}")
+                    _recover_to_listening_from_phase5(machine)
                     messages.pop()
                     continue
 

@@ -1016,3 +1016,288 @@ async def test_run_falls_back_to_text_on_speaker_unavailable(monkeypatch, capsys
     out = capsys.readouterr().out
     assert "[audio]" in out
     assert "falling back to text mode" in out
+
+
+# ---------------------------------------------------------------------------
+# #72 commit 3: state machine refactor — observer stubs + recovery helper
+# ---------------------------------------------------------------------------
+
+from agent.loop import (  # noqa: E402
+    _recover_to_listening_from_phase5,
+    _TranscriptStore,
+    _TurnMetrics,
+)
+from agent.turn_state import TurnState, TurnStateMachine  # noqa: E402
+
+
+def _walk_sm(sm: TurnStateMachine, *steps: TurnState) -> None:
+    """Walk the machine through the given states, each as a legal
+    transition with trigger='force'. Setup helper for observer tests."""
+    for s in steps:
+        assert sm.transition(s, trigger="force"), (
+            f"walk failed at {s.name}; current={sm.current().name}"
+        )
+
+
+# --- _TranscriptStore ------------------------------------------------------
+
+
+def test_transcript_store_initial_state_is_blank():
+    store = _TranscriptStore()
+    assert store.last_outcome is None
+    assert store.last_elapsed_text is None
+
+
+def test_transcript_store_marks_spoken_on_clean_speaking_to_listening():
+    """SPEAKING -> LISTENING is the clean-turn-end edge and must mark
+    the assistant turn as ``spoken``."""
+    sm = TurnStateMachine()
+    store = _TranscriptStore()
+    sm.on_change(store.observe)
+    _walk_sm(sm, TurnState.LISTENING, TurnState.THINKING, TurnState.SPEAKING)
+    assert store.last_outcome is None  # still unset — no SPEAKING-origin edge yet
+
+    sm.transition(TurnState.LISTENING, trigger="force")
+    assert store.last_outcome == "spoken"
+
+
+def test_transcript_store_marks_interrupted_on_barge_in():
+    """SPEAKING -> BARGE_IN is the barge-in edge (commit 4 fires it)
+    and must mark the assistant turn as ``interrupted``. Carry 1 from
+    the commit-2 review: this must be encoded in commit 3, not left
+    as a stub."""
+    sm = TurnStateMachine()
+    store = _TranscriptStore()
+    sm.on_change(store.observe)
+    _walk_sm(sm, TurnState.LISTENING, TurnState.THINKING, TurnState.SPEAKING)
+
+    sm.transition(TurnState.BARGE_IN, trigger="flux")
+    assert store.last_outcome == "interrupted"
+
+
+def test_transcript_store_ignores_non_speaking_origin_transitions():
+    sm = TurnStateMachine()
+    store = _TranscriptStore()
+    sm.on_change(store.observe)
+    _walk_sm(sm, TurnState.LISTENING, TurnState.THINKING)
+    assert store.last_outcome is None
+    sm.transition(TurnState.LISTENING, trigger="force")  # THINKING -> LISTENING
+    assert store.last_outcome is None
+
+
+# --- _TurnMetrics ----------------------------------------------------------
+
+
+def test_turn_metrics_counts_each_transition_exactly_once():
+    sm = TurnStateMachine()
+    metrics = _TurnMetrics()
+    sm.on_change(metrics.observe)
+    _walk_sm(
+        sm,
+        TurnState.LISTENING,
+        TurnState.THINKING,
+        TurnState.SPEAKING,
+        TurnState.LISTENING,
+    )
+    assert metrics.transitions_seen == 4
+    assert metrics.by_edge[(TurnState.IDLE, TurnState.LISTENING)] == 1
+    assert metrics.by_edge[(TurnState.LISTENING, TurnState.THINKING)] == 1
+    assert metrics.by_edge[(TurnState.THINKING, TurnState.SPEAKING)] == 1
+    assert metrics.by_edge[(TurnState.SPEAKING, TurnState.LISTENING)] == 1
+
+
+def test_turn_metrics_illegal_transition_does_not_increment():
+    sm = TurnStateMachine()
+    metrics = _TurnMetrics()
+    sm.on_change(metrics.observe)
+    _walk_sm(sm, TurnState.LISTENING)
+    assert metrics.transitions_seen == 1
+    # SPEAKING from LISTENING is illegal — observer should not fire.
+    accepted = sm.transition(TurnState.SPEAKING, trigger="force")
+    assert accepted is False
+    assert metrics.transitions_seen == 1
+
+
+# --- _recover_to_listening_from_phase5 -------------------------------------
+
+
+def test_recover_to_listening_from_thinking():
+    sm = TurnStateMachine()
+    _walk_sm(sm, TurnState.LISTENING, TurnState.THINKING)
+    _recover_to_listening_from_phase5(sm, trigger="manual")
+    assert sm.current() == TurnState.LISTENING
+
+
+def test_recover_to_listening_from_speaking():
+    sm = TurnStateMachine()
+    _walk_sm(sm, TurnState.LISTENING, TurnState.THINKING, TurnState.SPEAKING)
+    _recover_to_listening_from_phase5(sm, trigger="manual")
+    assert sm.current() == TurnState.LISTENING
+
+
+def test_recover_from_listening_is_noop():
+    """Caller shouldn't need to track whether Phase 5 was entered —
+    recovery helper is safe to call from any state and only acts on
+    THINKING / SPEAKING."""
+    sm = TurnStateMachine()
+    _walk_sm(sm, TurnState.LISTENING)
+    _recover_to_listening_from_phase5(sm, trigger="manual")
+    assert sm.current() == TurnState.LISTENING  # unchanged
+
+
+def test_recover_from_idle_is_noop():
+    sm = TurnStateMachine()
+    _recover_to_listening_from_phase5(sm, trigger="manual")
+    assert sm.current() == TurnState.IDLE  # unchanged — no illegal attempt
+
+
+# ---------------------------------------------------------------------------
+# Lift agent/loop.py coverage over the 90% bar — small text_loop paths that
+# existed pre-#72 but were uncovered.
+# ---------------------------------------------------------------------------
+
+
+async def test_text_mode_empty_input_skips_claude(monkeypatch, capsys):
+    """Empty input (just Enter) hits the ``if not user: continue`` short
+    circuit and never calls stream_tokens; next input then exits."""
+    _set_text_argv(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+    inputs = iter(["   ", "", KeyboardInterrupt])
+
+    def _fake_input(_prompt: str = "") -> str:
+        v = next(inputs)
+        if isinstance(v, type) and issubclass(v, BaseException):
+            raise v
+        return v
+
+    monkeypatch.setattr("builtins.input", _fake_input)
+    stream_called = []
+
+    async def _stream_tokens(_messages, _system):
+        stream_called.append(1)
+        yield "unreached"
+
+    monkeypatch.setattr("agent.loop.stream_tokens", _stream_tokens)
+
+    from agent.loop import run
+
+    assert await run() == 0
+    assert not stream_called, "stream_tokens must not be called on empty input"
+
+
+async def test_text_mode_rate_limit_pops_and_continues(monkeypatch, capsys):
+    """RateLimitError mid-stream prints [rate] and the next input exits."""
+    from anthropic import RateLimitError as _RL
+
+    _set_text_argv(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+    inputs = iter(["hello", KeyboardInterrupt])
+
+    def _fake_input(_prompt: str = "") -> str:
+        v = next(inputs)
+        if isinstance(v, type) and issubclass(v, BaseException):
+            raise v
+        return v
+
+    monkeypatch.setattr("builtins.input", _fake_input)
+
+    async def _raising_stream(_messages, _system):
+        if False:  # pragma: no cover
+            yield ""
+        raise _RL("rate", response=MagicMock(status_code=429), body=None)
+
+    monkeypatch.setattr("agent.loop.stream_tokens", _raising_stream)
+
+    from agent.loop import run
+
+    assert await run() == 0
+    out = capsys.readouterr().out
+    assert "[rate]" in out
+
+
+async def test_text_mode_network_error_pops_and_continues(monkeypatch, capsys):
+    """NetworkError (seam-wrapped mid-stream drop) prints [net] and the
+    next input exits."""
+    from agent.claude import NetworkError as _NE
+
+    _set_text_argv(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+    inputs = iter(["hello", KeyboardInterrupt])
+
+    def _fake_input(_prompt: str = "") -> str:
+        v = next(inputs)
+        if isinstance(v, type) and issubclass(v, BaseException):
+            raise v
+        return v
+
+    monkeypatch.setattr("builtins.input", _fake_input)
+
+    async def _raising_stream(_messages, _system):
+        if False:  # pragma: no cover
+            yield ""
+        raise _NE("transport closed")
+
+    monkeypatch.setattr("agent.loop.stream_tokens", _raising_stream)
+
+    from agent.loop import run
+
+    assert await run() == 0
+    out = capsys.readouterr().out
+    assert "[net]" in out
+
+
+async def test_text_mode_authentication_error_exits_two(monkeypatch, capsys):
+    """Mid-stream AuthenticationError exits 2 and names the env var."""
+    from anthropic import AuthenticationError as _AE
+
+    _set_text_argv(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+    monkeypatch.setattr("builtins.input", MagicMock(return_value="hello"))
+
+    async def _raising_stream(_messages, _system):
+        if False:  # pragma: no cover
+            yield ""
+        raise _AE("auth", response=MagicMock(status_code=401), body=None)
+
+    monkeypatch.setattr("agent.loop.stream_tokens", _raising_stream)
+
+    from agent.loop import run
+
+    assert await run() == 2
+    out = capsys.readouterr().out
+    assert "[auth]" in out
+    assert "ANTHROPIC_API_KEY" in out
+
+
+async def test_text_mode_generic_exception_pops_and_continues(monkeypatch, capsys):
+    """A random Exception mid-stream hits the BLE001 safety net."""
+    _set_text_argv(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+    inputs = iter(["hello", KeyboardInterrupt])
+
+    def _fake_input(_prompt: str = "") -> str:
+        v = next(inputs)
+        if isinstance(v, type) and issubclass(v, BaseException):
+            raise v
+        return v
+
+    monkeypatch.setattr("builtins.input", _fake_input)
+
+    async def _raising_stream(_messages, _system):
+        if False:  # pragma: no cover
+            yield ""
+        raise RuntimeError("something odd")
+
+    monkeypatch.setattr("agent.loop.stream_tokens", _raising_stream)
+
+    from agent.loop import run
+
+    assert await run() == 0
+    out = capsys.readouterr().out
+    assert "[err]" in out
+    assert "RuntimeError" in out
