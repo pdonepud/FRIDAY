@@ -61,9 +61,25 @@ jobs:
             pyproject.toml
             agent/requirements.txt
 
-      - name: Install PortAudio (Ubuntu)
+      - name: Install PortAudio + PulseAudio (Ubuntu)
+        # pulseaudio added 2026-10-24: ubuntu-latest image refresh
+        # between 2026-10-22 and 2026-10-24 changed PortAudio's
+        # PulseAudio-detection behaviour. Pa_Initialize() (called at
+        # ``import sounddevice`` module load) now raises PaErrorCode
+        # -9999 "Unanticipated host error: PulseAudio_Initialize:
+        # Can't connect to server" instead of falling through to the
+        # ALSA/dummy backend. Install pulseaudio and start it with
+        # --exit-idle-time=-1 so it stays up for the whole job and
+        # satisfies PortAudio's probe. Lint job doesn't import
+        # sounddevice (ruff parses, doesn't execute) so stays on the
+        # libportaudio2-only step. Mirrors the #49 pynput headless-fix
+        # precedent (which used an env var; PortAudio has no
+        # equivalent).
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libportaudio2 pulseaudio
+          pulseaudio --start --exit-idle-time=-1
 
       - name: Install dev dependencies
         run: python -m pip install -e ".[dev]"
