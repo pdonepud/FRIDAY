@@ -1203,6 +1203,19 @@ def test_recover_from_idle_is_noop():
     assert sm.current() == TurnState.IDLE  # unchanged — no illegal attempt
 
 
+def test_recover_to_listening_from_barge_in():
+    """CR #86 F4: mid-aclose or mid-cancel after SPEAKING -> BARGE_IN
+    fired must still recover to LISTENING. Pre-F4 the helper only
+    handled THINKING / SPEAKING, so cancellation during
+    ``barge_in_mic.aclose()`` would leave the machine stuck in
+    BARGE_IN and the next PRESSED would attempt an illegal
+    BARGE_IN -> THINKING."""
+    sm = TurnStateMachine()
+    _walk_sm(sm, TurnState.LISTENING, TurnState.THINKING, TurnState.SPEAKING, TurnState.BARGE_IN)
+    _recover_to_listening_from_phase5(sm, trigger="manual")
+    assert sm.current() == TurnState.LISTENING
+
+
 # ---------------------------------------------------------------------------
 # Lift agent/loop.py coverage over the 90% bar — small text_loop paths that
 # existed pre-#72 but were uncovered.

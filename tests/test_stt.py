@@ -2065,60 +2065,6 @@ async def test_mic_pump_re_raises_cancellation() -> None:
         await agent.stt._mic_pump(_NoopSocket(), _cancelled_mic())
 
 
-async def test_detect_barge_in_pump_failure_swallowed_during_drain(
-    monkeypatch, fast_bargein_confirm, caplog
-):
-    """When ``_mic_pump`` has raised ``STTError`` before the receive
-    side returns, ``detect_barge_in``'s drain in ``finally`` swallows
-    it with a WARNING instead of masking the receive-side outcome.
-
-    Scripted carefully so the pump raises synchronously on the first
-    ``send_media`` call (no event-loop timing to depend on): a mic
-    iterator that yields a single chunk immediately, no
-    ``asyncio.sleep`` before the yield.
-    """
-
-    class _OSErrorOnSendSocket(FakeAsyncSocket):
-        async def send_media(self, chunk: bytes) -> None:  # type: ignore[override]
-            raise OSError("mic transport dropped")
-
-    async def _single_chunk_mic() -> AsyncIterator[bytes]:
-        yield b"\x00" * 640
-        # Hang after the single chunk so the pump stays scheduled
-        # against the raise, not exits via exhaustion.
-        await asyncio.Event().wait()
-
-    socket = _OSErrorOnSendSocket(
-        pre_messages=[
-            _turn_info_update("StartOfTurn"),
-            _turn_info_update("EagerEndOfTurn"),
-        ],
-        exhaust_after_messages=True,
-    )
-    _install_fake_client(monkeypatch, socket)
-
-    barge_in_event = asyncio.Event()
-    with caplog.at_level(logging.WARNING, logger="agent.stt"):
-        # Yield to the loop briefly so the pump reaches send_media
-        # before the receive side returns. Then run detect_barge_in.
-        await asyncio.wait_for(
-            detect_barge_in(
-                _single_chunk_mic(),
-                barge_in_event,
-                confirmation_ms=fast_bargein_confirm,
-            ),
-            timeout=1.0,
-        )
-
-    # Receive-side confirmed the barge-in regardless of the pump.
-    assert barge_in_event.is_set()
-    # The pump failure may or may not land in the drain path depending
-    # on event-loop ordering (cancel can preempt the first send_media
-    # call); the test asserts the detector exits cleanly without
-    # raising. The drain WARNING is covered deterministically by the
-    # unit tests on ``_mic_pump`` above.
-
-
 async def test_detect_barge_in_connect_oserror_raises_stt_error(monkeypatch):
     """A transport error during ``connect()`` (DNS/TCP/TLS) surfaces as
     ``STTError`` via the outer ``except (OSError, ...)`` block, same
@@ -2177,3 +2123,54 @@ async def test_detect_barge_in_production_constant_default_is_150ms():
     the ADR-0005 Decision 2 ballpark the detector picks up when the
     caller doesn't override ``confirmation_ms``."""
     assert BARGEIN_CONFIRM_MS == 150
+
+
+# ---------------------------------------------------------------------------
+# CR #86 round 2 F3: pump observed via FIRST_COMPLETED, failures surface
+# without waiting on a potentially-idle watcher.
+# ---------------------------------------------------------------------------
+
+
+async def test_detect_barge_in_pump_failure_surfaces_without_watcher_messages(
+    monkeypatch, fast_bargein_confirm
+):
+    """When ``_mic_pump`` raises ``STTError`` while the watcher's websocket
+    has no pending messages, ``detect_barge_in`` must surface the pump
+    exception promptly instead of hanging on the idle watcher.
+
+    Pre-F3 behaviour (asyncio.wait absent): watcher is parked on
+    ``async for raw in ws`` with nothing to receive, pump raises
+    silently as an unobserved task, and the detector blocks forever
+    unless the caller cancels. Post-F3: ``asyncio.wait(FIRST_COMPLETED)``
+    sees the pump complete first and re-raises its exception, which
+    propagates through the ``async with connect_cm`` boundary.
+    """
+
+    class _OSErrorOnSendSocket(FakeAsyncSocket):
+        async def send_media(self, chunk: bytes) -> None:  # type: ignore[override]
+            raise OSError("mic transport dropped mid-SPEAKING")
+
+    async def _single_chunk_mic() -> AsyncIterator[bytes]:
+        yield b"\x00" * 640
+        # Keep the generator alive after the single chunk so the pump
+        # stays scheduled against the raise instead of exiting on
+        # exhaustion.
+        await asyncio.Event().wait()
+
+    # No pre_messages, no exhaustion: the watcher's `async for raw in ws`
+    # blocks on _hang.wait() forever. Pre-F3 this would deadlock.
+    socket = _OSErrorOnSendSocket(exhaust_after_messages=False)
+    _install_fake_client(monkeypatch, socket)
+
+    barge_in_event = asyncio.Event()
+    with pytest.raises(STTError, match="audio send failed"):
+        await asyncio.wait_for(
+            detect_barge_in(
+                _single_chunk_mic(),
+                barge_in_event,
+                confirmation_ms=fast_bargein_confirm,
+            ),
+            timeout=1.0,
+        )
+    # No barge-in confirmation reached the event — the pump died first.
+    assert not barge_in_event.is_set()

@@ -138,14 +138,27 @@ class _TurnMetrics:
 
 def _recover_to_listening_from_phase5(machine: TurnStateMachine, trigger: str = "manual") -> None:
     """Transition the machine back to LISTENING from a Phase 5
-    intermediate state (THINKING or SPEAKING) after a recoverable
-    error. No-op if we're not in either — the error fired before
-    THINKING was entered, or we never left LISTENING.
+    intermediate state (THINKING, SPEAKING, or BARGE_IN) after a
+    recoverable error. No-op if we're not in any — the error fired
+    before THINKING was entered, or we never left LISTENING.
     """
     current = machine.current()
     if current == TurnState.THINKING:
         machine.transition(TurnState.LISTENING, trigger=trigger)
     elif current == TurnState.SPEAKING:
+        machine.transition(TurnState.LISTENING, trigger=trigger)
+    elif current == TurnState.BARGE_IN:
+        # CR #86 F4: mid-aclose or mid-cancel after SPEAKING ->
+        # BARGE_IN has fired but before the Phase-5 barged_in branch's
+        # own BARGE_IN -> LISTENING transition ran. Without this
+        # branch the machine would stay in BARGE_IN; the next
+        # PRESSED would attempt an illegal BARGE_IN -> THINKING,
+        # get rejected with a WARNING, and the stale ``barge_in_event``
+        # (which the TurnStateMachine clears only on SPEAKING entry)
+        # would fire the barge-in path on the next turn — a silent
+        # lost-turn UX cliff. Recover here. The event stays set
+        # until the next SPEAKING entry clears it per the commit-1
+        # contract.
         machine.transition(TurnState.LISTENING, trigger=trigger)
 
 

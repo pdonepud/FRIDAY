@@ -983,27 +983,62 @@ async def detect_barge_in(
 
     try:
         async with connect_cm as socket:
+            # CR #86 F3: observe the pump as a sibling task via
+            # asyncio.wait(FIRST_COMPLETED) rather than awaiting only
+            # the watcher. Without this, a pump failure (OSError /
+            # STTError wrap) while the watcher is blocked on
+            # ``async for raw in ws`` with no pending messages would
+            # leave the detector hanging until the caller cancels it.
+            # In production voice_loop cancels on teardown so the hang
+            # is bounded, but a future caller that expects the
+            # detector to complete on its own (mic iterator exhaustion,
+            # timeout-based teardown) would deadlock. Surface the
+            # pump exception so it drives the exit.
             pump_task = asyncio.create_task(_mic_pump(socket, mic_chunks), name="stt-barge-in-pump")
+            watcher_task = asyncio.create_task(
+                _watch_for_barge_in(socket, barge_in_event, confirmation_ms),
+                name="stt-barge-in-watcher",
+            )
             try:
-                await _watch_for_barge_in(socket, barge_in_event, confirmation_ms)
+                done, _pending = await asyncio.wait(
+                    {pump_task, watcher_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # If the pump finished first with a non-cancel exception,
+                # raise it so the caller sees why the detector exited
+                # instead of swallowing it only in the drain.
+                if pump_task in done and not pump_task.cancelled():
+                    exc = pump_task.exception()
+                    if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                        raise exc
+                # Watcher-first completion (confirmed barge-in or a
+                # watcher-side raise) flows through the finally drain.
+                if watcher_task in done and not watcher_task.cancelled():
+                    w_exc = watcher_task.exception()
+                    if w_exc is not None and not isinstance(w_exc, asyncio.CancelledError):
+                        raise w_exc
             finally:
-                if not pump_task.done():
-                    pump_task.cancel()
-                try:
-                    await pump_task
-                except asyncio.CancelledError:
-                    pass
-                except STTError:
-                    # Pump raised a transport failure. Don't mask the
-                    # receive-side outcome if that already succeeded;
-                    # swallow here (receive won on the race) and let
-                    # the caller see the barge_in_event state. Record
-                    # the pump failure at WARNING for diagnostics.
-                    _log.warning(
-                        "stt(barge-in): pump raised during drain; receive-side outcome preserved"
-                    )
-                except BaseException as e:  # noqa: BLE001 — defensive drain
-                    _log.warning("stt(barge-in): pump raised during drain: %r", e)
+                for t in (pump_task, watcher_task):
+                    if not t.done():
+                        t.cancel()
+                for t in (pump_task, watcher_task):
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
+                    except STTError:
+                        # Pump or watcher raised a transport failure
+                        # during drain. If we're already propagating a
+                        # typed exception from the wait() block above,
+                        # that one wins; this WARNING just records that
+                        # the sibling also died.
+                        _log.warning(
+                            "stt(barge-in): sibling task %s raised during drain; "
+                            "receive-side outcome preserved",
+                            t.get_name(),
+                        )
+                    except BaseException as e:  # noqa: BLE001 — defensive drain
+                        _log.warning("stt(barge-in): sibling drain %s: %r", t.get_name(), e)
     except ApiError as e:
         raise _wrap_api_error(e) from e
     except (OSError, TimeoutError, WebSocketException) as e:
