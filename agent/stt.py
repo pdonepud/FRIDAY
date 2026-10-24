@@ -1,9 +1,12 @@
 """Deepgram Flux streaming STT with PTT-driven turn endings.
 
 Sole importer of ``deepgram`` in the codebase per ADR-0003 §STT.
-Consumers get a single coroutine — ``transcribe`` — plus a typed
-exception hierarchy (``STTError`` and subclasses). No leakage of
-``deepgram.*`` types across the seam.
+Consumers get two coroutines — ``transcribe`` (PTT-scoped, used
+during LISTENING to produce the user's transcript) and
+``detect_barge_in`` (SPEAKING-scoped, fires an ``asyncio.Event`` on
+a confirmed Flux ``StartOfTurn`` for the barge-in path in #72) —
+plus a typed exception hierarchy (``STTError`` and subclasses). No
+leakage of ``deepgram.*`` types across the seam.
 
 Streaming shape: three concurrent asyncio tasks over one Flux
 WebSocket, with a shared ``asyncio.Future[str]`` as the single return
@@ -60,6 +63,7 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 from agent.audio import INPUT_SAMPLE_RATE
 
 __all__ = [
+    "BARGEIN_CONFIRM_MS",
     "EAGER_EOT_THRESHOLD",
     "ENCODING",
     "EOT_THRESHOLD",
@@ -73,6 +77,7 @@ __all__ = [
     "STTFatal",
     "STTForceEndTurnUnsupported",
     "STTTimeout",
+    "detect_barge_in",
     "transcribe",
 ]
 
@@ -109,6 +114,16 @@ EOT_TIMEOUT_MS = 30000
 # ForceEndTurn fires as a liveness fallback. Per ADR-0005 Decision 1.
 # TODO(#70-tuning): revisit after real-world use.
 PTT_RELEASE_GRACE_MS = 500
+# Confirmation window after a Flux StartOfTurn observed during SPEAKING
+# (via ``detect_barge_in``). 150 ms ≈ 3 frames at a 50 ms Flux chunk
+# cadence; filters single-event flaps (throat clears, Lily's own
+# voice bleeding through) by requiring a second speech-indicative
+# event — Update with transcript, EagerEndOfTurn, EndOfTurn with
+# transcript, or TurnResumed — before firing the barge-in signal.
+# Per ADR-0005 Decision 2.
+# TODO(#72-tuning): revisit after real-world use (headphones vs.
+# speakers, room noise, Lily's voice latency into the open mic).
+BARGEIN_CONFIRM_MS = 150
 # Outer safety net around the receive loop, armed only AFTER
 # ForceEndTurn is sent. Bounds "how long to wait for the terminal
 # event"; the active-turn window (before ForceEndTurn) has no such
@@ -714,6 +729,320 @@ def _wrap_api_error(exc: ApiError) -> STTError:
         # evidence-based routing over shape-based routing.
         return STTAuthError("DEEPGRAM_API_KEY missing (unset or empty); see .env.example.")
     return STTError(f"Deepgram API error (status={status}): {exc!r}")
+
+
+# --- Barge-in detector (#72 / ADR-0005 Decision 2) ---------------------
+# Separate entry point from ``transcribe`` so each primitive stays
+# single-responsibility. ``transcribe`` is PTT-scoped (returns the
+# user's transcript on EndOfTurn); ``detect_barge_in`` is
+# SPEAKING-scoped (fires a shared ``asyncio.Event`` on a confirmed
+# StartOfTurn and keeps running until cancelled). ADR-0005
+# Alternatives explicitly rejected multiplexing the two modes behind
+# one call.
+
+
+async def _mic_pump(socket, mic_chunks: AsyncIterator[bytes]) -> None:
+    """Drain ``mic_chunks`` into the Flux session for ``detect_barge_in``.
+
+    Simpler than ``_pump``: no shared future, so transport failures
+    propagate as ``STTError`` to the caller instead of being
+    funneled through ``done_future``. ``CancelledError`` is the
+    normal exit path — ``detect_barge_in``'s ``finally`` cancels
+    this task once a barge-in has been confirmed or the caller has
+    cancelled.
+    """
+    try:
+        async for chunk in mic_chunks:
+            await socket.send_media(chunk)
+    except asyncio.CancelledError:
+        raise
+    except (OSError, TimeoutError, WebSocketException) as e:
+        raise STTError(f"audio send failed: {e!r}") from e
+    except STTError:
+        raise
+    except Exception as e:
+        raise STTError(f"mic source failed: {e!r}") from e
+
+
+async def _watch_for_barge_in(socket, barge_in_event: asyncio.Event, confirmation_ms: int) -> None:
+    """Watch Flux events for a confirmed ``StartOfTurn``.
+
+    Protocol:
+
+    * On ``StartOfTurn``: (re)arm the confirmation window as a
+      ``confirm_timer`` task that sleeps ``confirmation_ms`` ms.
+      A later ``StartOfTurn`` within or after the window re-arms.
+    * On a speech-indicative follow-up event (``Update`` with
+      non-empty transcript, ``EagerEndOfTurn``, ``EndOfTurn`` with
+      transcript, or ``TurnResumed``) **while** ``confirm_timer``
+      is still running: fire ``barge_in_event``, cancel the timer,
+      return.
+    * On the same follow-up events after ``confirm_timer`` has
+      completed (window expired): discard, keep listening for the
+      next ``StartOfTurn``.
+    * On a ``Warning`` with code ``FORCE_END_TURN_NO_ACTIVE_TURN``:
+      Flux saw no active turn — the StartOfTurn was a flap. Discard
+      any pending confirmation and keep listening.
+    * On ``Error`` events: translate to ``STTForceEndTurnUnsupported``
+      / ``STTFatal`` the same way ``_receive`` does.
+
+    The caller cancels this coroutine when leaving SPEAKING. The
+    final ``finally`` always cancels the pending ``confirm_timer``
+    so no stale timer leaks past the detector's lifetime.
+    """
+    if not hasattr(socket, "_websocket"):
+        raise STTError(
+            "SDK internal 'socket._websocket' missing — pin mismatch, check deepgram-sdk version"
+        )
+
+    ws = socket._websocket
+    confirm_timer: asyncio.Task[None] | None = None
+    confirmation_s = confirmation_ms / 1000
+
+    try:
+        async for raw in ws:
+            if isinstance(raw, bytes):
+                continue
+            msg = json.loads(raw)
+            msg_type = msg.get("type")
+
+            if msg_type == "TurnInfo":
+                event = msg.get("event")
+                if event == "StartOfTurn":
+                    # (Re)arm the confirmation window. If a prior
+                    # window is still open it's superseded — the
+                    # new StartOfTurn is the fresh evidence to
+                    # confirm against.
+                    if confirm_timer is not None and not confirm_timer.done():
+                        confirm_timer.cancel()
+                    confirm_timer = asyncio.create_task(
+                        asyncio.sleep(confirmation_s),
+                        name="stt-barge-in-confirm-timer",
+                    )
+                    _log.debug(
+                        "stt(barge-in): StartOfTurn (turn_index=%r), confirm window=%dms",
+                        msg.get("turn_index"),
+                        confirmation_ms,
+                    )
+                    continue
+
+                # Speech-indicative follow-up events only fire the
+                # signal if the confirmation window is still open.
+                if confirm_timer is None or confirm_timer.done():
+                    continue
+
+                if event == "Update":
+                    transcript = msg.get("transcript", "") or ""
+                    if not transcript:
+                        continue  # heartbeat update — not evidence
+                    _confirm(confirm_timer, barge_in_event, event, msg)
+                    return
+                if event in ("EagerEndOfTurn", "EndOfTurn", "TurnResumed"):
+                    if event == "EndOfTurn":
+                        transcript = msg.get("transcript", "") or ""
+                        if not transcript:
+                            # EndOfTurn with empty transcript — the
+                            # server closed a non-speech turn.
+                            # Disconfirming: cancel the window
+                            # instead of confirming.
+                            confirm_timer.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await confirm_timer
+                            _log.debug(
+                                "stt(barge-in): EndOfTurn with empty "
+                                "transcript inside window; discarding "
+                                "confirmation"
+                            )
+                            continue
+                    _confirm(confirm_timer, barge_in_event, event, msg)
+                    return
+
+                # Other TurnInfo events: log and keep watching.
+                _log.debug("stt(barge-in): non-salient TurnInfo event=%r", event)
+                continue
+
+            if msg_type == "Warning":
+                code = msg.get("code")
+                if code == "FORCE_END_TURN_NO_ACTIVE_TURN":
+                    # Flux saw no active turn — the StartOfTurn
+                    # (if any) was a flap. Discard pending window.
+                    if confirm_timer is not None and not confirm_timer.done():
+                        confirm_timer.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await confirm_timer
+                        confirm_timer = None
+                    _log.debug(
+                        "stt(barge-in): FORCE_END_TURN_NO_ACTIVE_TURN; "
+                        "discarding any pending confirmation"
+                    )
+                    continue
+                _log.warning(
+                    "stt(barge-in): Warning code=%r description=%r",
+                    code,
+                    msg.get("description"),
+                )
+                continue
+
+            if msg_type == "Error":
+                code = msg.get("code")
+                if code == "UNPARSABLE_CLIENT_MESSAGE":
+                    raise STTForceEndTurnUnsupported(
+                        "ForceEndTurn not enabled on this Deepgram deployment "
+                        "(FatalError code=UNPARSABLE_CLIENT_MESSAGE). "
+                        "Enable ForceEndTurn on the Deepgram dashboard "
+                        "(Feature Flags)."
+                    )
+                raise STTFatal(f"Flux fatal (code={code!r}): {msg.get('description')!r}")
+
+            _log.debug("stt(barge-in): non-terminal type=%r", msg_type)
+    except asyncio.CancelledError:
+        raise
+    except ConnectionClosed as e:
+        raise STTError(f"barge-in connection closed: {e!r}") from e
+    except (STTError, STTFatal, STTForceEndTurnUnsupported):
+        raise
+    except Exception as e:
+        raise STTError(f"barge-in receive loop failed: {e!r}") from e
+    finally:
+        if confirm_timer is not None and not confirm_timer.done():
+            confirm_timer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await confirm_timer
+
+
+def _confirm(
+    confirm_timer: asyncio.Task[None],
+    barge_in_event: asyncio.Event,
+    event: str,
+    msg: dict,
+) -> None:
+    """Fire the barge-in signal and cancel the pending window timer."""
+    confirm_timer.cancel()
+    _log.info(
+        "stt(barge-in): confirmed via %s (turn_index=%r)",
+        event,
+        msg.get("turn_index"),
+    )
+    barge_in_event.set()
+
+
+async def detect_barge_in(
+    mic_chunks: AsyncIterator[bytes],
+    barge_in_event: asyncio.Event,
+    *,
+    confirmation_ms: int = BARGEIN_CONFIRM_MS,
+) -> None:
+    """Open a Flux session scoped to SPEAKING and fire ``barge_in_event``
+    on a confirmed ``StartOfTurn`` (ADR-0005 Decision 2).
+
+    Args:
+        mic_chunks: async iterator yielding 16 kHz mono s16le PCM
+            bytes, same shape as :func:`transcribe` consumes. The
+            caller holds the mic open through SPEAKING per ADR-0005
+            Decision 4 and feeds it here as a sibling task to TTS
+            playback.
+        barge_in_event: shared ``asyncio.Event`` the state machine
+            owns (see :attr:`agent.turn_state.TurnStateMachine.barge_in_event`).
+            Set exactly once per invocation, on confirmed barge-in.
+        confirmation_ms: confirmation-window duration in ms. Default
+            :data:`BARGEIN_CONFIRM_MS` (150 ms).
+
+    Runs until either (a) a barge-in is confirmed and ``barge_in_event``
+    is set, (b) the mic iterator exhausts and the Flux session
+    completes, or (c) the caller cancels this coroutine. Case (c) is
+    the normal exit path at BARGE_IN entry or SPEAKING -> LISTENING
+    clean end.
+
+    Raises:
+        STTAuthError: DEEPGRAM_API_KEY missing or invalid.
+        STTForceEndTurnUnsupported: Flux rejected a (future)
+            ForceEndTurn call with ``UNPARSABLE_CLIENT_MESSAGE``.
+            ``detect_barge_in`` does not currently send ForceEndTurn,
+            but mirrors ``transcribe``'s mapping for symmetry.
+        STTFatal: Flux emitted a ``FatalError`` with any other code.
+        STTError: any other pipeline failure.
+    """
+    try:
+        client = _get_client()
+    except ApiError as e:
+        raise _wrap_api_error(e) from e
+    except Exception as e:
+        raise STTError(f"failed to construct Deepgram client: {e!r}") from e
+
+    try:
+        connect_cm = client.listen.v2.connect(
+            model=MODEL,
+            encoding=ENCODING,
+            sample_rate=SAMPLE_RATE,
+            eot_threshold=EOT_THRESHOLD,
+            eager_eot_threshold=EAGER_EOT_THRESHOLD,
+            eot_timeout_ms=EOT_TIMEOUT_MS,
+        )
+    except ApiError as e:
+        raise _wrap_api_error(e) from e
+
+    try:
+        async with connect_cm as socket:
+            # CR #86 F3: observe the pump as a sibling task via
+            # asyncio.wait(FIRST_COMPLETED) rather than awaiting only
+            # the watcher. Without this, a pump failure (OSError /
+            # STTError wrap) while the watcher is blocked on
+            # ``async for raw in ws`` with no pending messages would
+            # leave the detector hanging until the caller cancels it.
+            # In production voice_loop cancels on teardown so the hang
+            # is bounded, but a future caller that expects the
+            # detector to complete on its own (mic iterator exhaustion,
+            # timeout-based teardown) would deadlock. Surface the
+            # pump exception so it drives the exit.
+            pump_task = asyncio.create_task(_mic_pump(socket, mic_chunks), name="stt-barge-in-pump")
+            watcher_task = asyncio.create_task(
+                _watch_for_barge_in(socket, barge_in_event, confirmation_ms),
+                name="stt-barge-in-watcher",
+            )
+            try:
+                done, _pending = await asyncio.wait(
+                    {pump_task, watcher_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # If the pump finished first with a non-cancel exception,
+                # raise it so the caller sees why the detector exited
+                # instead of swallowing it only in the drain.
+                if pump_task in done and not pump_task.cancelled():
+                    exc = pump_task.exception()
+                    if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                        raise exc
+                # Watcher-first completion (confirmed barge-in or a
+                # watcher-side raise) flows through the finally drain.
+                if watcher_task in done and not watcher_task.cancelled():
+                    w_exc = watcher_task.exception()
+                    if w_exc is not None and not isinstance(w_exc, asyncio.CancelledError):
+                        raise w_exc
+            finally:
+                for t in (pump_task, watcher_task):
+                    if not t.done():
+                        t.cancel()
+                for t in (pump_task, watcher_task):
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
+                    except STTError:
+                        # Pump or watcher raised a transport failure
+                        # during drain. If we're already propagating a
+                        # typed exception from the wait() block above,
+                        # that one wins; this WARNING just records that
+                        # the sibling also died.
+                        _log.warning(
+                            "stt(barge-in): sibling task %s raised during drain; "
+                            "receive-side outcome preserved",
+                            t.get_name(),
+                        )
+                    except BaseException as e:  # noqa: BLE001 — defensive drain
+                        _log.warning("stt(barge-in): sibling drain %s: %r", t.get_name(), e)
+    except ApiError as e:
+        raise _wrap_api_error(e) from e
+    except (OSError, TimeoutError, WebSocketException) as e:
+        raise STTError(f"barge-in connection failed: {e!r}") from e
 
 
 # --- __main__ helpers ---------------------------------------------------

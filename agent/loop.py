@@ -37,7 +37,9 @@ from agent.claude import (
     stream_sentences,
     stream_tokens,
 )
+from agent.events import BargeInEvent
 from agent.system_prompt import SYSTEM_PROMPT
+from agent.turn_state import TurnState, TurnStateMachine
 
 # --- Banners + stock messages -------------------------------------------
 _BANNER: str = "FRIDAY — Tier 1 baseline. Type to talk. Ctrl+C to exit."
@@ -69,6 +71,95 @@ def _voice_missing_keys_message(missing: list[str]) -> str:
     lines = [f"{var} isn't set; see .env.example." for var in missing]
     lines.append("Copy .env.example to .env and add your keys.")
     return "\n".join(lines)
+
+
+class _TranscriptStore:
+    """Minimal transcript-store observer (#72 commit 3).
+
+    Full persistence (#76 SQLite) lands later. This stub records the
+    last turn's outcome and elapsed text so tests can assert the
+    sealing decision at each state transition — in particular, the
+    SPEAKING -> BARGE_IN edge (commit 4 fires it) must mark the
+    assistant turn as ``"interrupted"`` with the elapsed sentence
+    text, not ``"spoken"``.
+
+    Fields:
+
+    * ``last_outcome``: ``"spoken"`` on clean SPEAKING -> LISTENING;
+      ``"interrupted"`` on SPEAKING -> BARGE_IN. ``None`` before the
+      first SPEAKING-origin transition.
+    * ``last_elapsed_text``: the sentence text accumulated into the
+      TTS stream so far. ``voice_loop`` sets this imperatively before
+      firing the SPEAKING-origin transition (text is a per-turn
+      local, not something the observer can read from state alone).
+    """
+
+    def __init__(self) -> None:
+        self.last_outcome: str | None = None
+        self.last_elapsed_text: str | None = None
+
+    def observe(
+        self,
+        from_state: TurnState,
+        to_state: TurnState,
+        trigger: str,
+        payload: object,
+    ) -> None:
+        if from_state != TurnState.SPEAKING:
+            return
+        if to_state == TurnState.LISTENING:
+            self.last_outcome = "spoken"
+        elif to_state == TurnState.BARGE_IN:
+            self.last_outcome = "interrupted"
+
+
+class _TurnMetrics:
+    """Minimal metrics observer (#72 commit 3).
+
+    Counts transitions per ``(from, to)`` edge for diagnostics. Real
+    metrics plumbing (OpenTelemetry etc.) is explicitly out of scope.
+    """
+
+    def __init__(self) -> None:
+        self.transitions_seen: int = 0
+        self.by_edge: dict[tuple[TurnState, TurnState], int] = {}
+
+    def observe(
+        self,
+        from_state: TurnState,
+        to_state: TurnState,
+        trigger: str,
+        payload: object,
+    ) -> None:
+        self.transitions_seen += 1
+        key = (from_state, to_state)
+        self.by_edge[key] = self.by_edge.get(key, 0) + 1
+
+
+def _recover_to_listening_from_phase5(machine: TurnStateMachine, trigger: str = "manual") -> None:
+    """Transition the machine back to LISTENING from a Phase 5
+    intermediate state (THINKING, SPEAKING, or BARGE_IN) after a
+    recoverable error. No-op if we're not in any — the error fired
+    before THINKING was entered, or we never left LISTENING.
+    """
+    current = machine.current()
+    if current == TurnState.THINKING:
+        machine.transition(TurnState.LISTENING, trigger=trigger)
+    elif current == TurnState.SPEAKING:
+        machine.transition(TurnState.LISTENING, trigger=trigger)
+    elif current == TurnState.BARGE_IN:
+        # CR #86 F4: mid-aclose or mid-cancel after SPEAKING ->
+        # BARGE_IN has fired but before the Phase-5 barged_in branch's
+        # own BARGE_IN -> LISTENING transition ran. Without this
+        # branch the machine would stay in BARGE_IN; the next
+        # PRESSED would attempt an illegal BARGE_IN -> THINKING,
+        # get rejected with a WARNING, and the stale ``barge_in_event``
+        # (which the TurnStateMachine clears only on SPEAKING entry)
+        # would fire the barge-in path on the next turn — a silent
+        # lost-turn UX cliff. Recover here. The event stays set
+        # until the next SPEAKING entry clears it per the commit-1
+        # contract.
+        machine.transition(TurnState.LISTENING, trigger=trigger)
 
 
 async def _tee(src: AsyncIterator[str], collect: list[str]) -> AsyncIterator[str]:
@@ -233,6 +324,17 @@ async def voice_loop() -> int:
     """
     print(_VOICE_BANNER)
     messages: list[dict] = []
+    # #72 commit 3: voice_loop is the single owner of the state
+    # machine. Observers (transcript store, metrics) register at
+    # setup and never fire or hold state outside their own objects.
+    # Commit 4 wires detect_barge_in to the machine's barge_in_event
+    # and introduces the SPEAKING -> BARGE_IN transition; commit 3
+    # keeps behaviour identical to the pre-refactor loop.
+    machine = TurnStateMachine()
+    transcript_store = _TranscriptStore()
+    turn_metrics = _TurnMetrics()
+    machine.on_change(transcript_store.observe)
+    machine.on_change(turn_metrics.observe)
     ptt_iter = ptt.events()
     ptt_queue: asyncio.Queue[ptt.PTTEvent | None] = asyncio.Queue(
         maxsize=ptt.EVENT_QUEUE_MAX,
@@ -279,6 +381,17 @@ async def voice_loop() -> int:
                 print(f"[ptt] {type(e).__name__}: {e}")
                 return 2
 
+            # #72 commit 3: first PRESSED of the session takes the
+            # machine out of IDLE. Later turns stay in LISTENING
+            # between press/release cycles (SPEAKING -> LISTENING at
+            # Phase 5 clean end is the resting-state return path), so
+            # the IDLE -> LISTENING transition fires exactly once per
+            # voice_loop entry. The ``if current == IDLE`` guard
+            # keeps subsequent PRESSEDs from attempting an illegal
+            # self-transition.
+            if machine.current() == TurnState.IDLE:
+                machine.transition(TurnState.LISTENING, trigger="loop")
+
             # Spawn the per-turn RELEASED watcher. Watcher consumes the
             # pumped queue, so cancelling it mid-``get()`` only
             # cancels its own task — the shared ``ptt.events()``
@@ -313,10 +426,143 @@ async def voice_loop() -> int:
 
                 # --- Phase 5: Claude + TTS + playback --------------
                 collect: list[str] = []
+                # #72 commit 3: LISTENING -> THINKING at Phase 5
+                # entry (LLM call about to start). #72 commit 4
+                # (ADR-0005 Decision 4): THINKING -> SPEAKING spawns
+                # a sibling ``detect_barge_in`` task on the open mic;
+                # ``asyncio.wait`` races playback completion against
+                # the state-machine's ``barge_in_event``. SPEAKING ->
+                # LISTENING fires on clean end; SPEAKING ->
+                # BARGE_IN -> LISTENING on confirmed barge-in (TTS
+                # cancel plumbing is #71 — commit 4 stubs it via
+                # ``playback_task.cancel()``). Error paths route back
+                # to LISTENING via _recover_to_listening_from_phase5.
+                #
+                # TODO(#72-echo): the barge-in detector currently
+                # relies on commit 2's confirmation window as the
+                # only echo-filter. Flux doesn't surface a per-event
+                # confidence we can gate on. Real-world testing with
+                # Lily's output into an open mic may show self-echo
+                # confirming spuriously; if so, file a follow-up to
+                # add a feature flag defaulting to the mic-closed
+                # behaviour (current pre-#72-commit-4) and ship the
+                # mic-open flip behind it when EC lands.
+                machine.transition(TurnState.THINKING, trigger="loop")
+                barged_in = False
                 try:
                     sentence_iter = stream_sentences(messages, SYSTEM_PROMPT)
                     synth_iter = tts.synthesize(_tee(sentence_iter, collect))
-                    await audio.playback(synth_iter)
+                    machine.transition(TurnState.SPEAKING, trigger="loop")
+
+                    # Hoist the mic generator so we can explicitly
+                    # ``aclose()`` it in the finally after cancelling
+                    # the detector task. ``async for`` inside
+                    # ``_mic_pump`` does NOT call ``aclose()`` on
+                    # cancellation, so the ``RawInputStream`` held by
+                    # ``audio.capture()`` would stay open until the
+                    # async generator's finalization runs — unbounded
+                    # delay on Windows. Mirrors the ``ptt_iter.aclose()``
+                    # pattern in voice_loop's outer finally.
+                    barge_in_mic = audio.capture()
+                    detect_task = asyncio.create_task(
+                        stt.detect_barge_in(barge_in_mic, machine.barge_in_event),
+                        name="voice-loop-barge-in-detector",
+                    )
+                    playback_task = asyncio.create_task(
+                        audio.playback(synth_iter),
+                        name="voice-loop-playback",
+                    )
+                    barge_in_waiter = asyncio.create_task(
+                        machine.barge_in_event.wait(),
+                        name="voice-loop-barge-in-waiter",
+                    )
+                    phase5_tasks = (detect_task, playback_task, barge_in_waiter)
+                    try:
+                        done, _pending = await asyncio.wait(
+                            {playback_task, barge_in_waiter},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if barge_in_waiter in done:
+                            # Barge-in: fire SPEAKING -> BARGE_IN with
+                            # the BargeInEvent payload observers need
+                            # (metrics, transcript store).
+                            barged_in = True
+                            transcript_store.last_elapsed_text = "".join(collect)
+                            machine.transition(
+                                TurnState.BARGE_IN,
+                                trigger="flux",
+                                payload=BargeInEvent(
+                                    at=asyncio.get_running_loop().time(),
+                                    source="flux",
+                                    confidence=None,
+                                ),
+                            )
+                            # Cancel playback as the (#71-stubbed) TTS
+                            # cancel. #71 replaces this with the
+                            # destructive-cancel ADR-0005 Decision 3
+                            # specifies.
+                            if not playback_task.done():
+                                playback_task.cancel()
+                        else:
+                            # Clean playback end — surface any error
+                            # the playback task raised (would be a
+                            # Phase-5-handled exception type).
+                            if playback_task.exception() is not None:
+                                raise playback_task.exception()
+                            transcript_store.last_elapsed_text = "".join(collect)
+                            machine.transition(TurnState.LISTENING, trigger="loop")
+                    finally:
+                        # Drain all three sibling tasks. detect_task
+                        # exceptions are swallowed with WARNING — a
+                        # dead Flux session during SPEAKING is
+                        # recoverable (user hears Lily, loses only
+                        # the barge-in capability for that turn).
+                        for t in phase5_tasks:
+                            if not t.done():
+                                t.cancel()
+                        for t in phase5_tasks:
+                            try:
+                                await t
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception as e:  # noqa: BLE001 — defensive
+                                if t is detect_task:
+                                    print(f"[bargein] detector raised: {e!r}")
+                                # playback_task / barge_in_waiter
+                                # exceptions have already been
+                                # surfaced via the done-set check or
+                                # cancel propagation.
+                        # Explicit aclose so the RawInputStream inside
+                        # audio.capture() releases now, not at async-
+                        # generator finalization time (which can be
+                        # unbounded on Windows). CodeRabbit #86 F2.
+                        with contextlib.suppress(Exception):
+                            await barge_in_mic.aclose()
+                    if barged_in:
+                        # BARGE_IN -> LISTENING follows the cancel.
+                        # #71 will own the ordering with the real
+                        # destructive-cancel plumbing; here it fires
+                        # after the finally drains the sibling tasks.
+                        machine.transition(TurnState.LISTENING, trigger="loop")
+                        print("\n[barged in]")
+                        # Discard the pending user turn (option a).
+                        # Phase 6 has NOT run (we never reached the
+                        # clean path), so ``messages`` currently ends
+                        # with the Phase-4-appended user turn and no
+                        # assistant counterpart. Popping it matches
+                        # the SIGINT-stopped and other per-turn-abort
+                        # paths; the alternative — keep user, append
+                        # the partial assistant reply from ``collect``
+                        # — is a UX-nicer "preserve mid-utterance
+                        # context" design but belongs in a focused
+                        # follow-up PR with its own ADR consideration
+                        # (how to mark the partial, interaction with
+                        # ADR-0007's context-rot semantics). Leaving
+                        # user alive without a popped-or-appended
+                        # assistant would violate Anthropic's role-
+                        # alternation requirement on the next turn.
+                        messages.pop()
+                        continue
                 except asyncio.CancelledError:
                     # #55 D3: mid-response Ctrl+C. Under asyncio.run
                     # SIGINT delivers as task cancellation → CancelledError
@@ -334,6 +580,7 @@ async def voice_loop() -> int:
                     if remaining > 0:
                         raise
                     print("\n[stopped]")
+                    _recover_to_listening_from_phase5(machine)
                     messages.pop()
                     continue
                 except AuthenticationError:
@@ -347,6 +594,7 @@ async def voice_loop() -> int:
                     return 2  # A1: fatal
                 except RateLimitError:
                     print("\n[rate] Hit the rate limit — give it a moment.")
+                    _recover_to_listening_from_phase5(machine)
                     messages.pop()
                     continue
                 except (APIConnectionError, NetworkError):
@@ -356,6 +604,7 @@ async def voice_loop() -> int:
                     # agent/claude.py). APIConnectionError still fires
                     # at connect-time.
                     print("\n[net] Lost connection mid-response — try again.")
+                    _recover_to_listening_from_phase5(machine)
                     messages.pop()
                     continue
                 except audio.AudioPlaybackError as e:
@@ -365,6 +614,7 @@ async def voice_loop() -> int:
                     # as a text fallback so the user still sees
                     # Claude's reply even without audio.
                     print(f"\n[audio] {e}")
+                    _recover_to_listening_from_phase5(machine)
                     full_reply = "".join(collect).strip()
                     if full_reply:
                         # R5-locked: the user saw this text, so KEEP
@@ -385,10 +635,12 @@ async def voice_loop() -> int:
                     # burns credits). Text-only apology instead.
                     print(f"\n[tts] {e}")
                     print("[friday] Sorry, I lost my voice. Try again.")
+                    _recover_to_listening_from_phase5(machine)
                     messages.pop()
                     continue
                 except Exception as e:  # noqa: BLE001 — final safety net for voice loop
                     print(f"\n[err] {type(e).__name__}: {e}")
+                    _recover_to_listening_from_phase5(machine)
                     messages.pop()
                     continue
 

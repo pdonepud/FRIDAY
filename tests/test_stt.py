@@ -15,6 +15,7 @@ Manual hardware verification lives in ``python -m agent.stt``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -1615,3 +1616,561 @@ async def test_force_end_no_active_turn_returns_accumulated_transcript(monkeypat
 
     assert result == "hello"
     assert socket.force_end_turn_count > 0
+
+
+# ---------------------------------------------------------------------------
+# #72 / ADR-0005 Decision 2: detect_barge_in confirmation window
+# ---------------------------------------------------------------------------
+
+
+from agent.stt import BARGEIN_CONFIRM_MS, detect_barge_in  # noqa: E402
+
+
+@pytest.fixture
+def fast_bargein_confirm(monkeypatch):
+    """Shrink the confirmation window so timeout-path tests don't sit
+    on 150 ms of real wall clock. Tests that need to observe window
+    expiry use a shorter value for speed; those pinning the production
+    value monkeypatch to the original."""
+    monkeypatch.setattr(agent.stt, "BARGEIN_CONFIRM_MS", 30)
+    return 30
+
+
+def _mock_mic() -> AsyncIterator[bytes]:
+    """Infinite mic iterator that yields 20 ms silence frames forever.
+
+    The barge-in detector doesn't consume rapidly — tests just need
+    something to send into the Flux session. Each ``await``'d chunk
+    yields the event loop so the receive-side can advance.
+    """
+
+    async def _gen() -> AsyncIterator[bytes]:
+        while True:
+            await asyncio.sleep(0.001)
+            yield b"\x00" * 640
+
+    return _gen()
+
+
+async def test_detect_barge_in_fires_on_startofturn_plus_update_in_window(
+    monkeypatch, fast_bargein_confirm
+):
+    """StartOfTurn followed by Update(transcript='hi') inside the window
+    sets ``barge_in_event`` and returns cleanly."""
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_update("StartOfTurn"),
+            json.dumps(
+                {
+                    "type": "TurnInfo",
+                    "request_id": "test",
+                    "sequence_id": 2,
+                    "event": "Update",
+                    "turn_index": 0,
+                    "audio_window_start": 0.0,
+                    "audio_window_end": 0.2,
+                    "transcript": "hi",
+                    "words": [],
+                    "end_of_turn_confidence": 0.3,
+                }
+            ),
+        ],
+        exhaust_after_messages=True,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    barge_in_event = asyncio.Event()
+    await asyncio.wait_for(
+        detect_barge_in(_mock_mic(), barge_in_event),
+        timeout=1.0,
+    )
+    assert barge_in_event.is_set()
+
+
+async def test_detect_barge_in_fires_on_startofturn_plus_eager_in_window(
+    monkeypatch, fast_bargein_confirm
+):
+    """StartOfTurn + EagerEndOfTurn (no transcript needed) counts as confirmation."""
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_update("StartOfTurn"),
+            _turn_info_update("EagerEndOfTurn"),
+        ],
+        exhaust_after_messages=True,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    barge_in_event = asyncio.Event()
+    await asyncio.wait_for(
+        detect_barge_in(_mock_mic(), barge_in_event),
+        timeout=1.0,
+    )
+    assert barge_in_event.is_set()
+
+
+async def test_detect_barge_in_fires_on_startofturn_plus_turnresumed_in_window(
+    monkeypatch, fast_bargein_confirm
+):
+    """TurnResumed inside the window counts as speech-indicative too."""
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_update("StartOfTurn"),
+            _turn_info_update("TurnResumed"),
+        ],
+        exhaust_after_messages=True,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    barge_in_event = asyncio.Event()
+    await asyncio.wait_for(
+        detect_barge_in(_mock_mic(), barge_in_event),
+        timeout=1.0,
+    )
+    assert barge_in_event.is_set()
+
+
+async def test_detect_barge_in_ignores_empty_update_in_window(
+    monkeypatch, fast_bargein_confirm, caplog
+):
+    """``Update`` with empty transcript is a heartbeat, not evidence.
+    The window should expire with no confirmation."""
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_update("StartOfTurn"),
+            _turn_info_update("Update"),  # empty transcript
+        ],
+        exhaust_after_messages=True,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    barge_in_event = asyncio.Event()
+    with caplog.at_level(logging.INFO, logger="agent.stt"):
+        await asyncio.wait_for(
+            detect_barge_in(_mock_mic(), barge_in_event),
+            timeout=1.0,
+        )
+
+    assert not barge_in_event.is_set()
+    confirmed = [r for r in caplog.records if "confirmed" in r.getMessage()]
+    assert not confirmed, "no confirmation should have fired on empty-update evidence"
+
+
+async def test_detect_barge_in_window_expires_without_followup(monkeypatch, fast_bargein_confirm):
+    """StartOfTurn arrives, nothing else does. The window expires and
+    the detector keeps running (until the socket closes or caller
+    cancels). We cancel after a sufficient delay and assert the event
+    stayed unset."""
+    socket = FakeAsyncSocket(
+        pre_messages=[_turn_info_update("StartOfTurn")],
+        exhaust_after_messages=False,  # socket hangs; mirrors real idle Flux
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    barge_in_event = asyncio.Event()
+    task = asyncio.create_task(
+        detect_barge_in(_mock_mic(), barge_in_event, confirmation_ms=fast_bargein_confirm)
+    )
+    # Wait longer than the confirmation window; nothing else is going
+    # to arrive, so no barge-in should fire.
+    await asyncio.sleep(fast_bargein_confirm / 1000 * 3)
+    assert not barge_in_event.is_set()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_detect_barge_in_followup_after_window_does_not_confirm(
+    monkeypatch, fast_bargein_confirm
+):
+    """StartOfTurn fires, window expires, then an Update arrives. The
+    late Update is NOT evidence for the expired window — the detector
+    must not fire the barge-in signal."""
+    confirm_s = fast_bargein_confirm / 1000
+
+    class _DelayedWebSocket:
+        """Yield StartOfTurn immediately, then an Update after a delay
+        longer than the confirmation window. Models a slow-arriving
+        follow-up event."""
+
+        def __aiter__(self):
+            return self._iter()
+
+        async def _iter(self):
+            yield _turn_info_update("StartOfTurn")
+            await asyncio.sleep(confirm_s * 2)  # exceed window
+            yield json.dumps(
+                {
+                    "type": "TurnInfo",
+                    "request_id": "test",
+                    "sequence_id": 2,
+                    "event": "Update",
+                    "turn_index": 0,
+                    "audio_window_start": 0.0,
+                    "audio_window_end": 0.2,
+                    "transcript": "late",
+                    "words": [],
+                    "end_of_turn_confidence": 0.3,
+                }
+            )
+            # Hang so the detector doesn't exit the receive loop.
+            await asyncio.Event().wait()
+
+    socket = FakeAsyncSocket()
+    socket._websocket = _DelayedWebSocket()  # type: ignore[assignment]
+    _install_fake_client(monkeypatch, socket)
+
+    barge_in_event = asyncio.Event()
+    task = asyncio.create_task(
+        detect_barge_in(_mock_mic(), barge_in_event, confirmation_ms=fast_bargein_confirm)
+    )
+    # Wait long enough for both events to arrive.
+    await asyncio.sleep(confirm_s * 3)
+    assert not barge_in_event.is_set(), "late follow-up after window expiry must not confirm"
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_detect_barge_in_rearms_on_second_startofturn(monkeypatch, fast_bargein_confirm):
+    """A second StartOfTurn re-arms the confirmation window. An Update
+    inside the re-armed window still confirms."""
+    confirm_s = fast_bargein_confirm / 1000
+
+    class _ReArmWebSocket:
+        def __aiter__(self):
+            return self._iter()
+
+        async def _iter(self):
+            yield _turn_info_update("StartOfTurn")
+            await asyncio.sleep(confirm_s * 2)  # let window 1 expire
+            yield _turn_info_update("StartOfTurn")
+            await asyncio.sleep(confirm_s / 4)  # inside window 2
+            yield json.dumps(
+                {
+                    "type": "TurnInfo",
+                    "request_id": "test",
+                    "sequence_id": 3,
+                    "event": "Update",
+                    "turn_index": 1,
+                    "audio_window_start": 0.0,
+                    "audio_window_end": 0.2,
+                    "transcript": "yo",
+                    "words": [],
+                    "end_of_turn_confidence": 0.3,
+                }
+            )
+            await asyncio.Event().wait()
+
+    socket = FakeAsyncSocket()
+    socket._websocket = _ReArmWebSocket()  # type: ignore[assignment]
+    _install_fake_client(monkeypatch, socket)
+
+    barge_in_event = asyncio.Event()
+    task = asyncio.create_task(
+        detect_barge_in(_mock_mic(), barge_in_event, confirmation_ms=fast_bargein_confirm)
+    )
+    await asyncio.sleep(confirm_s * 4)
+    assert barge_in_event.is_set(), "re-armed window should have confirmed"
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_detect_barge_in_empty_endofturn_in_window_discards(
+    monkeypatch, fast_bargein_confirm
+):
+    """``EndOfTurn`` with empty transcript inside the window is
+    disconfirming — the server closed a non-speech turn. The detector
+    discards the window and keeps listening."""
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_update("StartOfTurn"),
+            _turn_info_end_of_turn(transcript="", trigger="model"),
+        ],
+        exhaust_after_messages=False,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    barge_in_event = asyncio.Event()
+    task = asyncio.create_task(
+        detect_barge_in(_mock_mic(), barge_in_event, confirmation_ms=fast_bargein_confirm)
+    )
+    await asyncio.sleep(fast_bargein_confirm / 1000 * 3)
+    assert not barge_in_event.is_set()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_detect_barge_in_force_end_turn_warning_discards_window(
+    monkeypatch, fast_bargein_confirm
+):
+    """``FORCE_END_TURN_NO_ACTIVE_TURN`` arriving inside the window
+    cancels the pending confirmation and the detector keeps listening."""
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            _turn_info_update("StartOfTurn"),
+            _warning("FORCE_END_TURN_NO_ACTIVE_TURN", "flap"),
+        ],
+        exhaust_after_messages=False,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    barge_in_event = asyncio.Event()
+    task = asyncio.create_task(
+        detect_barge_in(_mock_mic(), barge_in_event, confirmation_ms=fast_bargein_confirm)
+    )
+    await asyncio.sleep(fast_bargein_confirm / 1000 * 3)
+    assert not barge_in_event.is_set()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_detect_barge_in_cancellation_cleans_up(monkeypatch, fast_bargein_confirm):
+    """External cancellation (voice_loop at BARGE_IN entry / clean end)
+    propagates ``CancelledError`` and does not fire the event."""
+    socket = FakeAsyncSocket(exhaust_after_messages=False)
+    _install_fake_client(monkeypatch, socket)
+
+    barge_in_event = asyncio.Event()
+    task = asyncio.create_task(detect_barge_in(_mock_mic(), barge_in_event))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not barge_in_event.is_set()
+
+
+async def test_detect_barge_in_auth_error_during_connect(monkeypatch):
+    """A 401 from Flux surfaces as ``STTAuthError`` from the connect
+    seam, mirroring ``transcribe``'s behaviour."""
+    fake_client = MagicMock(name="AsyncDeepgramClient()")
+    fake_client.listen.v2.connect.side_effect = ApiError(status_code=401, body="auth")
+
+    monkeypatch.setattr(agent.stt, "_client", None)
+    monkeypatch.setattr(agent.stt, "_get_client", lambda: fake_client)
+
+    with pytest.raises(STTAuthError):
+        await detect_barge_in(_mock_mic(), asyncio.Event())
+
+
+async def test_detect_barge_in_fatal_error_during_receive(monkeypatch, fast_bargein_confirm):
+    """A FatalError from Flux maps to ``STTFatal``."""
+    socket = FakeAsyncSocket(
+        pre_messages=[_fatal("GENERIC_FAULT", "test")],
+        exhaust_after_messages=True,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    with pytest.raises(STTFatal):
+        await detect_barge_in(_mock_mic(), asyncio.Event())
+
+
+async def test_detect_barge_in_unparsable_message_maps_to_force_end_unsupported(
+    monkeypatch, fast_bargein_confirm
+):
+    """``UNPARSABLE_CLIENT_MESSAGE`` surfaces as
+    ``STTForceEndTurnUnsupported`` (mirrors ``transcribe``)."""
+    socket = FakeAsyncSocket(
+        pre_messages=[_fatal("UNPARSABLE_CLIENT_MESSAGE", "no ForceEndTurn")],
+        exhaust_after_messages=True,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    with pytest.raises(STTForceEndTurnUnsupported):
+        await detect_barge_in(_mock_mic(), asyncio.Event())
+
+
+async def test_detect_barge_in_connection_closed_during_receive(monkeypatch, fast_bargein_confirm):
+    """``ConnectionClosed`` from the receive iterator surfaces as
+    ``STTError`` with a specific wording."""
+    socket = FakeAsyncSocket(
+        pre_messages=[ConnectionClosed(None, None)],
+        exhaust_after_messages=True,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    with pytest.raises(STTError, match="connection closed"):
+        await detect_barge_in(_mock_mic(), asyncio.Event(), confirmation_ms=fast_bargein_confirm)
+
+
+async def test_detect_barge_in_invalid_json_wrapped_in_stt_error(monkeypatch, fast_bargein_confirm):
+    """A non-JSON wire message hits the generic ``except Exception`` in
+    ``_watch_for_barge_in`` and is wrapped as ``STTError``."""
+    socket = FakeAsyncSocket(
+        pre_messages=["not json at all"],
+        exhaust_after_messages=True,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    with pytest.raises(STTError, match="receive loop failed"):
+        await detect_barge_in(_mock_mic(), asyncio.Event(), confirmation_ms=fast_bargein_confirm)
+
+
+async def test_detect_barge_in_missing_websocket_attr_raises(monkeypatch, fast_bargein_confirm):
+    """SDK pin mismatch: no ``_websocket`` attribute → ``STTError``."""
+    socket = FakeAsyncSocket(omit_websocket_attr=True)
+    _install_fake_client(monkeypatch, socket)
+
+    with pytest.raises(STTError, match="socket._websocket"):
+        await detect_barge_in(_mock_mic(), asyncio.Event(), confirmation_ms=fast_bargein_confirm)
+
+
+async def test_mic_pump_wraps_oserror_as_sttererror():
+    """Direct unit on ``_mic_pump``: transport failure on ``send_media``
+    wraps as ``STTError``."""
+
+    class _OSErrorSocket:
+        async def send_media(self, chunk: bytes) -> None:
+            raise OSError("mic transport dropped")
+
+    async def _one_chunk() -> AsyncIterator[bytes]:
+        yield b"\x00" * 640
+
+    with pytest.raises(STTError, match="audio send failed"):
+        await agent.stt._mic_pump(_OSErrorSocket(), _one_chunk())
+
+
+async def test_mic_pump_wraps_mic_iterator_exception_as_sttererror():
+    """Direct unit on ``_mic_pump``: a generic exception from the mic
+    iterator wraps as ``STTError`` with the ``mic source failed``
+    wording."""
+
+    async def _bad_mic() -> AsyncIterator[bytes]:
+        yield b"\x00" * 640
+        raise RuntimeError("mic hardware vanished")
+
+    class _NoopSocket:
+        async def send_media(self, chunk: bytes) -> None:
+            pass
+
+    with pytest.raises(STTError, match="mic source failed"):
+        await agent.stt._mic_pump(_NoopSocket(), _bad_mic())
+
+
+async def test_mic_pump_re_raises_cancellation() -> None:
+    """``CancelledError`` from the mic iterator (external cancel of the
+    pump task) propagates as-is, not wrapped."""
+
+    async def _cancelled_mic() -> AsyncIterator[bytes]:
+        raise asyncio.CancelledError
+        yield b""  # pragma: no cover — never reached
+
+    class _NoopSocket:
+        async def send_media(self, chunk: bytes) -> None:
+            pass
+
+    with pytest.raises(asyncio.CancelledError):
+        await agent.stt._mic_pump(_NoopSocket(), _cancelled_mic())
+
+
+async def test_detect_barge_in_connect_oserror_raises_stt_error(monkeypatch):
+    """A transport error during ``connect()`` (DNS/TCP/TLS) surfaces as
+    ``STTError`` via the outer ``except (OSError, ...)`` block, same
+    as ``transcribe()``."""
+
+    class _FailingConnectCM:
+        async def __aenter__(self):
+            raise OSError("DNS blew up")
+
+        async def __aexit__(self, *_a: object) -> None:
+            return None
+
+    fake_client = MagicMock(name="AsyncDeepgramClient()")
+    fake_client.listen.v2.connect.return_value = _FailingConnectCM()
+
+    monkeypatch.setattr(agent.stt, "_client", None)
+    monkeypatch.setattr(agent.stt, "_get_client", lambda: fake_client)
+
+    with pytest.raises(STTError, match="connection failed"):
+        await detect_barge_in(_mock_mic(), asyncio.Event())
+
+
+async def test_detect_barge_in_non_turninfo_type_is_logged_and_ignored(
+    monkeypatch, fast_bargein_confirm
+):
+    """Non-TurnInfo / non-Warning / non-Error messages (e.g. a
+    ``Connected`` payload) are logged at DEBUG and ignored, matching
+    ``_receive``'s treatment of SDK-level housekeeping events."""
+    socket = FakeAsyncSocket(
+        pre_messages=[
+            json.dumps(
+                {
+                    "type": "Connected",
+                    "request_id": "test",
+                    "sequence_id": 0,
+                }
+            ),
+            _turn_info_update("StartOfTurn"),
+            _turn_info_update("EagerEndOfTurn"),
+        ],
+        exhaust_after_messages=True,
+    )
+    _install_fake_client(monkeypatch, socket)
+
+    barge_in_event = asyncio.Event()
+    await asyncio.wait_for(
+        detect_barge_in(_mock_mic(), barge_in_event, confirmation_ms=fast_bargein_confirm),
+        timeout=1.0,
+    )
+    assert barge_in_event.is_set()
+
+
+async def test_detect_barge_in_production_constant_default_is_150ms():
+    """Guard against the autouse ``fast_bargein_confirm`` fixture
+    being read as the production default — ``BARGEIN_CONFIRM_MS`` is
+    the ADR-0005 Decision 2 ballpark the detector picks up when the
+    caller doesn't override ``confirmation_ms``."""
+    assert BARGEIN_CONFIRM_MS == 150
+
+
+# ---------------------------------------------------------------------------
+# CR #86 round 2 F3: pump observed via FIRST_COMPLETED, failures surface
+# without waiting on a potentially-idle watcher.
+# ---------------------------------------------------------------------------
+
+
+async def test_detect_barge_in_pump_failure_surfaces_without_watcher_messages(
+    monkeypatch, fast_bargein_confirm
+):
+    """When ``_mic_pump`` raises ``STTError`` while the watcher's websocket
+    has no pending messages, ``detect_barge_in`` must surface the pump
+    exception promptly instead of hanging on the idle watcher.
+
+    Pre-F3 behaviour (asyncio.wait absent): watcher is parked on
+    ``async for raw in ws`` with nothing to receive, pump raises
+    silently as an unobserved task, and the detector blocks forever
+    unless the caller cancels. Post-F3: ``asyncio.wait(FIRST_COMPLETED)``
+    sees the pump complete first and re-raises its exception, which
+    propagates through the ``async with connect_cm`` boundary.
+    """
+
+    class _OSErrorOnSendSocket(FakeAsyncSocket):
+        async def send_media(self, chunk: bytes) -> None:  # type: ignore[override]
+            raise OSError("mic transport dropped mid-SPEAKING")
+
+    async def _single_chunk_mic() -> AsyncIterator[bytes]:
+        yield b"\x00" * 640
+        # Keep the generator alive after the single chunk so the pump
+        # stays scheduled against the raise instead of exiting on
+        # exhaustion.
+        await asyncio.Event().wait()
+
+    # No pre_messages, no exhaustion: the watcher's `async for raw in ws`
+    # blocks on _hang.wait() forever. Pre-F3 this would deadlock.
+    socket = _OSErrorOnSendSocket(exhaust_after_messages=False)
+    _install_fake_client(monkeypatch, socket)
+
+    barge_in_event = asyncio.Event()
+    with pytest.raises(STTError, match="audio send failed"):
+        await asyncio.wait_for(
+            detect_barge_in(
+                _single_chunk_mic(),
+                barge_in_event,
+                confirmation_ms=fast_bargein_confirm,
+            ),
+            timeout=1.0,
+        )
+    # No barge-in confirmation reached the event — the pump died first.
+    assert not barge_in_event.is_set()
