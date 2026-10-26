@@ -586,11 +586,7 @@ def _handle_end_of_turn(msg: dict, done_future: asyncio.Future[str]) -> None:
     elif trigger == "timeout":
         _fail(done_future, STTTimeout(partial=transcript))
     elif trigger == "model":
-        _log.warning(
-            "stt: EndOfTurn with trigger='model' despite eot_threshold=%s; "
-            "Flux boundary-condition. Returning transcript anyway.",
-            EOT_THRESHOLD,
-        )
+        _log.debug("stt: natural EndOfTurn (trigger='model')")
         _succeed(done_future, transcript)
     else:
         _log.warning(
