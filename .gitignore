@@ -10,6 +10,10 @@ CLAUDE.md
 CASE_STUDY.md
 CLAUDE_SESSION_*.md
 
+# === Personal (not part of the project) ===
+workout.md
+token_write.json
+
 # === Python ===
 __pycache__/
 *.py[cod]
