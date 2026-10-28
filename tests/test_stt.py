@@ -423,8 +423,8 @@ async def test_trigger_timeout_raises_STTTimeout_with_partial(monkeypatch):
     assert exc_info.value.partial == "half a sentence"
 
 
-async def test_trigger_model_returns_transcript_with_warning(monkeypatch, caplog):
-    caplog.set_level(logging.WARNING, logger="agent.stt")
+async def test_trigger_model_returns_transcript_with_debug_log(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG, logger="agent.stt")
     socket = FakeAsyncSocket(
         post_force_end=[_turn_info_end_of_turn(transcript="something", trigger="model")]
     )
@@ -437,7 +437,9 @@ async def test_trigger_model_returns_transcript_with_warning(monkeypatch, caplog
 
     transcript = await asyncio.wait_for(task, timeout=1.0)
     assert transcript == "something"
-    assert any("trigger='model'" in r.getMessage() for r in caplog.records)
+    assert any(
+        r.levelno == logging.DEBUG and "trigger='model'" in r.getMessage() for r in caplog.records
+    )
 
 
 async def test_trigger_unknown_returns_transcript_with_warning(monkeypatch, caplog):
@@ -1382,7 +1384,7 @@ async def test_ptt_release_eot_in_grace_no_force_end(monkeypatch):
     ``ForceEndTurn``.
     """
     socket = FakeAsyncSocket(
-        pre_messages=[_turn_info_end_of_turn(transcript="natural eot", trigger="manual")],
+        pre_messages=[_turn_info_end_of_turn(transcript="natural eot", trigger="model")],
         exhaust_after_messages=True,
     )
     _install_fake_client(monkeypatch, socket)
@@ -1432,7 +1434,7 @@ async def test_ptt_release_eager_then_eot_in_grace(monkeypatch):
     socket = FakeAsyncSocket(
         pre_messages=[
             _turn_info_update("EagerEndOfTurn"),
-            _turn_info_end_of_turn(transcript="eager-then-eot", trigger="manual"),
+            _turn_info_end_of_turn(transcript="eager-then-eot", trigger="model"),
         ],
         exhaust_after_messages=True,
     )
