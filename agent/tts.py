@@ -391,6 +391,24 @@ async def synthesize(text_chunks: AsyncIterator[str]) -> AsyncIterator[bytes]:
                 for t in tasks:
                     if not t.done():
                         t.cancel()
+                # #71 CR R1 (Major): drain pcm_queue so a cancelled
+                # receiver's finally's ``await pcm_queue.put(None)``
+                # sentinel can complete on a full queue.  On barge-in,
+                # voice_loop cancels playback before draining the queue;
+                # receiver may be blocked at ``await pcm_queue.put(data)``
+                # with the 96-chunk buffer occupied.  Cancellation
+                # removes the waiting putter but leaves the buffered
+                # chunks in the queue — nothing reads them after
+                # playback is cancelled.  Draining here lets receiver's
+                # sentinel put proceed and the task actually exit, so
+                # the outer ``await t`` loop below (and the voice_loop's
+                # inline ``await synth_iter.aclose()`` that drives this
+                # whole path synchronously per #71) can't hang.
+                while True:
+                    try:
+                        pcm_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
                 for t in tasks:
                     try:
                         await t
