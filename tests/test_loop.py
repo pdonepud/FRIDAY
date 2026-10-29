@@ -1720,3 +1720,56 @@ async def test_voice_mode_detect_barge_in_spawned_after_speaking_on_happy_path(m
     assert len(records) == 1
     (_invoked, state_at_invocation) = records[0]
     assert state_at_invocation == TurnState.SPEAKING
+
+
+async def test_voice_mode_pre_roll_cancellation_cleans_up_playback_task(monkeypatch):
+    """CR #92 F2: an external CancelledError during the pre-race
+    (before first chunk) must cancel + await ``playback_task`` so it
+    does not leak across turns. Without the inner-finally pre-roll
+    cleanup, the orphaned task keeps consuming its synthesis stream
+    and can play audio during a later turn.
+
+    Deterministic: the mock playback sets ``playback_started`` once
+    it enters, so the test cancels main_task only after we know the
+    pre-race is live.
+    """
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    playback_started = asyncio.Event()
+    playback_tasks: list[asyncio.Task] = []
+
+    async def _hangs_in_pre_roll(_chunks, *_a, **_kw):
+        # Register this task + signal pre-roll has begun, then block
+        # forever. first_chunk_event stays unset because we never
+        # consume a chunk from _chunks.
+        playback_tasks.append(asyncio.current_task())
+        playback_started.set()
+        await asyncio.Event().wait()  # cancelled by voice_loop's cleanup
+
+    _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_result="hi",
+        sentences=("ok.",),
+        synth_result=(b"a",),  # synth has data, but _hangs_in_pre_roll never reads it
+    )
+    monkeypatch.setattr("agent.audio.playback", _hangs_in_pre_roll)
+
+    from agent.loop import run
+
+    main_task = asyncio.create_task(run())
+    await playback_started.wait()  # pre-race is live
+    main_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await main_task
+
+    # Exactly one playback task was spawned; the pre-roll cleanup
+    # must have driven it to a terminal state (cancelled). Without
+    # the F2 fix, it would still be pending.
+    assert len(playback_tasks) == 1
+    assert playback_tasks[0].done()

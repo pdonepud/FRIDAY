@@ -188,7 +188,11 @@ async def _mark_first_chunk(
     """
     first = True
     async for chunk in src:
-        if first:
+        # CR #92 F1: tts.synthesize may yield an empty frame as the
+        # first chunk (base64-decode of an empty audio field). Setting
+        # the event here would spuriously enter SPEAKING with no
+        # audible output. Only mark on the first NON-EMPTY chunk.
+        if first and chunk:
             first_chunk_event.set()
             first = False
         yield chunk
@@ -485,6 +489,11 @@ async def voice_loop() -> int:
                 barge_in_waiter: asyncio.Task | None = None
                 phase5_tasks: tuple[asyncio.Task, ...] = ()
                 first_chunk_waiter: asyncio.Task | None = None
+                # CR #92 F2: pre-declare so the inner finally can
+                # cancel+await it on a SIGINT (or any exception)
+                # during the pre-roll window — before it joins
+                # phase5_tasks on the SPEAKING branch.
+                playback_task: asyncio.Task | None = None
                 try:
                     sentence_iter = stream_sentences(messages, SYSTEM_PROMPT)
                     synth_iter = tts.synthesize(_tee(sentence_iter, collect))
@@ -609,6 +618,24 @@ async def voice_loop() -> int:
                                 transcript_store.last_elapsed_text = "".join(collect)
                                 machine.transition(TurnState.LISTENING, trigger="loop")
                     finally:
+                        # CR #92 F2: pre-roll playback_task cleanup —
+                        # on a SIGINT (or any exception) between
+                        # ``playback_task = create_task(...)`` and
+                        # phase5_tasks being assigned on the SPEAKING
+                        # branch, playback_task would otherwise leak
+                        # and keep consuming its synth stream across
+                        # turns. ``not in phase5_tasks`` guard skips
+                        # the double-cleanup on the SPEAKING path
+                        # where the drain loop below already handles
+                        # it.
+                        if (
+                            playback_task is not None
+                            and not playback_task.done()
+                            and playback_task not in phase5_tasks
+                        ):
+                            playback_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError, Exception):
+                                await playback_task
                         # #87: first_chunk_waiter cleanup — guarded by
                         # ``is not None`` so an exception before its
                         # create_task doesn't trip, and ``not done()``
