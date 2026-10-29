@@ -54,6 +54,40 @@ async def _collect(aiter) -> list:
     return out
 
 
+class _TrackedAsyncGen:
+    """Async-generator wrapper that counts ``aclose()`` invocations.
+
+    Used by the #71 regression tests to verify ``voice_loop``'s inner
+    finally calls ``aclose()`` on ``synth_iter`` and ``sentence_iter``
+    on both the barge-in and clean-end paths.  Explicit delegation on
+    ``asend`` / ``athrow`` matches the project style — a ``__getattr__``
+    fallthrough would cover the full protocol in one line but any
+    production caller invoking those methods on the wrapper would
+    then hit ``AttributeError`` only on a typo, not on a missing
+    passthrough.
+    """
+
+    def __init__(self, inner, close_tracker: list[bool]) -> None:
+        self._inner = inner
+        self._tracker = close_tracker
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self._inner.__anext__()
+
+    async def aclose(self):
+        self._tracker.append(True)
+        await self._inner.aclose()
+
+    async def asend(self, value):
+        return await self._inner.asend(value)
+
+    async def athrow(self, exc_type, exc=None, tb=None):
+        return await self._inner.athrow(exc_type, exc, tb)
+
+
 def _set_voice_argv(monkeypatch):
     """Pin ``sys.argv`` so argparse picks the voice branch."""
     monkeypatch.setattr("sys.argv", ["python -m agent"])
@@ -1773,3 +1807,195 @@ async def test_voice_mode_pre_roll_cancellation_cleans_up_playback_task(monkeypa
     # the F2 fix, it would still be pending.
     assert len(playback_tasks) == 1
     assert playback_tasks[0].done()
+
+
+# ---------------------------------------------------------------------------
+# #71: explicit aclose chain on upstream iterators (barge-in + clean-end)
+# ---------------------------------------------------------------------------
+
+
+async def test_voice_mode_barge_in_at_stream_start_closes_upstream_iters(monkeypatch, capsys):
+    """#71: barge-in fires on the first chunk — both ``synth_iter``
+    and ``sentence_iter`` must be ``aclose``'d by voice_loop's inner
+    finally, closing the ElevenLabs WebSocket and the Anthropic
+    httpx stream deterministically instead of waiting for GC."""
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    synth_closes: list[bool] = []
+    sentence_closes: list[bool] = []
+
+    async def _fire_barge_in(event: asyncio.Event) -> None:
+        # Give playback a tick to start, then fire the shared event.
+        await asyncio.sleep(0.001)
+        event.set()
+
+    _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_result="hi",
+        sentences=("Hello.",),
+        synth_result=(b"a",),
+        barge_in=_fire_barge_in,
+    )
+
+    # Wrap the fakes installed by _install_voice_pipeline_mocks so we
+    # observe aclose() on the exact iterators voice_loop instantiates:
+    # sentence_iter from stream_sentences, synth_iter from tts.synthesize.
+    import agent.loop
+
+    installed_stream = agent.loop.stream_sentences
+    installed_synth = tts.synthesize
+
+    def _tracking_stream(*a, **kw):
+        return _TrackedAsyncGen(installed_stream(*a, **kw), sentence_closes)
+
+    def _tracking_synth(*a, **kw):
+        return _TrackedAsyncGen(installed_synth(*a, **kw), synth_closes)
+
+    monkeypatch.setattr("agent.loop.stream_sentences", _tracking_stream)
+    monkeypatch.setattr("agent.tts.synthesize", _tracking_synth)
+
+    # Make playback long enough that the barge-in event fires BEFORE
+    # natural completion.
+    async def _slow_playback(chunks, *_a, **_kw):
+        async for _ in chunks:
+            pass
+        await asyncio.sleep(0.1)
+
+    monkeypatch.setattr("agent.audio.playback", _slow_playback)
+
+    from agent.loop import run
+
+    assert await run() == 2  # ptt exhausts after the barged-in turn
+    out = capsys.readouterr().out
+    assert "[barged in]" in out
+    assert len(synth_closes) == 1, "synth_iter.aclose() must be called on barge-in"
+    assert len(sentence_closes) == 1, "sentence_iter.aclose() must be called on barge-in"
+
+
+async def test_voice_mode_barge_in_mid_sentence_closes_upstream_iters(monkeypatch, capsys):
+    """#71: barge-in fires mid-stream after several chunks have
+    played — upstream iterators must still ``aclose`` cleanly."""
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    synth_closes: list[bool] = []
+    sentence_closes: list[bool] = []
+
+    async def _fire_barge_in(event: asyncio.Event) -> None:
+        # Longer delay — let a few chunks flow through playback before
+        # the barge-in fires, so the aclose chain exercises the real
+        # mid-stream cleanup path (not just the first-chunk race).
+        await asyncio.sleep(0.005)
+        event.set()
+
+    _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_result="hi",
+        sentences=("Hello there friend.",),
+        synth_result=(b"a", b"b", b"c", b"d", b"e"),
+        barge_in=_fire_barge_in,
+    )
+
+    import agent.loop
+
+    installed_stream = agent.loop.stream_sentences
+    installed_synth = tts.synthesize
+
+    def _tracking_stream(*a, **kw):
+        return _TrackedAsyncGen(installed_stream(*a, **kw), sentence_closes)
+
+    def _tracking_synth(*a, **kw):
+        return _TrackedAsyncGen(installed_synth(*a, **kw), synth_closes)
+
+    monkeypatch.setattr("agent.loop.stream_sentences", _tracking_stream)
+    monkeypatch.setattr("agent.tts.synthesize", _tracking_synth)
+
+    async def _slow_playback(chunks, *_a, **_kw):
+        async for _ in chunks:
+            pass
+        await asyncio.sleep(0.1)
+
+    monkeypatch.setattr("agent.audio.playback", _slow_playback)
+
+    from agent.loop import run
+
+    assert await run() == 2
+    out = capsys.readouterr().out
+    assert "[barged in]" in out
+    assert len(synth_closes) == 1, "synth_iter.aclose() must be called on mid-stream barge-in"
+    assert len(sentence_closes) == 1, "sentence_iter.aclose() must be called on mid-stream barge-in"
+
+
+async def test_voice_mode_barge_in_at_stream_end_races_cleanly(monkeypatch, capsys):
+    """#71: barge-in event fires right as playback is naturally
+    completing — both race outcomes (clean-end wins vs. barge-in
+    wins) must tear down cleanly without errors or state
+    corruption.  The aclose chain is unconditional in the inner
+    finally, so BOTH outcomes result in ``synth_iter`` and
+    ``sentence_iter`` aclose being called exactly once (either by
+    the barge-in path or by the clean-end path's shared finally)."""
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    synth_closes: list[bool] = []
+    sentence_closes: list[bool] = []
+
+    async def _fire_barge_in(event: asyncio.Event) -> None:
+        # No delay — race the natural end of playback.
+        event.set()
+
+    _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_result="hi",
+        sentences=("ok.",),
+        synth_result=(b"a",),
+        barge_in=_fire_barge_in,
+    )
+
+    import agent.loop
+
+    installed_stream = agent.loop.stream_sentences
+    installed_synth = tts.synthesize
+
+    def _tracking_stream(*a, **kw):
+        return _TrackedAsyncGen(installed_stream(*a, **kw), sentence_closes)
+
+    def _tracking_synth(*a, **kw):
+        return _TrackedAsyncGen(installed_synth(*a, **kw), synth_closes)
+
+    monkeypatch.setattr("agent.loop.stream_sentences", _tracking_stream)
+    monkeypatch.setattr("agent.tts.synthesize", _tracking_synth)
+
+    # Default _fake_playback (installed by _install_voice_pipeline_mocks)
+    # exhausts chunks and returns immediately — natural end usually
+    # wins the race, but either outcome is legal here.
+
+    from agent.loop import run
+
+    assert await run() == 2
+    out = capsys.readouterr().out
+    assert len(synth_closes) == 1, (
+        f"synth_iter.aclose() must fire exactly once; got {len(synth_closes)}"
+    )
+    assert len(sentence_closes) == 1, (
+        f"sentence_iter.aclose() must fire exactly once; got {len(sentence_closes)}"
+    )
+    # No traceback / error prints — both race outcomes tear down cleanly.
+    for marker in ("Traceback", "RuntimeError", "AssertionError", "[err]"):
+        assert marker not in out, f"unexpected error marker {marker!r} in output: {out!r}"

@@ -458,8 +458,10 @@ async def voice_loop() -> int:
                 # the state-machine's ``barge_in_event``. SPEAKING ->
                 # LISTENING fires on clean end; SPEAKING ->
                 # BARGE_IN -> LISTENING on confirmed barge-in (TTS
-                # cancel plumbing is #71 — commit 4 stubs it via
-                # ``playback_task.cancel()``). Error paths route back
+                # cancel per ADR-0005 Decision 3 —
+                # ``playback_task.cancel()`` tears down the PortAudio
+                # stream (#55) and the inner finally aclose()s
+                # synth_iter + sentence_iter (#71)). Error paths route back
                 # to LISTENING via _recover_to_listening_from_phase5.
                 #
                 # TODO(#72-echo): the barge-in detector currently
@@ -494,6 +496,16 @@ async def voice_loop() -> int:
                 # during the pre-roll window — before it joins
                 # phase5_tasks on the SPEAKING branch.
                 playback_task: asyncio.Task | None = None
+                # #71: pre-declare upstream iterators so the inner
+                # finally can ``aclose()`` them unconditionally.  On
+                # clean-end both are already exhausted (aclose is a
+                # no-op); on barge-in they are mid-stream and aclose
+                # drives the TTS WebSocket close + Anthropic httpx
+                # stream close synchronously — promoting ADR-0005
+                # line 142's "GC-based cleanup is prompt but non-
+                # deterministic" to deterministic now.
+                sentence_iter: AsyncIterator[str] | None = None
+                synth_iter: AsyncIterator[bytes] | None = None
                 try:
                     sentence_iter = stream_sentences(messages, SYSTEM_PROMPT)
                     synth_iter = tts.synthesize(_tee(sentence_iter, collect))
@@ -602,10 +614,15 @@ async def voice_loop() -> int:
                                         confidence=None,
                                     ),
                                 )
-                                # Cancel playback as the (#71-stubbed)
-                                # TTS cancel. #71 replaces this with
-                                # the destructive-cancel ADR-0005
-                                # Decision 3 specifies.
+                                # Destructive cancel per ADR-0005
+                                # Decision 3: cancelling playback_task
+                                # unwinds audio.playback's nested
+                                # finally (closes the PortAudio stream
+                                # per #55), and the inner finally
+                                # below drives the explicit aclose()
+                                # chain on synth_iter + sentence_iter
+                                # (closes the ElevenLabs WS + Anthropic
+                                # httpx stream).
                                 if not playback_task.done():
                                     playback_task.cancel()
                             else:
@@ -668,6 +685,27 @@ async def voice_loop() -> int:
                                 # exceptions have already been
                                 # surfaced via the done-set check or
                                 # cancel propagation.
+                        # #71 / ADR-0005 Decision 3: explicit aclose
+                        # chain on upstream iterators.  Without this,
+                        # synth_iter's WebSocket and sentence_iter's
+                        # httpx stream stay open until voice_loop's
+                        # next iteration overwrites the local
+                        # references — GC-prompt but not synchronous.
+                        # Draining them here makes resource cleanup
+                        # deterministic across both the barge-in path
+                        # (iterators mid-stream) and the clean-end
+                        # path (iterators already exhausted; aclose
+                        # is a safe no-op).  Order: synth_iter first
+                        # so TTS's sender/receiver tasks + WS close
+                        # fire before we close the upstream LLM
+                        # stream, mirroring the destruction order a
+                        # natural end-of-stream would have taken.
+                        if synth_iter is not None:
+                            with contextlib.suppress(Exception):
+                                await synth_iter.aclose()
+                        if sentence_iter is not None:
+                            with contextlib.suppress(Exception):
+                                await sentence_iter.aclose()
                         # Explicit aclose so the RawInputStream inside
                         # audio.capture() releases now, not at async-
                         # generator finalization time (which can be
@@ -688,10 +726,10 @@ async def voice_loop() -> int:
                         messages.pop()
                         continue
                     if barged_in:
-                        # BARGE_IN -> LISTENING follows the cancel.
-                        # #71 will own the ordering with the real
-                        # destructive-cancel plumbing; here it fires
-                        # after the finally drains the sibling tasks.
+                        # BARGE_IN -> LISTENING fires after the inner
+                        # finally drives the destructive cancel
+                        # (playback_task cancellation + synth_iter /
+                        # sentence_iter aclose per ADR-0005 Decision 3).
                         machine.transition(TurnState.LISTENING, trigger="loop")
                         print("\n[barged in]")
                         # Discard the pending user turn (option a).

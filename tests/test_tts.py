@@ -1157,3 +1157,55 @@ async def test_pipeline_error_suppressed_on_caller_unwind(monkeypatch, caplog):
             raise _ConsumerErr("consumer bailed")
 
     # The consumer's exception surfaces, NOT the server error frame.
+
+
+# ---------------------------------------------------------------------------
+# Bundle 26 (#71 CR R1): aclose() must not hang when pcm_queue is full
+# ---------------------------------------------------------------------------
+
+
+async def test_synthesize_aclose_does_not_hang_on_full_pcm_queue(monkeypatch):
+    """#71 CR R1 (Major): when ``pcm_queue`` is full at ``PCM_QUEUE_MAX``
+    and the consumer stops iterating (barge-in cancels playback), the
+    receiver's finally's ``await pcm_queue.put(None)`` sentinel must not
+    block ``synth_iter.aclose()``. ``synthesize``'s finally drains the
+    queue before awaiting the cancelled sender + receiver tasks, so the
+    sentinel put proceeds and both tasks exit cleanly — ``aclose()``
+    returns promptly, not after a hang that would freeze the voice loop.
+
+    On Python 3.11+ the pending-cancel counter typically makes the
+    receiver's finally's put also raise ``CancelledError`` even without
+    the drain, so this test is a composition guard rather than a
+    reproduction of a hang on current Python. The drain makes
+    correctness independent of the counter semantics — any outer
+    ``shield`` or timeout context around the aclose site would reveal
+    the pre-fix hang immediately.
+    """
+    _install_key(monkeypatch)
+
+    # Deliver well more than PCM_QUEUE_MAX non-final frames so the
+    # receiver stays alive and fills the queue once the consumer stops
+    # pulling chunks off.
+    frames = [_audio_frame(b"\x00\x01" * 100) for _ in range(PCM_QUEUE_MAX * 3)]
+    ws = _FakeWebSocket(pre_messages=frames)
+    _install_fake_ws(monkeypatch, ws)
+
+    synth_iter = synthesize(_chunks_from(["hello"]))
+
+    # Pull a single chunk off, then stop iterating. The receiver has no
+    # back-pressure from a consumer at this point and will fill pcm_queue
+    # until it blocks on put at PCM_QUEUE_MAX.
+    async for _chunk in synth_iter:
+        break
+
+    # Give the receiver a healthy run of event-loop ticks to pump frames
+    # from the fake WS into pcm_queue; saturation happens well before
+    # the loop budget exhausts.
+    for _ in range(200):
+        await asyncio.sleep(0)
+
+    # Pre-fix (any environment where the receiver's finally put doesn't
+    # see the cancel counter) this hangs forever. Post-fix, the drain
+    # in synthesize's finally lets the sentinel put complete and the
+    # await returns promptly — well within the 1 s guard.
+    await asyncio.wait_for(synth_iter.aclose(), timeout=1.0)
