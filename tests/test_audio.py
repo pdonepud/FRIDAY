@@ -1100,3 +1100,53 @@ async def test_playback_surfaces_tts_error_equivalent(fake_output_stream):
     assert exc_info.value is boom
     assert fake_output_stream[0].stopped is True
     assert fake_output_stream[0].closed is True
+
+
+# ---------------------------------------------------------------------------
+# #71 AC: no leaked PortAudio stream after task cancel
+# ---------------------------------------------------------------------------
+
+
+async def test_playback_task_cancel_closes_portaudio_stream(fake_output_stream):
+    """#71 AC: 'No leaked PortAudio stream after cancel (mid-drain
+    regression pattern from #55)'.
+
+    When ``playback_task`` is cancelled mid-stream — the barge-in
+    cancel pattern — ``audio.playback``'s nested try/finally must
+    still run ``stream.stop()`` + ``stream.close()``. This verifies
+    the #55 teardown pattern composes with task cancellation, not
+    just watchdog-fired ``AudioPlaybackError``.
+    """
+    chunks_started = asyncio.Event()
+
+    async def _slow_chunks() -> AsyncIterator[bytes]:
+        # Yield a handful so playback starts its stream + enters the
+        # steady-state consumer loop, then hang: this mirrors a real
+        # TTS iterator that is still mid-synthesis when barge-in
+        # cancels playback_task.
+        for _ in range(5):
+            yield b"\x00" * 480
+        chunks_started.set()
+        await asyncio.Event().wait()  # cancelled by play_task.cancel()
+
+    play_task = asyncio.create_task(playback(_slow_chunks()))
+    # Wait until our chunks iterator has handed over five frames so
+    # the real stream has definitely been constructed + started.
+    await chunks_started.wait()
+    # One extra tick to let playback settle in its main loop before
+    # we interrupt it.
+    await asyncio.sleep(0.01)
+
+    play_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await play_task
+
+    # Exactly one stream was constructed, and its full lifecycle
+    # (start → stop → close) ran despite the cancel landing
+    # mid-stream. Without the nested finally, close() would be
+    # skipped on CancelledError and the stream would leak.
+    assert len(fake_output_stream) == 1
+    stream = fake_output_stream[0]
+    assert stream.started is True
+    assert stream.stopped is True
+    assert stream.closed is True
