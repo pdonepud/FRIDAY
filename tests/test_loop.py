@@ -1541,3 +1541,235 @@ async def test_voice_mode_barge_in_marks_transcript_store_interrupted(monkeypatc
     store = captured_store["val"]
     assert store.last_outcome == "interrupted"
     assert store.last_elapsed_text == "Hello there."
+
+
+# ---------------------------------------------------------------------------
+# #87: defer THINKING -> SPEAKING until first audio chunk
+# ---------------------------------------------------------------------------
+
+
+async def test_voice_mode_empty_synth_stream_takes_thinking_to_listening_directly(
+    monkeypatch, capsys
+):
+    """#87: when tts.synthesize yields zero chunks (LLM produced
+    nothing speakable), Phase 5 must transition THINKING ->
+    LISTENING directly without entering SPEAKING, without spawning
+    the barge-in detector, and the pending user turn is popped
+    with a [no reply] breadcrumb.
+
+    Role-alternation parity: the next turn's captured messages
+    must NOT contain the discarded user turn (same shape as
+    test_voice_mode_barge_in_discards_user_turn).
+    """
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    seen: list[tuple[TurnState, TurnState, str, object]] = []
+
+    class _TappedMachine(TurnStateMachine):
+        def __init__(self) -> None:
+            super().__init__()
+            self.on_change(lambda f, t, trig, p: seen.append((f, t, trig, p)))
+
+    monkeypatch.setattr("agent.loop.TurnStateMachine", _TappedMachine)
+
+    captured = _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_results=["first turn", "second turn"],
+        sentences=("ok.",),
+        synth_result=(),  # empty tuple drives the zero-chunk path
+    )
+
+    from agent.loop import run
+
+    assert await run() == 2  # ptt exhausts after the second turn
+    out = capsys.readouterr().out
+    assert "[no reply]" in out
+
+    edges = [(f, t, trig) for (f, t, trig, _p) in seen]
+    assert (TurnState.LISTENING, TurnState.THINKING, "loop") in edges
+    assert (TurnState.THINKING, TurnState.LISTENING, "loop") in edges
+    assert not any(f == TurnState.THINKING and t == TurnState.SPEAKING for (f, t, _trig) in edges)
+    assert not any(f == TurnState.SPEAKING for (f, t, _trig) in edges)
+
+    # Role-alternation: each turn's stream_sentences snapshot sees
+    # only its own user message. The prior empty-stream turn's
+    # discarded user is popped and never leaks into the next turn.
+    assert len(captured) == 2
+    assert captured[0] == [{"role": "user", "content": "first turn"}]
+    assert captured[1] == [{"role": "user", "content": "second turn"}]
+
+
+async def test_voice_mode_detect_barge_in_not_spawned_on_empty_stream(monkeypatch):
+    """#87: on the empty-stream path, ``stt.detect_barge_in`` is
+    never invoked — Phase 5 takes THINKING -> LISTENING directly
+    before reaching the SPEAKING-entry barge-in detector spawn."""
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    machine_ref: list[TurnStateMachine] = []
+
+    class _CapturingMachine(TurnStateMachine):
+        def __init__(self) -> None:
+            super().__init__()
+            machine_ref.append(self)
+
+    monkeypatch.setattr("agent.loop.TurnStateMachine", _CapturingMachine)
+
+    records: list[tuple[bool, TurnState]] = []
+
+    async def _recording_detect(mic_chunks, _barge_in_event, **_kw):
+        # Record (invoked, state-at-invocation) BEFORE draining.
+        state = machine_ref[0].current() if machine_ref else None
+        records.append((True, state))
+
+        # Mirror _fake_detect_barge_in production shape so the mic
+        # generator sees the same lifecycle under cleanup.
+        async def _drain() -> None:
+            async for _ in mic_chunks:
+                pass
+
+        drain_task = asyncio.create_task(_drain(), name="rec-detect-mic-drain")
+        try:
+            await asyncio.Event().wait()  # block until cancelled
+        finally:
+            if not drain_task.done():
+                drain_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await drain_task
+
+    _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_result="hi",
+        sentences=("ok.",),
+        synth_result=(),
+    )
+    # Override after _install_voice_pipeline_mocks (which installs
+    # its own _fake_detect_barge_in last).
+    monkeypatch.setattr("agent.stt.detect_barge_in", _recording_detect)
+
+    from agent.loop import run
+
+    assert await run() == 2
+    assert records == []
+
+
+async def test_voice_mode_detect_barge_in_spawned_after_speaking_on_happy_path(monkeypatch):
+    """#87: on the happy path (non-empty synth), ``stt.detect_barge_in``
+    is invoked exactly once, AFTER the THINKING -> SPEAKING
+    transition has fired on the state machine."""
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    machine_ref: list[TurnStateMachine] = []
+
+    class _CapturingMachine(TurnStateMachine):
+        def __init__(self) -> None:
+            super().__init__()
+            machine_ref.append(self)
+
+    monkeypatch.setattr("agent.loop.TurnStateMachine", _CapturingMachine)
+
+    records: list[tuple[bool, TurnState]] = []
+
+    async def _recording_detect(mic_chunks, _barge_in_event, **_kw):
+        state = machine_ref[0].current() if machine_ref else None
+        records.append((True, state))
+
+        async def _drain() -> None:
+            async for _ in mic_chunks:
+                pass
+
+        drain_task = asyncio.create_task(_drain(), name="rec-detect-mic-drain")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            if not drain_task.done():
+                drain_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await drain_task
+
+    _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_result="hi",
+        sentences=("ok.",),
+        synth_result=(b"a",),
+    )
+    monkeypatch.setattr("agent.stt.detect_barge_in", _recording_detect)
+
+    from agent.loop import run
+
+    assert await run() == 2
+    assert len(records) == 1
+    (_invoked, state_at_invocation) = records[0]
+    assert state_at_invocation == TurnState.SPEAKING
+
+
+async def test_voice_mode_pre_roll_cancellation_cleans_up_playback_task(monkeypatch):
+    """CR #92 F2: an external CancelledError during the pre-race
+    (before first chunk) must cancel + await ``playback_task`` so it
+    does not leak across turns. Without the inner-finally pre-roll
+    cleanup, the orphaned task keeps consuming its synthesis stream
+    and can play audio during a later turn.
+
+    Deterministic: the mock playback sets ``playback_started`` once
+    it enters, so the test cancels main_task only after we know the
+    pre-race is live.
+    """
+    _set_voice_argv(monkeypatch)
+    _set_all_keys(monkeypatch)
+    monkeypatch.setattr("agent.loop.load_dotenv", lambda: None)
+
+    playback_started = asyncio.Event()
+    playback_tasks: list[asyncio.Task] = []
+
+    async def _hangs_in_pre_roll(_chunks, *_a, **_kw):
+        # Register this task + signal pre-roll has begun, then block
+        # forever. first_chunk_event stays unset because we never
+        # consume a chunk from _chunks.
+        playback_tasks.append(asyncio.current_task())
+        playback_started.set()
+        await asyncio.Event().wait()  # cancelled by voice_loop's cleanup
+
+    _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_result="hi",
+        sentences=("ok.",),
+        synth_result=(b"a",),  # synth has data, but _hangs_in_pre_roll never reads it
+    )
+    monkeypatch.setattr("agent.audio.playback", _hangs_in_pre_roll)
+
+    from agent.loop import run
+
+    main_task = asyncio.create_task(run())
+    await playback_started.wait()  # pre-race is live
+    main_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await main_task
+
+    # Exactly one playback task was spawned; the pre-roll cleanup
+    # must have driven it to a terminal state (cancelled). Without
+    # the F2 fix, it would still be pending.
+    assert len(playback_tasks) == 1
+    assert playback_tasks[0].done()

@@ -174,6 +174,30 @@ async def _tee(src: AsyncIterator[str], collect: list[str]) -> AsyncIterator[str
         yield chunk
 
 
+async def _mark_first_chunk(
+    src: AsyncIterator[bytes],
+    first_chunk_event: asyncio.Event,
+) -> AsyncIterator[bytes]:
+    """Pass PCM chunks through, setting ``first_chunk_event`` on the first chunk.
+
+    #87: ``voice_loop`` wraps ``synth_iter`` with this helper so the
+    ``THINKING -> SPEAKING`` transition fires only when playback
+    actually observes its first audio chunk — not when the lazy
+    generator is merely wired up. Lifted to module scope (not a
+    closure) to match ``_tee``'s pattern and avoid B023.
+    """
+    first = True
+    async for chunk in src:
+        # CR #92 F1: tts.synthesize may yield an empty frame as the
+        # first chunk (base64-decode of an empty audio field). Setting
+        # the event here would spuriously enter SPEAKING with no
+        # audible output. Only mark on the first NON-EMPTY chunk.
+        if first and chunk:
+            first_chunk_event.set()
+            first = False
+        yield chunk
+
+
 async def _ptt_pump(
     ptt_iter: AsyncIterator[ptt.PTTEvent],
     ptt_queue: asyncio.Queue[ptt.PTTEvent | None],
@@ -449,70 +473,182 @@ async def voice_loop() -> int:
                 # mic-open flip behind it when EC lands.
                 machine.transition(TurnState.THINKING, trigger="loop")
                 barged_in = False
+                # #87: on the empty-stream path (LLM produced nothing
+                # speakable) we take THINKING -> LISTENING directly,
+                # pop the pending user turn, and print [no reply].
+                # Flagged here, acted on after the inner finally so
+                # the cleanup block runs on BOTH branches uniformly.
+                no_reply = False
+                # Pre-init so the widened inner finally can guard
+                # cleanup with ``is not None`` — barge_in_mic +
+                # detect_task + barge_in_waiter are only created on
+                # the SPEAKING path, phase5_tasks stays () on the
+                # empty-stream path (its drain loop is then a no-op).
+                barge_in_mic = None
+                detect_task: asyncio.Task | None = None
+                barge_in_waiter: asyncio.Task | None = None
+                phase5_tasks: tuple[asyncio.Task, ...] = ()
+                first_chunk_waiter: asyncio.Task | None = None
+                # CR #92 F2: pre-declare so the inner finally can
+                # cancel+await it on a SIGINT (or any exception)
+                # during the pre-roll window — before it joins
+                # phase5_tasks on the SPEAKING branch.
+                playback_task: asyncio.Task | None = None
                 try:
                     sentence_iter = stream_sentences(messages, SYSTEM_PROMPT)
                     synth_iter = tts.synthesize(_tee(sentence_iter, collect))
-                    machine.transition(TurnState.SPEAKING, trigger="loop")
 
-                    # Hoist the mic generator so we can explicitly
-                    # ``aclose()`` it in the finally after cancelling
-                    # the detector task. ``async for`` inside
-                    # ``_mic_pump`` does NOT call ``aclose()`` on
-                    # cancellation, so the ``RawInputStream`` held by
-                    # ``audio.capture()`` would stay open until the
-                    # async generator's finalization runs — unbounded
-                    # delay on Windows. Mirrors the ``ptt_iter.aclose()``
-                    # pattern in voice_loop's outer finally.
-                    barge_in_mic = audio.capture()
-                    detect_task = asyncio.create_task(
-                        stt.detect_barge_in(barge_in_mic, machine.barge_in_event),
-                        name="voice-loop-barge-in-detector",
-                    )
+                    # #87: THINKING -> SPEAKING must fire only when
+                    # audio.playback consumes its first chunk — not
+                    # when the lazy generator chain is merely wired
+                    # up. If we transitioned here, the barge-in
+                    # detector + barge_in_waiter would already be
+                    # running during the LLM + TTS pre-roll (no
+                    # audio yet) and a Flux ``StartOfTurn`` from the
+                    # open mic could confirm and discard a turn the
+                    # user never actually heard. Addresses CR #86
+                    # F1 / ADR-0005's "barge-in detector must not
+                    # run during the pre-audio THINKING window"
+                    # invariant.
+                    first_chunk_event = asyncio.Event()
+                    wrapped_synth = _mark_first_chunk(synth_iter, first_chunk_event)
                     playback_task = asyncio.create_task(
-                        audio.playback(synth_iter),
+                        audio.playback(wrapped_synth),
                         name="voice-loop-playback",
                     )
-                    barge_in_waiter = asyncio.create_task(
-                        machine.barge_in_event.wait(),
-                        name="voice-loop-barge-in-waiter",
+                    first_chunk_waiter = asyncio.create_task(
+                        first_chunk_event.wait(),
+                        name="voice-loop-first-chunk-waiter",
                     )
-                    phase5_tasks = (detect_task, playback_task, barge_in_waiter)
                     try:
-                        done, _pending = await asyncio.wait(
-                            {playback_task, barge_in_waiter},
+                        pre_done, _pre_pending = await asyncio.wait(
+                            {first_chunk_waiter, playback_task},
                             return_when=asyncio.FIRST_COMPLETED,
                         )
-                        if barge_in_waiter in done:
-                            # Barge-in: fire SPEAKING -> BARGE_IN with
-                            # the BargeInEvent payload observers need
-                            # (metrics, transcript store).
-                            barged_in = True
-                            transcript_store.last_elapsed_text = "".join(collect)
-                            machine.transition(
-                                TurnState.BARGE_IN,
-                                trigger="flux",
-                                payload=BargeInEvent(
-                                    at=asyncio.get_running_loop().time(),
-                                    source="flux",
-                                    confidence=None,
-                                ),
-                            )
-                            # Cancel playback as the (#71-stubbed) TTS
-                            # cancel. #71 replaces this with the
-                            # destructive-cancel ADR-0005 Decision 3
-                            # specifies.
-                            if not playback_task.done():
-                                playback_task.cancel()
-                        else:
-                            # Clean playback end — surface any error
-                            # the playback task raised (would be a
-                            # Phase-5-handled exception type).
+                        if first_chunk_waiter not in pre_done:
+                            # Empty-stream path: audio.playback
+                            # consumed the whole synth iterator
+                            # without observing a chunk, OR it
+                            # raised before any chunk arrived.
+                            # Drain the waiter inline so the inner
+                            # finally's guard sees ``done()`` and
+                            # skips re-cancel.
+                            if not first_chunk_waiter.done():
+                                first_chunk_waiter.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await first_chunk_waiter
+                            # If playback raised, surface it — the
+                            # outer Phase-5 typed-exception handlers
+                            # own the recovery (net / tts / etc).
                             if playback_task.exception() is not None:
                                 raise playback_task.exception()
-                            transcript_store.last_elapsed_text = "".join(collect)
+                            # Genuine empty stream — "LLM produced
+                            # nothing speakable" per #87 + ADR-0005.
+                            # The (THINKING, LISTENING) edge is
+                            # already in ``_LEGAL_TRANSITIONS``
+                            # (agent/turn_state.py:132). Pop + continue
+                            # after the finally runs — role-alternation
+                            # parity with the SIGINT / net / tts
+                            # recoverable aborts below (L583-644 of
+                            # pre-#87 loop.py).
+                            no_reply = True
                             machine.transition(TurnState.LISTENING, trigger="loop")
+                        else:
+                            # First chunk observed — Lily is actually
+                            # about to make sound. Transition for
+                            # real and spawn the mic + detector +
+                            # waiter.
+                            machine.transition(TurnState.SPEAKING, trigger="loop")
+
+                            # Hoist the mic generator so we can
+                            # explicitly ``aclose()`` it in the
+                            # finally after cancelling the detector
+                            # task. ``async for`` inside ``_mic_pump``
+                            # does NOT call ``aclose()`` on
+                            # cancellation, so the ``RawInputStream``
+                            # held by ``audio.capture()`` would stay
+                            # open until the async generator's
+                            # finalization runs — unbounded delay on
+                            # Windows. Mirrors the
+                            # ``ptt_iter.aclose()`` pattern in
+                            # voice_loop's outer finally.
+                            barge_in_mic = audio.capture()
+                            detect_task = asyncio.create_task(
+                                stt.detect_barge_in(barge_in_mic, machine.barge_in_event),
+                                name="voice-loop-barge-in-detector",
+                            )
+                            barge_in_waiter = asyncio.create_task(
+                                machine.barge_in_event.wait(),
+                                name="voice-loop-barge-in-waiter",
+                            )
+                            phase5_tasks = (detect_task, playback_task, barge_in_waiter)
+                            done, _pending = await asyncio.wait(
+                                {playback_task, barge_in_waiter},
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if barge_in_waiter in done:
+                                # Barge-in: fire SPEAKING -> BARGE_IN
+                                # with the BargeInEvent payload
+                                # observers need (metrics, transcript
+                                # store).
+                                barged_in = True
+                                transcript_store.last_elapsed_text = "".join(collect)
+                                machine.transition(
+                                    TurnState.BARGE_IN,
+                                    trigger="flux",
+                                    payload=BargeInEvent(
+                                        at=asyncio.get_running_loop().time(),
+                                        source="flux",
+                                        confidence=None,
+                                    ),
+                                )
+                                # Cancel playback as the (#71-stubbed)
+                                # TTS cancel. #71 replaces this with
+                                # the destructive-cancel ADR-0005
+                                # Decision 3 specifies.
+                                if not playback_task.done():
+                                    playback_task.cancel()
+                            else:
+                                # Clean playback end — surface any
+                                # error the playback task raised
+                                # (would be a Phase-5-handled
+                                # exception type).
+                                if playback_task.exception() is not None:
+                                    raise playback_task.exception()
+                                transcript_store.last_elapsed_text = "".join(collect)
+                                machine.transition(TurnState.LISTENING, trigger="loop")
                     finally:
-                        # Drain all three sibling tasks. detect_task
+                        # CR #92 F2: pre-roll playback_task cleanup —
+                        # on a SIGINT (or any exception) between
+                        # ``playback_task = create_task(...)`` and
+                        # phase5_tasks being assigned on the SPEAKING
+                        # branch, playback_task would otherwise leak
+                        # and keep consuming its synth stream across
+                        # turns. ``not in phase5_tasks`` guard skips
+                        # the double-cleanup on the SPEAKING path
+                        # where the drain loop below already handles
+                        # it.
+                        if (
+                            playback_task is not None
+                            and not playback_task.done()
+                            and playback_task not in phase5_tasks
+                        ):
+                            playback_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError, Exception):
+                                await playback_task
+                        # #87: first_chunk_waiter cleanup — guarded by
+                        # ``is not None`` so an exception before its
+                        # create_task doesn't trip, and ``not done()``
+                        # so the empty-stream path (which already
+                        # drained it inline) + the normal path (where
+                        # it fired naturally) both avoid double-cancel.
+                        if first_chunk_waiter is not None and not first_chunk_waiter.done():
+                            first_chunk_waiter.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await first_chunk_waiter
+                        # Drain phase5_tasks on the SPEAKING path.
+                        # Empty-stream path leaves phase5_tasks as
+                        # () so this loop is a no-op there. detect_task
                         # exceptions are swallowed with WARNING — a
                         # dead Flux session during SPEAKING is
                         # recoverable (user hears Lily, loses only
@@ -536,8 +672,21 @@ async def voice_loop() -> int:
                         # audio.capture() releases now, not at async-
                         # generator finalization time (which can be
                         # unbounded on Windows). CodeRabbit #86 F2.
-                        with contextlib.suppress(Exception):
-                            await barge_in_mic.aclose()
+                        # Empty-stream path never calls audio.capture(),
+                        # so guard with ``is not None``.
+                        if barge_in_mic is not None:
+                            with contextlib.suppress(Exception):
+                                await barge_in_mic.aclose()
+                    if no_reply:
+                        # #87: LLM produced nothing speakable. Drop
+                        # the pending Phase-4 user turn + continue
+                        # — role-alternation parity with the SIGINT,
+                        # net-error, and tts-error recoverable
+                        # abort paths further down this except
+                        # chain.
+                        print("[no reply]")
+                        messages.pop()
+                        continue
                     if barged_in:
                         # BARGE_IN -> LISTENING follows the cancel.
                         # #71 will own the ordering with the real
