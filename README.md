@@ -317,6 +317,25 @@ keys into a chat or public log.
 
 ---
 
+## Where FRIDAY stores data
+
+FRIDAY keeps its on-disk state (conversation history, memory
+store) in a platform-appropriate directory, created with
+user-only permissions (``0o700``) on first run:
+
+- **Linux:** ``$XDG_DATA_HOME/friday`` if set, otherwise
+  ``~/.local/share/friday``.
+- **macOS:** ``~/Library/Application Support/friday``.
+- **Windows:** ``%APPDATA%\friday`` if set, otherwise
+  ``~/.friday``.
+
+On an unrecognized platform, FRIDAY falls back to ``~/.friday``.
+
+This directory is created automatically; delete it to wipe
+FRIDAY's memory between sessions.
+
+---
+
 ## Contributing
 
 This is a personal project, but PRs and ideas are welcome. If you're building something similar or want to fork it for your own assistant:
