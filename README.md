@@ -319,9 +319,10 @@ keys into a chat or public log.
 
 ## Where FRIDAY stores data
 
-FRIDAY keeps its on-disk state (conversation history, memory
-store) in a platform-appropriate directory, created with
-user-only permissions (``0o700``) on first run:
+Once the Tier 4 persistence modules land (ADR-0006), FRIDAY will
+keep its on-disk state (conversation history, memory store) in a
+platform-appropriate directory, created with user-only
+permissions (``0o700``) on first run:
 
 - **Linux:** ``$XDG_DATA_HOME/friday`` if set, otherwise
   ``~/.local/share/friday``.
@@ -331,8 +332,9 @@ user-only permissions (``0o700``) on first run:
 
 On an unrecognized platform, FRIDAY falls back to ``~/.friday``.
 
-This directory is created automatically; delete it to wipe
-FRIDAY's memory between sessions.
+Once persistence lands, this directory will be created
+automatically on first run; delete it to wipe FRIDAY's memory
+between sessions.
 
 ---
 

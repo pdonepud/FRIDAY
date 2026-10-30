@@ -111,3 +111,24 @@ def test_get_data_dir_sets_restrictive_perms_on_posix(monkeypatch, tmp_path):
     result = get_data_dir()
     mode = stat.S_IMODE(result.stat().st_mode)
     assert mode == 0o700, f"expected 0o700, got {oct(mode)}"
+
+
+def test_get_data_dir_raises_notadirectoryerror_when_target_is_a_file(monkeypatch, tmp_path):
+    """#73 CR F1: if a regular file occupies the target path,
+    get_data_dir() raises NotADirectoryError with the path in
+    the message — not a silent-return-the-file-path path that
+    would surface as a confusing error at the first consumer's
+    compose site."""
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    target = xdg / "friday"
+    target.write_text("stray file at the data-dir path")
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+
+    with pytest.raises(NotADirectoryError) as exc_info:
+        get_data_dir()
+
+    # Path appears in the message so the failure points at the
+    # real cause, not a generic "it exists but isn't a dir".
+    assert str(target) in str(exc_info.value)

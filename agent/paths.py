@@ -54,8 +54,18 @@ def get_data_dir() -> Path:
     try:
         data_dir.mkdir(parents=True, mode=0o700)
     except FileExistsError:
-        # Already exists — don't re-chmod. A user may have
+        # #73 CR F1: FileExistsError without exist_ok=True fires for
+        # both "directory already exists" AND "regular file occupies
+        # this path". Only the first case is legitimate idempotent
+        # reuse; the second violates the docstring's "guaranteed to
+        # be a directory" promise and would surface as a confusing
+        # NotADirectoryError at the first consumer's compose site
+        # (e.g. ``data_dir / "session.json"`` in #75). Raise
+        # explicitly here, with the path in the message, so the
+        # failure points at the real cause.
+        if not data_dir.is_dir():
+            raise NotADirectoryError(f"{data_dir} exists but is not a directory") from None
+        # Directory already exists — don't re-chmod. A user may have
         # intentionally relaxed perms (e.g. a shared account);
         # idempotent reuse preserves that.
-        pass
     return data_dir
