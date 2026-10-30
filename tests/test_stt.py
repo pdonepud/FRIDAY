@@ -1871,8 +1871,15 @@ async def test_detect_barge_in_rearms_on_second_startofturn(monkeypatch, fast_ba
     task = asyncio.create_task(
         detect_barge_in(_mock_mic(), barge_in_event, confirmation_ms=fast_bargein_confirm)
     )
-    await asyncio.sleep(confirm_s * 4)
-    assert barge_in_event.is_set(), "re-armed window should have confirmed"
+    # #88 (follow-up to #86 CR F5): the fake WS schedules ~67.5 ms
+    # of delay before the Update arrives (confirm_s * 2 + confirm_s / 4
+    # with confirm_s = fast_bargein_confirm / 1000), leaving ~52.5 ms
+    # of margin inside the old 120 ms sleep. Loaded runners can slip
+    # past the budget. wait_for passes as soon as the detector
+    # confirms; TimeoutError (if the event never fires) is the test
+    # failure signal with a clear line number — no explicit assert
+    # needed.
+    await asyncio.wait_for(barge_in_event.wait(), timeout=confirm_s * 10)
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
