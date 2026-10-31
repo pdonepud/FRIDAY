@@ -37,14 +37,36 @@ def get_data_dir() -> Path:
             be a directory after this call returns.
     """
     if sys.platform.startswith("linux"):
-        xdg = os.environ.get("XDG_DATA_HOME", "").strip()
-        base = Path(xdg) if xdg else Path.home() / ".local" / "share"
+        # #73 CR R2:
+        # F1 — ``.strip()`` on the env value mangles paths with
+        #   legitimate leading/trailing whitespace (POSIX allows
+        #   almost any character in filenames). Trim ONLY for the
+        #   is-set check; pass the raw value through to Path.
+        # F2 — the XDG Base Directory Spec requires relative values
+        #   to be ignored and the default used instead (see
+        #   https://specifications.freedesktop.org/basedir-spec/latest/).
+        #   Without ``os.path.isabs`` check, calls from different
+        #   working directories would select different storage
+        #   locations, breaking the single-data-directory guarantee.
+        xdg = os.environ.get("XDG_DATA_HOME", "")
+        if xdg.strip() and os.path.isabs(xdg):
+            base = Path(xdg)
+        else:
+            base = Path.home() / ".local" / "share"
         data_dir = base / "friday"
     elif sys.platform == "darwin":
         data_dir = Path.home() / "Library" / "Application Support" / "friday"
     elif sys.platform.startswith("win"):
-        appdata = os.environ.get("APPDATA", "").strip()
-        if appdata:
+        # #73 CR R2: same F1 + F2 treatment as the Linux branch
+        # above. APPDATA is not XDG-governed and is almost always
+        # set by Windows to an absolute path, but the same two
+        # correctness concerns apply in theory — a user with a
+        # whitespace-prefixed APPDATA or a shell-constructed
+        # relative APPDATA would otherwise silently select a
+        # non-canonical storage location. Mirror the Linux
+        # treatment for consistency.
+        appdata = os.environ.get("APPDATA", "")
+        if appdata.strip() and os.path.isabs(appdata):
             data_dir = Path(appdata) / "friday"
         else:
             data_dir = Path.home() / ".friday"

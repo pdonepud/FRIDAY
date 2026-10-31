@@ -132,3 +132,59 @@ def test_get_data_dir_raises_notadirectoryerror_when_target_is_a_file(monkeypatc
     # Path appears in the message so the failure points at the
     # real cause, not a generic "it exists but isn't a dir".
     assert str(target) in str(exc_info.value)
+
+
+def test_get_data_dir_linux_ignores_relative_xdg_data_home(monkeypatch, tmp_path):
+    """#73 CR R2 F2: per the XDG Base Directory Spec, a relative
+    ``$XDG_DATA_HOME`` must be ignored and the default used.
+    Otherwise calls from different working directories would
+    select different storage locations, breaking the
+    single-data-directory guarantee."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", "relative/data/home")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    result = get_data_dir()
+    assert result == tmp_path / ".local" / "share" / "friday"
+    assert result.is_dir()
+
+
+def test_get_data_dir_linux_preserves_whitespace_in_xdg_data_home(monkeypatch, tmp_path):
+    """#73 CR R2 F1: an absolute XDG path with internal whitespace
+    (POSIX allows this) must pass through to Path unchanged, not
+    stripped."""
+    xdg = tmp_path / "xdg with spaces"
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+    result = get_data_dir()
+    assert result == xdg / "friday"
+    assert result.is_dir()
+
+
+def test_get_data_dir_linux_whitespace_only_xdg_falls_back(monkeypatch, tmp_path):
+    """#73 CR R2 F1: whitespace-only ``$XDG_DATA_HOME`` is treated
+    as unset — the empty-vs-whitespace distinction uses
+    ``.strip()`` for the is-set check without stripping the actual
+    value passed to Path."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", "   ")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    result = get_data_dir()
+    assert result == tmp_path / ".local" / "share" / "friday"
+    assert result.is_dir()
+
+
+def test_get_data_dir_windows_ignores_relative_appdata(monkeypatch, tmp_path):
+    """#73 CR R2: Windows APPDATA branch gets the same relative-
+    rejection treatment as the Linux XDG branch for symmetry —
+    a relative APPDATA (unusual in practice but possible from a
+    shell-constructed env) must fall back rather than select a
+    CWD-relative location."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("APPDATA", "relative\\appdata")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    result = get_data_dir()
+    assert result == tmp_path / ".friday"
+    assert result.is_dir()
