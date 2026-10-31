@@ -188,3 +188,19 @@ def test_get_data_dir_windows_ignores_relative_appdata(monkeypatch, tmp_path):
     result = get_data_dir()
     assert result == tmp_path / ".friday"
     assert result.is_dir()
+
+
+def test_get_data_dir_windows_rejects_drive_relative_appdata(monkeypatch, tmp_path):
+    """#73 CR R3 F1: on Windows, ``os.path.isabs(r"\\data")``
+    returns True on Python versions before 3.11.10 / 3.12.4,
+    incorrectly accepting a drive-relative path whose resolved
+    location depends on the current drive. ``Path.is_absolute()``
+    correctly rejects such paths — a drive-relative APPDATA must
+    fall back to ``~/.friday``."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("APPDATA", r"\data")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    result = get_data_dir()
+    assert result == tmp_path / ".friday"
+    assert result.is_dir()

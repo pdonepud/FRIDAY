@@ -8,10 +8,13 @@ and reused idempotently on subsequent calls.
 
 Path convention:
 
-* Linux: ``$XDG_DATA_HOME/friday`` if the env var is set and
-  non-empty, else ``~/.local/share/friday``.
+* Linux: ``$XDG_DATA_HOME/friday`` if the env var is set to an
+  absolute path, else ``~/.local/share/friday`` (per the XDG
+  Base Directory Spec, relative values are ignored).
 * macOS: ``~/Library/Application Support/friday``.
-* Windows: ``%APPDATA%\\friday`` if the env var is set, else
+* Windows: ``%APPDATA%\\friday`` if the env var is set to an
+  absolute path (checked via ``Path.is_absolute()``, which
+  rejects drive-relative values like ``\\data``), else
   ``~/.friday``.
 * Unknown platform: ``~/.friday``.
 """
@@ -45,11 +48,18 @@ def get_data_dir() -> Path:
         # F2 — the XDG Base Directory Spec requires relative values
         #   to be ignored and the default used instead (see
         #   https://specifications.freedesktop.org/basedir-spec/latest/).
-        #   Without ``os.path.isabs`` check, calls from different
+        #   Without an absolute-path check, calls from different
         #   working directories would select different storage
         #   locations, breaking the single-data-directory guarantee.
+        # CR R3 F1: switched from ``os.path.isabs`` to
+        # ``Path.is_absolute()`` because the former returns True for
+        # drive-relative Windows paths (``\data``) on Python versions
+        # before 3.11.10 / 3.12.4, which defeats the single-storage-
+        # location guarantee for launches from different drives. The
+        # pathlib check correctly rejects such paths regardless of
+        # Python version.
         xdg = os.environ.get("XDG_DATA_HOME", "")
-        if xdg.strip() and os.path.isabs(xdg):
+        if xdg.strip() and Path(xdg).is_absolute():
             base = Path(xdg)
         else:
             base = Path.home() / ".local" / "share"
@@ -65,8 +75,15 @@ def get_data_dir() -> Path:
         # relative APPDATA would otherwise silently select a
         # non-canonical storage location. Mirror the Linux
         # treatment for consistency.
+        # CR R3 F1: switched from ``os.path.isabs`` to
+        # ``Path.is_absolute()`` because the former returns True for
+        # drive-relative Windows paths (``\data``) on Python versions
+        # before 3.11.10 / 3.12.4, which defeats the single-storage-
+        # location guarantee for launches from different drives. The
+        # pathlib check correctly rejects such paths regardless of
+        # Python version.
         appdata = os.environ.get("APPDATA", "")
-        if appdata.strip() and os.path.isabs(appdata):
+        if appdata.strip() and Path(appdata).is_absolute():
             data_dir = Path(appdata) / "friday"
         else:
             data_dir = Path.home() / ".friday"
