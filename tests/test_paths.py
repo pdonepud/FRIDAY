@@ -8,6 +8,7 @@ POSIX-only restrictive-permissions assertion.
 
 from __future__ import annotations
 
+import os
 import stat
 import sys
 
@@ -204,3 +205,27 @@ def test_get_data_dir_windows_rejects_drive_relative_appdata(monkeypatch, tmp_pa
     result = get_data_dir()
     assert result == tmp_path / ".friday"
     assert result.is_dir()
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="umask has no effect on Windows file-mode bits",
+)
+def test_get_data_dir_posix_perms_survive_hostile_umask(monkeypatch, tmp_path):
+    """#73 CR R4 F1: Path.mkdir(mode=0o700) is subject to the
+    process umask — under a hostile umask like 0o700 the raw
+    mkdir would produce mode 0o000 and the directory would be
+    unusable by its owner. The explicit chmod after mkdir forces
+    0o700 independent of umask."""
+    xdg = tmp_path / "xdg"
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+    # 0o700 masks ALL owner bits — hostile. Without the chmod
+    # fix, mkdir would produce 0o000 (0o700 & ~0o700 == 0o000).
+    original_umask = os.umask(0o700)
+    try:
+        result = get_data_dir()
+    finally:
+        os.umask(original_umask)
+    mode = stat.S_IMODE(result.stat().st_mode)
+    assert mode == 0o700, f"expected 0o700 under hostile umask 0o700, got {oct(mode)}"

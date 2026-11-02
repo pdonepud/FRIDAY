@@ -3,8 +3,11 @@
 Provides :func:`get_data_dir`, the single helper every Tier 4
 persistence module (``session.json``, ``memory.db``) uses to
 locate FRIDAY's on-disk state. The returned directory is created
-with restrictive permissions (``0o700`` on POSIX) on first call
-and reused idempotently on subsequent calls.
+on first call with restrictive permissions (``0o700`` on POSIX,
+applied via explicit ``chmod`` after ``mkdir`` so the mode is
+independent of the process umask; Windows ACL behavior is
+Python-version-dependent — see the README). Subsequent calls
+reuse the directory idempotently without touching permissions.
 
 Path convention:
 
@@ -92,6 +95,17 @@ def get_data_dir() -> Path:
 
     try:
         data_dir.mkdir(parents=True, mode=0o700)
+        # #73 CR R4 F1: Path.mkdir(mode=0o700) is subject to the
+        # process umask — the actual mode is ``0o700 & ~umask``.
+        # Under a hostile umask like 0o700 the result is 0o000 and
+        # the directory is unusable by its owner, violating the
+        # documented permission guarantee. Explicit chmod after
+        # mkdir forces 0o700 independent of umask. POSIX-only:
+        # chmod with mode bits is a no-op on Windows (NTFS uses
+        # ACLs; see the README's Windows paragraph for the
+        # Python-version-dependent ACL behavior).
+        if sys.platform != "win32":
+            data_dir.chmod(0o700)
     except FileExistsError:
         # #73 CR F1: FileExistsError without exist_ok=True fires for
         # both "directory already exists" AND "regular file occupies

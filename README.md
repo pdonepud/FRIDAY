@@ -334,11 +334,18 @@ platform-appropriate directory, created on first run:
 On an unrecognized platform, FRIDAY falls back to ``~/.friday``.
 
 On POSIX systems (Linux and macOS), FRIDAY creates the directory
-with user-only permissions (``0o700``). On Windows, directory
-permissions follow the parent's ACL inheritance — FRIDAY does
-not set explicit ACLs, and mode bits passed to ``mkdir`` are not
-equivalent to a restrictive ACL on Windows versions before
-Python 3.11.10 / 3.12.4.
+with user-only permissions (``0o700``), applied via explicit
+``chmod`` after creation so the result is independent of the
+process umask. On Windows, FRIDAY does not set explicit ACLs —
+the applied ACL depends on the Python version:
+
+- **Python 3.11.0–3.11.9 and 3.12.0–3.12.3:** the new directory
+  inherits the parent directory's ACL.
+- **Python 3.11.10+ and 3.12.4+:** ``Path.mkdir`` applies an ACL
+  granting access to the current user and administrators.
+
+Mode bits passed to ``mkdir`` do not map to NTFS ACLs on any
+Windows Python version.
 
 Once persistence lands, this directory will be created
 automatically on first run; delete it to wipe FRIDAY's memory
