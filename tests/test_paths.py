@@ -218,6 +218,14 @@ def test_get_data_dir_posix_perms_survive_hostile_umask(monkeypatch, tmp_path):
     unusable by its owner. The explicit chmod after mkdir forces
     0o700 independent of umask."""
     xdg = tmp_path / "xdg"
+    # Pre-create the XDG parent so the hostile umask only affects
+    # the leaf (``friday``) directory — matches realistic
+    # deployment where ``$XDG_DATA_HOME`` or ``~/.local/share``
+    # already exists. Without this, ``mkdir(parents=True)`` would
+    # create ``xdg`` under umask too, giving it mode 0o000 and
+    # blocking leaf creation with PermissionError before the
+    # chmod guarantee is even reached.
+    xdg.mkdir()
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
     # 0o700 masks ALL owner bits — hostile. Without the chmod
