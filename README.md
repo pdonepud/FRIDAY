@@ -317,6 +317,42 @@ keys into a chat or public log.
 
 ---
 
+## Where FRIDAY stores data
+
+Once the Tier 4 persistence modules land (ADR-0006), FRIDAY will
+keep its on-disk state (conversation history, memory store) in a
+platform-appropriate directory, created on first run:
+
+- **Linux:** ``$XDG_DATA_HOME/friday`` if set to an absolute
+  path, otherwise ``~/.local/share/friday``. Per the XDG Base
+  Directory Spec, a relative ``$XDG_DATA_HOME`` is ignored.
+- **macOS:** ``~/Library/Application Support/friday``.
+- **Windows:** ``%APPDATA%\friday`` if set to an absolute path,
+  otherwise ``~/.friday``. Drive-relative values (e.g.
+  ``\data``) are rejected.
+
+On an unrecognized platform, FRIDAY falls back to ``~/.friday``.
+
+On POSIX systems (Linux and macOS), FRIDAY creates the directory
+with user-only permissions (``0o700``), applied via explicit
+``chmod`` after creation so the result is independent of the
+process umask. On Windows, FRIDAY does not set explicit ACLs —
+the applied ACL depends on the Python version:
+
+- **Python 3.11.0–3.11.9 and 3.12.0–3.12.3:** the new directory
+  inherits the parent directory's ACL.
+- **Python 3.11.10+ and 3.12.4+:** ``Path.mkdir`` applies an ACL
+  granting access to the current user and administrators.
+
+Mode bits passed to ``mkdir`` do not map to NTFS ACLs on any
+Windows Python version.
+
+Once persistence lands, this directory will be created
+automatically on first run; delete it to wipe FRIDAY's memory
+between sessions.
+
+---
+
 ## Contributing
 
 This is a personal project, but PRs and ideas are welcome. If you're building something similar or want to fork it for your own assistant:
