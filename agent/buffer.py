@@ -111,8 +111,22 @@ class Turn:
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
-        if self.role not in _ROLES:
+        # #74 CR F2: ``_ROLES`` is a frozenset — an unhashable role
+        # (list, dict) would raise TypeError from the ``in`` lookup
+        # instead of the ValueError the docstring promises. The
+        # ``isinstance(..., str)`` guard runs first so non-strings
+        # fail with ValueError like any other invalid role.
+        if not isinstance(self.role, str) or self.role not in _ROLES:
             raise ValueError(f"Turn.role must be one of {sorted(_ROLES)}; got {self.role!r}")
+        # #74 CR F1: the class docstring requires a timezone-aware
+        # ``timestamp`` ("Must be timezone-aware"). The default
+        # (datetime.now(UTC)) satisfies this, but an explicit
+        # ``datetime(2026, 1, 1, 12, 0)`` without ``tzinfo`` would
+        # slip through silently. Validate the invariant so callers
+        # fail fast at construction instead of surfacing timezone
+        # bugs at serialization or comparison sites later.
+        if self.timestamp.tzinfo is None:
+            raise ValueError(f"Turn.timestamp must be timezone-aware; got {self.timestamp!r}")
 
     def to_message(self) -> dict[str, str]:
         """Return the Anthropic Messages API representation.

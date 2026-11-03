@@ -63,6 +63,44 @@ def test_turn_accepts_valid_roles(good_role):
     assert turn.role == good_role
 
 
+def test_turn_rejects_naive_timestamp():
+    """#74 CR F1: the Turn docstring requires a timezone-aware
+    timestamp. A naive datetime (no tzinfo) must raise ValueError
+    at construction so callers fail fast rather than surface a
+    timezone bug at serialization / comparison time later."""
+    naive = datetime(2026, 1, 1, 12, 0)  # no tzinfo
+    with pytest.raises(ValueError, match="timezone-aware"):
+        Turn(role="user", content="hi", timestamp=naive)
+
+
+def test_turn_accepts_explicit_utc_timestamp_still_works():
+    """Sanity check that the F1 guard didn't break the explicit-
+    timestamp path for a legitimate tz-aware value."""
+    when = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    turn = Turn(role="user", content="hi", timestamp=when)
+    assert turn.timestamp == when
+
+
+@pytest.mark.parametrize(
+    "bad_role",
+    [
+        None,
+        42,
+        ["user"],  # list — would TypeError on frozenset lookup
+        {"user": True},  # dict — same
+        ("user",),  # tuple — hashable but still invalid
+        object(),  # arbitrary non-string
+    ],
+)
+def test_turn_rejects_non_string_role_with_valueerror(bad_role):
+    """#74 CR F2: non-string roles (including unhashable types
+    like list and dict) must raise ValueError, matching the
+    docstring. The old implementation raised TypeError on
+    unhashable types from the frozenset ``in`` lookup."""
+    with pytest.raises(ValueError, match="Turn.role must be"):
+        Turn(role=bad_role, content="x")  # type: ignore[arg-type]
+
+
 # -----------------------------------------------------------------
 # Turn message + token_count
 # -----------------------------------------------------------------
