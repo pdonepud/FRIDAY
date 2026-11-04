@@ -163,9 +163,26 @@ def test_save_session_file_mode_is_0o600_on_posix(tmp_path):
     assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
 
 
+def test_save_session_logs_warning_on_unicode_error_no_raise(tmp_path, caplog):
+    """#75 CR F1: a Turn containing a lone surrogate (non-UTF-8-encodable
+    code point) in its content must not escape ``save_session`` as a
+    ``UnicodeEncodeError`` from json.dump — the save path is called
+    from atexit and must never raise."""
+    caplog.set_level(logging.WARNING, logger="agent.session")
+    path = tmp_path / "session.json"
+    buf = ConversationBuffer(turn_limit=5)
+    buf.append(Turn(role="user", content="\ud800"))  # lone high surrogate
+
+    # Must not raise.
+    save_session(buf, path)
+
+    assert not path.exists()
+    assert any("session save failed" in rec.message for rec in caplog.records)
+
+
 @pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="POSIX-only — chmod 0o500 doesn't restrict writes on Windows",
+    sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="POSIX-only, non-root — chmod doesn't restrict root or apply on Windows",
 )
 def test_save_session_logs_warning_on_permission_error_no_raise(tmp_path, caplog):
     """A non-writable parent directory logs WARNING and does NOT raise."""
@@ -209,15 +226,28 @@ def test_load_session_corrupt_json_returns_empty_logs_warning(tmp_path, caplog):
     assert any("corrupt" in rec.message for rec in caplog.records)
 
 
+def test_load_session_invalid_utf8_returns_empty_logs_warning(tmp_path, caplog):
+    """#75 CR F2: a session.json that is not valid UTF-8 raises
+    ``UnicodeDecodeError`` from ``read_text``. The load path must
+    treat it as corrupt — WARNING + empty buffer, no escape."""
+    caplog.set_level(logging.WARNING, logger="agent.session")
+    path = tmp_path / "session.json"
+    path.write_bytes(b"\xff\xfe\xff\x80")  # invalid UTF-8 byte sequence
+
+    buf = load_session(path, turn_limit=5)
+    assert len(buf) == 0
+    assert any("session load read failed" in rec.message for rec in caplog.records)
+
+
 def test_load_session_missing_version_field_returns_empty_logs_warning(tmp_path, caplog):
-    """A payload without a 'version' field is treated as unknown version."""
+    """A payload without a 'version' field is treated as unsupported."""
     caplog.set_level(logging.WARNING, logger="agent.session")
     path = tmp_path / "session.json"
     path.write_text(json.dumps({"turns": []}), encoding="utf-8")
 
     buf = load_session(path, turn_limit=5)
     assert len(buf) == 0
-    assert any("unknown version" in rec.message for rec in caplog.records)
+    assert any("unsupported schema version" in rec.message for rec in caplog.records)
 
 
 def test_load_session_unknown_version_returns_empty_logs_warning(tmp_path, caplog):
@@ -228,7 +258,35 @@ def test_load_session_unknown_version_returns_empty_logs_warning(tmp_path, caplo
 
     buf = load_session(path, turn_limit=5)
     assert len(buf) == 0
-    assert any("unknown version" in rec.message for rec in caplog.records)
+    assert any("unsupported schema version" in rec.message for rec in caplog.records)
+
+
+def test_load_session_bool_version_treated_as_corrupt(tmp_path, caplog):
+    """#75 CR F4: ``bool`` is a subclass of ``int`` in Python and
+    ``True == 1`` is True, so a naive equality check would accept
+    ``{"version": True}``. The ``type(v) is int`` guard must reject
+    this."""
+    caplog.set_level(logging.WARNING, logger="agent.session")
+    path = tmp_path / "session.json"
+    path.write_text(json.dumps({"version": True, "turns": []}), encoding="utf-8")
+
+    buf = load_session(path, turn_limit=5)
+    assert len(buf) == 0
+    assert any("unsupported schema version" in rec.message for rec in caplog.records)
+
+
+def test_load_session_float_version_treated_as_corrupt(tmp_path, caplog):
+    """#75 CR F4: ``1.0 == 1`` is True in Python, so an equality-only
+    check would silently accept ``{"version": 1.0}``. The
+    ``type(v) is int`` guard must reject non-int versions even when
+    numerically equal to the schema constant."""
+    caplog.set_level(logging.WARNING, logger="agent.session")
+    path = tmp_path / "session.json"
+    path.write_text(json.dumps({"version": 1.0, "turns": []}), encoding="utf-8")
+
+    buf = load_session(path, turn_limit=5)
+    assert len(buf) == 0
+    assert any("unsupported schema version" in rec.message for rec in caplog.records)
 
 
 def test_load_session_bad_turn_naive_timestamp_discards_whole_file(tmp_path, caplog):
@@ -283,8 +341,11 @@ def test_load_session_bad_turn_invalid_role_discards_whole_file(tmp_path, caplog
     assert any("bad turn" in rec.message for rec in caplog.records)
 
 
-def test_load_session_bad_turn_missing_field_discards_whole_file(tmp_path, caplog):
-    """A turn missing a required field → KeyError → whole file discarded."""
+def test_load_session_bad_turn_non_string_content_discards_whole_file(tmp_path, caplog):
+    """#75 CR F5: Turn construction accepts ``content`` of any type
+    (buffer.py doesn't validate it), so the loader must reject a
+    non-string content field before calling Turn — matches the
+    "wrong fields discard whole file" contract."""
     caplog.set_level(logging.WARNING, logger="agent.session")
     path = tmp_path / "session.json"
     path.write_text(
@@ -292,7 +353,55 @@ def test_load_session_bad_turn_missing_field_discards_whole_file(tmp_path, caplo
             {
                 "version": SCHEMA_VERSION,
                 "turns": [
-                    {"role": "user", "timestamp": "2026-11-03T14:00:00+00:00"},  # no content
+                    {
+                        "role": "user",
+                        "content": 123,  # int, not str
+                        "timestamp": "2026-11-04T12:00:00+00:00",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    buf = load_session(path, turn_limit=5)
+    assert len(buf) == 0
+    assert any("content is not a string" in rec.message for rec in caplog.records)
+
+
+def test_load_session_bad_turn_non_dict_entry_discards_whole_file(tmp_path, caplog):
+    """#75 CR F5: a non-object entry in ``turns`` (e.g. a bare string
+    or a list) must be rejected before Turn construction."""
+    caplog.set_level(logging.WARNING, logger="agent.session")
+    path = tmp_path / "session.json"
+    path.write_text(
+        json.dumps({"version": SCHEMA_VERSION, "turns": ["not a turn object"]}),
+        encoding="utf-8",
+    )
+
+    buf = load_session(path, turn_limit=5)
+    assert len(buf) == 0
+    assert any("turn is not an object" in rec.message for rec in caplog.records)
+
+
+def test_load_session_bad_turn_missing_field_discards_whole_file(tmp_path, caplog):
+    """A turn missing a required field → KeyError at Turn construction
+    → whole file discarded.
+
+    Probes the ``timestamp`` key specifically (not ``content``) so the
+    #75 CR F5 content-shape guard doesn't short-circuit the test — F5
+    rejects a non-string content at an earlier validation layer with
+    a more specific message; the generic ``bad turn`` message is still
+    what Turn's own KeyError path produces.
+    """
+    caplog.set_level(logging.WARNING, logger="agent.session")
+    path = tmp_path / "session.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": SCHEMA_VERSION,
+                "turns": [
+                    {"role": "user", "content": "ok"},  # no timestamp
                 ],
             }
         ),
@@ -330,8 +439,8 @@ def test_load_session_top_level_not_dict_returns_empty_logs_warning(tmp_path, ca
 
 
 @pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="POSIX-only — chmod 0o000 doesn't restrict reads on Windows",
+    sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="POSIX-only, non-root — chmod doesn't restrict root or apply on Windows",
 )
 def test_load_session_permission_error_returns_empty_logs_warning(tmp_path, caplog):
     """Permission denied on read → WARNING + empty buffer."""

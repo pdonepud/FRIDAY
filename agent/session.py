@@ -136,7 +136,13 @@ def save_session(buffer: ConversationBuffer, path: Path) -> None:
             os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, path)
         replaced = True
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
+        # #75 CR F1: a lone surrogate (or any non-UTF-8-encodable code
+        # point) in Turn.content raises UnicodeEncodeError from
+        # json.dump during the write. The docstring promises the save
+        # path logs a warning and never crashes shutdown; without
+        # UnicodeError in this tuple the exception would escape past
+        # atexit and surface a traceback on exit.
         _log.warning("session save failed at %s: %s", path, exc)
     finally:
         if tmp_path is not None and not replaced:
@@ -152,7 +158,11 @@ def load_session(
 ) -> ConversationBuffer:
     """Reconstruct a :class:`ConversationBuffer` from ``path``.
 
-    Missing file → empty buffer, silent (expected on first run).
+    A missing file is treated as a first-run / clean-install signal
+    and returns an empty buffer silently (no warning logged). Corrupt,
+    unreadable (non-ENOENT), or bad-schema files log a WARNING. This
+    refines ADR-0006 §Short-term's "corrupt or missing" wording.
+
     Any corruption (JSON error, wrong schema version, missing/wrong
     fields, invalid turn) → WARNING + empty buffer, matching the ADR's
     "discard if corrupt" posture.
@@ -166,7 +176,13 @@ def load_session(
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return ConversationBuffer(turn_limit=turn_limit)
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
+        # #75 CR F2: a session.json that is not valid UTF-8 (corruption,
+        # a partial write from an older power-loss, a hand-edit in the
+        # wrong encoding) raises UnicodeDecodeError from read_text,
+        # which otherwise would escape past this handler and crash the
+        # loop on startup. Treat it as another "corrupt" case — warn
+        # and return an empty buffer.
         _log.warning("session load read failed at %s: %s", path, exc)
         return ConversationBuffer(turn_limit=turn_limit)
 
@@ -179,12 +195,19 @@ def load_session(
     if not isinstance(payload, dict):
         _log.warning("session load corrupt at %s: top-level is not an object", path)
         return ConversationBuffer(turn_limit=turn_limit)
-    if payload.get("version") != SCHEMA_VERSION:
+    version = payload.get("version")
+    # #75 CR F4: ``type(version) is not int`` (NOT ``isinstance``) —
+    # ``bool`` is a subclass of ``int`` in Python, and ``True == 1``
+    # compares equal, so ``isinstance(True, int)`` would accept
+    # ``{"version": True}`` as valid. Similarly ``1.0 == 1`` would slip
+    # through a plain equality check. Rejecting anything whose concrete
+    # type is not exactly ``int`` closes both holes and matches the
+    # "discard if corrupt" posture.
+    if type(version) is not int or version != SCHEMA_VERSION:
         _log.warning(
-            "session load unknown version at %s: got %r, expected %d",
+            "session load corrupt at %s: unsupported schema version %r",
             path,
-            payload.get("version"),
-            SCHEMA_VERSION,
+            version,
         )
         return ConversationBuffer(turn_limit=turn_limit)
     turns_raw = payload.get("turns")
@@ -194,6 +217,20 @@ def load_session(
 
     reconstructed: list[Turn] = []
     for d in turns_raw:
+        # #75 CR F5: pre-validate shape + content type before handing
+        # to ``Turn``. Buffer.py's ``__post_init__`` enforces role and
+        # tz-awareness, but ``content`` has no runtime type check —
+        # a non-string here would silently construct a Turn that then
+        # fails later at serialization or Anthropic-API send time. The
+        # loader is the right place to reject it: match the "wrong
+        # fields discard whole file" contract used by every other
+        # shape error in this function.
+        if not isinstance(d, dict):
+            _log.warning("session load corrupt at %s: turn is not an object", path)
+            return ConversationBuffer(turn_limit=turn_limit)
+        if not isinstance(d.get("content"), str):
+            _log.warning("session load corrupt at %s: turn content is not a string", path)
+            return ConversationBuffer(turn_limit=turn_limit)
         try:
             reconstructed.append(
                 Turn(
