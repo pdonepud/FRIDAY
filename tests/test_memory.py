@@ -764,3 +764,41 @@ async def test_search_memories_implicit_and_requires_all_terms(bootstrapped_db):
     await add_memory(bootstrapped_db, kind="fact", content="coffee and tea")
     hits = await search_memories(bootstrapped_db, "coffee elephant")
     assert hits == []
+
+
+async def test_search_memories_handles_conversational_punctuation(bootstrapped_db):
+    """FTS5 rejects bare ``,`` ``'`` ``?`` ``.`` in MATCH expressions,
+    and the unicode61 tokenizer treats ``,`` as token glue creating
+    phantom adjacency requirements. The ``[\\W_]+`` strip handles both
+    — a typical conversational query round-trips cleanly to a bareword
+    MATCH with no parse error. Seed content mirrors the conversational
+    query's word bag so the implicit-AND invariant (every token must
+    appear) is satisfied — the fix is about avoiding the FTS5 parse
+    error and avoiding phantom adjacency from comma-glue, not about
+    relaxing the implicit-AND semantics."""
+    await add_memory(
+        bootstrapped_db,
+        kind="fact",
+        content="what's the meeting with Sarah tomorrow at noon",
+    )
+    hits = await search_memories(
+        bootstrapped_db,
+        "what's the meeting with Sarah, tomorrow?",
+    )
+    assert len(hits) == 1
+    assert "Sarah" in hits[0].content
+    assert "tomorrow" in hits[0].content
+
+
+async def test_search_memories_strips_underscores(bootstrapped_db):
+    """The unicode61 tokenizer treats ``_`` as a separator; the
+    normalization strips it before MATCH so a query like
+    ``machine_learning`` cleanly matches a memory whose content is
+    ``machine learning fundamentals``."""
+    await add_memory(
+        bootstrapped_db,
+        kind="fact",
+        content="machine learning fundamentals",
+    )
+    hits = await search_memories(bootstrapped_db, "machine_learning fundamentals")
+    assert len(hits) == 1

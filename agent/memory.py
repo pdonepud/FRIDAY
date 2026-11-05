@@ -586,11 +586,17 @@ async def search_memories(
     1. Strips the FTS5 operator keywords ``AND`` / ``OR`` / ``NOT`` /
        ``NEAR`` (case-insensitive, matched as WHOLE WORDS — ``"ANDROID
        sales"`` keeps ``ANDROID`` intact).
-    2. Strips FTS5 operator punctuation (``* " ( ) : - ^``).
-    3. Collapses whitespace to single spaces and strips ends.
-    4. If the result is empty (e.g. a pure-noise query), returns ``[]``
+    2. Strips ALL non-word characters and underscores, collapsing runs
+       into a single space. This is Unicode-aware (letters in non-ASCII
+       scripts such as ``café`` survive) and covers both FTS5 operator
+       punctuation (``* " ( ) : - ^``) AND conversational punctuation
+       (``, . ? ' ! ;``) — the latter would otherwise make FTS5 raise
+       a parse error or make the ``unicode61`` tokenizer impose
+       phantom adjacency. Trailing / leading whitespace is trimmed in
+       the same pass.
+    3. If the result is empty (e.g. a pure-noise query), returns ``[]``
        WITHOUT opening the DB.
-    5. Binds the normalized terms as a BARE ``MATCH`` string (not a
+    4. Binds the normalized terms as a BARE ``MATCH`` string (not a
        quoted phrase) — FTS5's implicit-AND over the bag of terms.
 
     Semantics note: ADR-0006:78 contains contradictory wording
@@ -622,13 +628,21 @@ async def search_memories(
         query,
         flags=re.IGNORECASE,
     )
-    # Step 2: operator punctuation. The dash is escaped inside the
-    # character class to avoid being read as a range operator.
-    normalized = re.sub(r'[*"():\-^]', " ", normalized)
-    # Step 3: whitespace normalization.
-    normalized = re.sub(r"\s+", " ", normalized).strip()
+    # Step 2: strip ALL non-word characters AND underscores, collapsing
+    # runs into a single space, then trim ends. This one regex handles:
+    #   (a) FTS5 operator punctuation (``* " ( ) : - ^``).
+    #   (b) conversational punctuation (``, . ? ' ! ;`` and friends),
+    #       which FTS5 either rejects as a parse error outside a
+    #       quoted phrase or the unicode61 tokenizer treats as token
+    #       glue (e.g. ``coffee, tea`` → phantom adjacency).
+    #   (c) underscores, which unicode61 treats as a token separator
+    #       (``machine_learning`` → ``machine`` + ``learning``).
+    # ``\W`` is Unicode-aware in Python 3, so letters in non-ASCII
+    # scripts (e.g. ``café``) survive. The ``+`` quantifier subsumes
+    # the former whitespace-collapse step.
+    normalized = re.sub(r"[\W_]+", " ", normalized).strip()
 
-    # Step 4: short-circuit on noise — no DB call, no log.
+    # Step 3: short-circuit on noise — no DB call, no log.
     if not normalized:
         return []
 
