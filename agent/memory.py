@@ -1,4 +1,4 @@
-"""SQLite memory store scaffolding (ADR-0006 §Long-term: SQLite via aiosqlite).
+"""SQLite memory store (ADR-0006 §Long-term: SQLite via aiosqlite).
 
 Sole owner of the long-term memory DB file (``<data_dir>/memory.db``)
 per ADR-0002's "one small typed surface per external system" seam
@@ -7,7 +7,7 @@ pattern. This is the next instance of that pattern after
 ``agent/tts.py`` (ElevenLabs), and the Tier-4 persistence precedent
 in ``agent/session.py`` (short-term buffer JSON snapshot).
 
-Schema v1:
+Schema v1 (base tables):
 
 .. code-block:: sql
 
@@ -24,11 +24,34 @@ Schema v1:
         version INTEGER NOT NULL
     );
 
-FTS5 virtual table + triggers are explicitly deferred to #77 — per the
-ADR §Consequences capability-probe note, #77 owns both the probe and
-the FTS layer. Keeping v1 FTS5-free means the ``memory.db`` file
-itself is portable to minimal / stripped Python builds without FTS5
-support; v2 (#77) is where that portability becomes conditional.
+Schema v2 (FTS5 keyword retrieval; #77):
+
+.. code-block:: sql
+
+    CREATE VIRTUAL TABLE memories_fts USING fts5(
+        content,
+        content='memories',
+        content_rowid='id'
+    );
+
+    -- three triggers keep memories_fts in sync with memories
+    CREATE TRIGGER memories_ai AFTER INSERT ON memories ...
+    CREATE TRIGGER memories_ad AFTER DELETE ON memories ...
+    CREATE TRIGGER memories_au AFTER UPDATE ON memories
+        WHEN NEW.content IS NOT OLD.content ...
+
+    -- backfill existing rows (v1 → v2 upgrade; no-op on fresh install)
+    INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
+
+## FTS5 capability
+
+FTS5 is a SQLite build-time flag — most mainstream Python distributions
+(python.org, Debian/Ubuntu ``python3``, Homebrew, pyenv) ship with it
+enabled, but stripped builds may omit it. :func:`ensure_fts5_available`
+probes the running Python's ``sqlite3`` once at :func:`bootstrap_db`
+entry, BEFORE any file-system work, and raises
+:class:`FTS5UnavailableError` with a remedy message. An FTS5-less
+install therefore fails loudly and leaves no partial-migration residue.
 
 ## Migration pattern
 
@@ -79,15 +102,19 @@ a follow-up, mirroring #75's Option-1 wiring posture). Promotion to a
 singleton is a mechanical no-API-break change later if measurable
 throughput demands it.
 
-Public surface (ADR-0006 §public-surface, subset — ``search_memories``
-is #77; ``list_memories`` is #80):
+Public surface (ADR-0006 §public-surface, subset — ``list_memories``
+is #80):
 
 * :class:`Memory` — frozen dataclass.
-* :class:`MemoryDBError` — raised for schema/migration failures only.
+* :class:`MemoryDBError` — raised for schema/migration failures.
+* :class:`FTS5UnavailableError` — ``MemoryDBError`` subclass raised at
+  :func:`bootstrap_db` entry when the probe fails.
 * :func:`default_memory_db_path` — ``<data_dir>/memory.db``.
+* :func:`ensure_fts5_available` — standalone capability probe.
 * :func:`bootstrap_db` — idempotent migration runner.
 * :func:`add_memory`, :func:`get_memory`, :func:`delete_memory` —
   CRUD on individual memories.
+* :func:`search_memories` — ranked FTS5 keyword retrieval.
 """
 
 from __future__ import annotations
@@ -95,6 +122,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import sqlite3
 import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -129,6 +158,54 @@ _MIGRATIONS: Final[list[tuple[int, list[str]]]] = [
             """,
         ],
     ),
+    (
+        2,
+        [
+            # External-content FTS5 index backed by the memories table.
+            # content_rowid='id' maps FTS rowid to memories.id so joins
+            # and the 'delete' / 'rebuild' housekeeping commands line up
+            # with the base table's primary key.
+            "CREATE VIRTUAL TABLE memories_fts "
+            "USING fts5(content, content='memories', content_rowid='id')",
+            # Insert mirror. BEGIN...END trigger body is one statement.
+            """
+            CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+              INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+            END
+            """,
+            # Delete mirror using FTS5's 'delete' command — the correct
+            # external-content pattern. A plain DELETE on memories_fts
+            # would not work for external-content tables.
+            """
+            CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
+              INSERT INTO memories_fts(memories_fts, rowid, content)
+                VALUES ('delete', old.id, old.content);
+            END
+            """,
+            # Update mirror — 'delete' the old row from the index, then
+            # insert the new. WHEN NEW.content IS NOT OLD.content skips
+            # re-indexing on metadata-only / kind-only updates (``IS
+            # NOT`` instead of ``!=`` because ``!=`` returns NULL when
+            # either side is NULL, which SQLite treats as "not true" —
+            # we want the trigger to fire on NULL<->value transitions).
+            """
+            CREATE TRIGGER memories_au AFTER UPDATE ON memories
+            WHEN NEW.content IS NOT OLD.content BEGIN
+              INSERT INTO memories_fts(memories_fts, rowid, content)
+                VALUES ('delete', old.id, old.content);
+              INSERT INTO memories_fts(rowid, content)
+                VALUES (new.id, new.content);
+            END
+            """,
+            # Backfill existing rows on a v1→v2 upgrade. A fresh install
+            # arrives with memories empty, so 'rebuild' is a trivial
+            # no-op; on an upgrade it indexes everything already in
+            # memories. Runs last, after the triggers exist, so the
+            # resulting state is identical to one where every row had
+            # been inserted post-trigger.
+            "INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')",
+        ],
+    ),
 ]
 
 #: Highest schema version the code knows how to produce. Derived from
@@ -138,6 +215,15 @@ SCHEMA_VERSION: Final[int] = _MIGRATIONS[-1][0]
 #: Truncation ceiling for raw-payload echoes in WARNING log lines so a
 #: large corrupt-row's metadata blob doesn't flood logs.
 _LOG_TRUNCATE: Final[int] = 200
+
+#: Default k for :func:`search_memories`. ADR-0006 Implementation Notes
+#: pins this to 5; context assembly (ADR-0007 / #79) may override.
+_FTS_TOPK_DEFAULT: Final[int] = 5
+
+#: Marker substring in the ``sqlite3.OperationalError`` message raised
+#: when the running SQLite build lacks FTS5. Case-folded during probe
+#: match to handle future SQLite capitalization drift.
+_FTS5_UNAVAILABLE_MARKER: Final[str] = "no such module: fts5"
 
 _log = logging.getLogger("agent.memory")
 
@@ -150,6 +236,17 @@ class MemoryDBError(Exception):
     NOT raised for ordinary DB errors — those propagate as
     :class:`aiosqlite.Error` / :class:`sqlite3.DatabaseError`, which
     callers can catch directly.
+    """
+
+
+class FTS5UnavailableError(MemoryDBError):
+    """FTS5 module missing from the running Python's SQLite build.
+
+    Subclass of :class:`MemoryDBError` so a caller catching the base
+    class still handles it, while a more-specific caller (e.g. a
+    future install-wizard surface) can discriminate. Raised from
+    :func:`ensure_fts5_available` and, transitively, from
+    :func:`bootstrap_db` before any filesystem work.
     """
 
 
@@ -195,6 +292,34 @@ class Memory:
             raise TypeError(f"Memory.metadata must be a dict; got {type(self.metadata).__name__}")
 
 
+async def ensure_fts5_available() -> None:
+    """Probe the running Python's SQLite for FTS5; raise if missing.
+
+    Opens an in-memory connection and attempts
+    ``CREATE VIRTUAL TABLE IF NOT EXISTS _fts5_probe USING fts5(x)``.
+    A SQLite build without FTS5 raises
+    :class:`sqlite3.OperationalError` with message
+    ``"no such module: fts5"``; this function re-raises it as
+    :class:`FTS5UnavailableError` with a remedy message. Any other
+    DB error propagates unchanged.
+
+    Idempotent and side-effect-free — safe to call repeatedly. No
+    filesystem writes.
+    """
+    async with aiosqlite.connect(":memory:", isolation_level=None) as db:
+        try:
+            await db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS _fts5_probe USING fts5(x)")
+        except (sqlite3.OperationalError, aiosqlite.Error) as exc:
+            if _FTS5_UNAVAILABLE_MARKER in str(exc).lower():
+                raise FTS5UnavailableError(
+                    "FTS5 not available in this SQLite build. Install a Python "
+                    "distribution whose bundled SQLite has FTS5 enabled "
+                    "(python.org installer, pyenv, Debian/Ubuntu python3, Homebrew). "
+                    "See ADR-0006 §Consequences for background."
+                ) from exc
+            raise
+
+
 def default_memory_db_path() -> Path:
     """Return ``<data_dir>/memory.db`` (platform-aware).
 
@@ -221,13 +346,23 @@ async def bootstrap_db(db_path: Path) -> None:
     until the winner commits, then reads the already-applied version
     and skips the migration loop.
 
+    Fails fast if FTS5 is missing (via :func:`ensure_fts5_available`)
+    BEFORE any filesystem work, so an FTS5-less install leaves no
+    partially-migrated ``memory.db`` behind.
+
     Raises:
+        FTS5UnavailableError: the running Python's SQLite lacks FTS5.
         MemoryDBError: the DB is at a version higher than
             :data:`SCHEMA_VERSION` (downgrade not supported), or the
             ``schema_version`` table is corrupt (more than one row).
         aiosqlite.Error / sqlite3.DatabaseError: unrecoverable DB
             errors from a migration propagate after rollback.
     """
+    # Probe FIRST — before file creation, before opening the real DB.
+    # An FTS5-less install must fail with a clear remedy message
+    # instead of mid-migration on the v2 CREATE VIRTUAL TABLE.
+    await ensure_fts5_available()
+
     # Create the file with restrictive mode BEFORE aiosqlite opens it,
     # so the file's inode is born with 0o600 rather than the umask-
     # masked default (typically 0o644). Windows NTFS uses ACLs and mode
@@ -360,25 +495,21 @@ async def add_memory(
         return int(cursor.lastrowid)
 
 
-async def get_memory(db_path: Path, memory_id: int) -> Memory | None:
-    """Fetch a single memory by id. Returns None if no match.
+def _row_to_memory(row: aiosqlite.Row) -> Memory:
+    """Parse a ``SELECT * FROM memories`` row into a :class:`Memory`.
+
+    Pure function — no DB access, no I/O. Shared between
+    :func:`get_memory` (single-row fetch) and :func:`search_memories`
+    (FTS5 join) so the metadata-JSON warn-and-fall-back behavior is
+    identical across both read paths.
 
     Corrupt ``metadata`` JSON on the row (invalid JSON, or valid JSON
-    that doesn't decode to a dict) logs a WARNING and the returned
-    :class:`Memory` has ``metadata={}`` — same "warn and fall back"
-    posture as :func:`agent.session.load_session`.
+    that doesn't decode to a dict) logs a WARNING naming the row id
+    and returns a :class:`Memory` with ``metadata={}`` — same posture
+    as :func:`agent.session.load_session`'s "warn and fall back".
 
-    Raises:
-        aiosqlite.Error / sqlite3.DatabaseError: DB errors propagate.
+    Returns a validated :class:`Memory` (``__post_init__`` runs).
     """
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)) as cur:
-            row = await cur.fetchone()
-
-    if row is None:
-        return None
-
     raw_meta = row["metadata"]
     try:
         metadata = json.loads(raw_meta)
@@ -390,7 +521,7 @@ async def get_memory(db_path: Path, memory_id: int) -> Memory | None:
             truncated = truncated[:_LOG_TRUNCATE] + "…"
         _log.warning(
             "memory row %d has invalid metadata JSON (%s); returning empty dict. raw=%r",
-            memory_id,
+            row["id"],
             exc,
             truncated,
         )
@@ -404,6 +535,26 @@ async def get_memory(db_path: Path, memory_id: int) -> Memory | None:
         content=row["content"],
         metadata=metadata,
     )
+
+
+async def get_memory(db_path: Path, memory_id: int) -> Memory | None:
+    """Fetch a single memory by id. Returns None if no match.
+
+    Delegates row parsing to :func:`_row_to_memory`, which handles
+    corrupt-metadata warn-and-fall-back. See that function's docstring
+    for details.
+
+    Raises:
+        aiosqlite.Error / sqlite3.DatabaseError: DB errors propagate.
+    """
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)) as cur:
+            row = await cur.fetchone()
+
+    if row is None:
+        return None
+    return _row_to_memory(row)
 
 
 async def delete_memory(db_path: Path, memory_id: int) -> bool:
@@ -420,3 +571,80 @@ async def delete_memory(db_path: Path, memory_id: int) -> bool:
         # The ``== 1`` check makes that intent explicit and treats any
         # surprising rowcount as a miss rather than a vacuous True.
         return cursor.rowcount == 1
+
+
+async def search_memories(
+    db_path: Path,
+    query: str,
+    k: int = _FTS_TOPK_DEFAULT,
+) -> list[Memory]:
+    """Rank the top-``k`` memories matching ``query`` via FTS5.
+
+    Governing spec: **ADR-0006 §Retriever**. Normalizes raw
+    conversational text into FTS5-safe search terms:
+
+    1. Strips the FTS5 operator keywords ``AND`` / ``OR`` / ``NOT`` /
+       ``NEAR`` (case-insensitive, matched as WHOLE WORDS — ``"ANDROID
+       sales"`` keeps ``ANDROID`` intact).
+    2. Strips FTS5 operator punctuation (``* " ( ) : - ^``).
+    3. Collapses whitespace to single spaces and strips ends.
+    4. If the result is empty (e.g. a pure-noise query), returns ``[]``
+       WITHOUT opening the DB.
+    5. Binds the normalized terms as a BARE ``MATCH`` string (not a
+       quoted phrase) — FTS5's implicit-AND over the bag of terms.
+
+    Semantics note: ADR-0006:78 contains contradictory wording
+    ("bag-of-terms keyword query" vs "quoted phrase match"). Shipped
+    behavior matches the bag-of-terms intent — all terms must appear
+    in the matched row, adjacency not required. A separate ADR
+    correction tracks the wording fix.
+
+    Results are ordered by FTS5's ``rank`` column (bm25 by default
+    since SQLite 3.20); smaller is more relevant, so natural
+    ascending order yields best-first.
+
+    ``k`` must be a positive int. ``True`` is rejected despite
+    ``isinstance(True, int)`` — this mirrors :mod:`agent.session`'s
+    strict-int version check.
+
+    Raises:
+        ValueError: ``k`` is not a positive int (``None``, ``bool``,
+            ``float``, string, or ``<= 0``).
+        aiosqlite.Error / sqlite3.DatabaseError: DB errors propagate.
+    """
+    if not isinstance(k, int) or isinstance(k, bool) or k <= 0:
+        raise ValueError(f"k must be a positive int; got {k!r}")
+
+    # Step 1: whole-word operator keywords. Case-insensitive via re.I.
+    normalized = re.sub(
+        r"\b(?:AND|OR|NOT|NEAR)\b",
+        " ",
+        query,
+        flags=re.IGNORECASE,
+    )
+    # Step 2: operator punctuation. The dash is escaped inside the
+    # character class to avoid being read as a range operator.
+    normalized = re.sub(r'[*"():\-^]', " ", normalized)
+    # Step 3: whitespace normalization.
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    # Step 4: short-circuit on noise — no DB call, no log.
+    if not normalized:
+        return []
+
+    async with aiosqlite.connect(db_path, isolation_level=None) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT m.id, m.created_at, m.updated_at, m.kind, m.content, m.metadata
+            FROM memories m
+            JOIN memories_fts f ON f.rowid = m.id
+            WHERE memories_fts MATCH ?
+            ORDER BY f.rank
+            LIMIT ?
+            """,
+            (normalized, k),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    return [_row_to_memory(r) for r in rows]
