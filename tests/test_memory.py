@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import stat
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -99,6 +102,101 @@ async def test_bootstrap_rejects_multiple_schema_version_rows(tmp_path):
         await bootstrap_db(path)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="POSIX-only, non-root (mode bits are a no-op on Windows; root ignores them)",
+)
+async def test_bootstrap_creates_db_file_with_0o600_mode_on_posix(tmp_path):
+    """On POSIX as non-root, bootstrap_db creates memory.db with mode
+    0o600 (owner-rw only), matching session.json's convention. Defense
+    in depth on top of the 0o700 parent dir from get_data_dir()."""
+    path = tmp_path / "memory.db"
+    assert not path.exists()
+
+    await bootstrap_db(path)
+
+    mode = stat.S_IMODE(path.stat().st_mode)
+    assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+
+
+async def test_concurrent_bootstrap_calls_serialize(tmp_path):
+    """Two concurrent bootstrap_db calls on the same fresh file both
+    succeed (no SQLITE_BUSY). BEGIN IMMEDIATE serializes the writers;
+    the loser reads the already-applied version and skips the
+    migration loop. Result: exactly one schema_version row at the
+    current SCHEMA_VERSION, no duplicate CREATE TABLE memories."""
+    path = tmp_path / "memory.db"
+
+    await asyncio.gather(bootstrap_db(path), bootstrap_db(path))
+
+    async with aiosqlite.connect(path) as db:
+        async with db.execute("SELECT version FROM schema_version") as cur:
+            rows = await cur.fetchall()
+    assert rows == [(SCHEMA_VERSION,)]
+
+
+async def test_bootstrap_rolls_back_on_mid_migration_failure(tmp_path, monkeypatch):
+    """A migration that fails AFTER a successful CREATE TABLE must
+    roll back the DDL, not leave the half-applied table behind.
+    SQLite DDL is transactional, and our BEGIN IMMEDIATE wrapper plus
+    isolation_level=None ensure the table creation gets undone when
+    a later statement in the same migration raises."""
+    path = tmp_path / "memory.db"
+
+    # Inject a bad migration that succeeds on CREATE TABLE memories
+    # then raises on a reference to a nonexistent table. The real
+    # _MIGRATIONS is restored at test teardown by monkeypatch.
+    broken_migrations = [
+        (
+            1,
+            [
+                """
+                CREATE TABLE memories (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    kind       TEXT NOT NULL,
+                    content    TEXT NOT NULL,
+                    metadata   TEXT NOT NULL DEFAULT '{}'
+                )
+                """,
+                "INSERT INTO __mid_migration_sentinel__ VALUES (1)",
+            ],
+        ),
+    ]
+    monkeypatch.setattr("agent.memory._MIGRATIONS", broken_migrations)
+
+    with pytest.raises(aiosqlite.Error, match="__mid_migration_sentinel__"):
+        await bootstrap_db(path)
+
+    # Post-crash inspection: memories table must NOT exist (DDL rolled
+    # back), schema_version table persists (created outside the
+    # wrapper tx) but has zero rows (UPSERT never ran).
+    async with aiosqlite.connect(path) as db:
+        async with db.execute("SELECT name FROM sqlite_master WHERE type='table'") as cur:
+            tables = {row[0] for row in await cur.fetchall()}
+        async with db.execute("SELECT COUNT(*) FROM schema_version") as cur:
+            (count,) = await cur.fetchone()
+
+    assert "memories" not in tables
+    assert "schema_version" in tables
+    assert count == 0
+
+    # Restore the real migrations list and retry on the same path —
+    # should succeed cleanly and bring the DB to v1 with no residue.
+    monkeypatch.undo()
+    await bootstrap_db(path)
+    async with aiosqlite.connect(path) as db:
+        async with db.execute("SELECT version FROM schema_version") as cur:
+            rows = await cur.fetchall()
+        async with db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='memories'"
+        ) as cur:
+            memories_row = await cur.fetchone()
+    assert rows == [(SCHEMA_VERSION,)]
+    assert memories_row is not None
+
+
 # -----------------------------------------------------------------
 # add_memory / get_memory
 # -----------------------------------------------------------------
@@ -179,6 +277,30 @@ async def test_add_memory_rejects_non_dict_metadata(bootstrapped_db):
             content="x",
             metadata=[1, 2, 3],  # type: ignore[arg-type]
         )
+    async with aiosqlite.connect(bootstrapped_db) as db:
+        async with db.execute("SELECT COUNT(*) FROM memories") as cur:
+            (count,) = await cur.fetchone()
+    assert count == 0
+
+
+@pytest.mark.parametrize(
+    "kind,content,match",
+    [
+        ("", "hello", "kind must be"),
+        ("fact", "", "content must be"),
+        (None, "hello", "kind must be"),
+        ("fact", 42, "content must be"),
+    ],
+)
+async def test_add_memory_rejects_empty_or_non_string_kind_or_content(
+    bootstrapped_db, kind, content, match
+):
+    """add_memory's write-path validation mirrors
+    Memory.__post_init__'s read-path checks — empty / non-str kind or
+    content raises ValueError before the DB is opened, so no row is
+    written."""
+    with pytest.raises(ValueError, match=match):
+        await add_memory(bootstrapped_db, kind=kind, content=content)
     async with aiosqlite.connect(bootstrapped_db) as db:
         async with db.execute("SELECT COUNT(*) FROM memories") as cur:
             (count,) = await cur.fetchone()
