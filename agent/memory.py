@@ -583,20 +583,26 @@ async def search_memories(
     Governing spec: **ADR-0006 §Retriever**. Normalizes raw
     conversational text into FTS5-safe search terms:
 
-    1. Strips the FTS5 operator keywords ``AND`` / ``OR`` / ``NOT`` /
-       ``NEAR`` (case-insensitive, matched as WHOLE WORDS — ``"ANDROID
-       sales"`` keeps ``ANDROID`` intact).
-    2. Strips ALL non-word characters and underscores, collapsing runs
-       into a single space. This is Unicode-aware (letters in non-ASCII
-       scripts such as ``café`` survive) and covers both FTS5 operator
-       punctuation (``* " ( ) : - ^``) AND conversational punctuation
-       (``, . ? ' ! ;``) — the latter would otherwise make FTS5 raise
-       a parse error or make the ``unicode61`` tokenizer impose
-       phantom adjacency. Trailing / leading whitespace is trimmed in
-       the same pass.
-    3. If the result is empty (e.g. a pure-noise query), returns ``[]``
+    1. Replaces every non-word character (operator punctuation,
+       conversational punctuation ``, . ? ' ! ;``, and underscores)
+       with a single space, collapsing runs. This is Unicode-aware,
+       so non-ASCII letters (``café``) survive. Running this step
+       FIRST exposes operator keywords that were glued by non-word
+       characters (e.g. ``coffee_OR_tea``, ``coffee(AND)tea``) so
+       step 2 catches them — otherwise ``\b`` word boundaries would
+       miss ``_OR_`` and the keyword would leak into ``MATCH`` as an
+       FTS5 operator, violating the implicit-AND guarantee.
+    2. Strips the FTS5 operator keywords ``AND`` / ``OR`` / ``NOT`` /
+       ``NEAR`` (whole-word, case-insensitive). ``\b`` boundaries are
+       now correct because step 1 already replaced non-word glue with
+       spaces. ``"ANDROID sales"`` still keeps ``ANDROID`` intact —
+       the inner letters are word characters so ``\b`` doesn't match
+       mid-identifier.
+    3. Collapses any residual double spaces introduced by step 2's
+       substitutions and strips ends.
+    4. If the result is empty (e.g. a pure-noise query), returns ``[]``
        WITHOUT opening the DB.
-    4. Binds the normalized terms as a BARE ``MATCH`` string (not a
+    5. Binds the normalized terms as a BARE ``MATCH`` string (not a
        quoted phrase) — FTS5's implicit-AND over the bag of terms.
 
     Semantics note: ADR-0006:78 contains contradictory wording
@@ -621,26 +627,40 @@ async def search_memories(
     if not isinstance(k, int) or isinstance(k, bool) or k <= 0:
         raise ValueError(f"k must be a positive int; got {k!r}")
 
-    # Step 1: whole-word operator keywords. Case-insensitive via re.I.
-    normalized = re.sub(
-        r"\b(?:AND|OR|NOT|NEAR)\b",
-        " ",
-        query,
-        flags=re.IGNORECASE,
-    )
-    # Step 2: strip ALL non-word characters AND underscores, collapsing
-    # runs into a single space, then trim ends. This one regex handles:
+    # Step 1: strip ALL non-word characters AND underscores, collapsing
+    # runs into a single space. Running this FIRST exposes operator
+    # keywords that were glued by underscores or other non-word
+    # characters (e.g. ``coffee_OR_tea``, ``coffee(AND)tea``) so Step 2
+    # can strip them as whole words. Previously, Step 2 would miss
+    # these because ``_`` and ``(`` are not word boundaries for ``\b``,
+    # and the subsequent strip would then expose the operator to FTS5
+    # as an OR/AND token — leaking those semantics into what the ADR
+    # promises as implicit-AND.
+    # This regex also handles:
     #   (a) FTS5 operator punctuation (``* " ( ) : - ^``).
     #   (b) conversational punctuation (``, . ? ' ! ;`` and friends),
     #       which FTS5 either rejects as a parse error outside a
     #       quoted phrase or the unicode61 tokenizer treats as token
-    #       glue (e.g. ``coffee, tea`` → phantom adjacency).
+    #       glue (``coffee, tea`` → phantom adjacency).
     #   (c) underscores, which unicode61 treats as a token separator
     #       (``machine_learning`` → ``machine`` + ``learning``).
     # ``\W`` is Unicode-aware in Python 3, so letters in non-ASCII
-    # scripts (e.g. ``café``) survive. The ``+`` quantifier subsumes
-    # the former whitespace-collapse step.
-    normalized = re.sub(r"[\W_]+", " ", normalized).strip()
+    # scripts (e.g. ``café``) survive.
+    normalized = re.sub(r"[\W_]+", " ", query).strip()
+    # Step 2: whole-word operator keywords. Now runs AFTER the non-word
+    # strip so underscore-exposed operators are caught. Case-insensitive
+    # via re.I; ``\b`` boundaries protect mid-identifier letters
+    # (``ANDROID`` still survives).
+    normalized = re.sub(
+        r"\b(?:AND|OR|NOT|NEAR)\b",
+        " ",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    # Collapse the whitespace Step 2 may have introduced when an
+    # operator keyword sat between two bare terms (``coffee OR tea`` →
+    # ``coffee  tea`` after Step 2 → ``coffee tea`` here).
+    normalized = re.sub(r"\s+", " ", normalized).strip()
 
     # Step 3: short-circuit on noise — no DB call, no log.
     if not normalized:

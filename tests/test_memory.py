@@ -802,3 +802,25 @@ async def test_search_memories_strips_underscores(bootstrapped_db):
     )
     hits = await search_memories(bootstrapped_db, "machine_learning fundamentals")
     assert len(hits) == 1
+
+
+async def test_search_memories_normalizes_underscore_glued_operator(bootstrapped_db):
+    """Underscore-glued operator keywords (e.g. ``coffee_OR_tea``) are
+    stripped after the non-word strip exposes them, keeping implicit-AND
+    semantics. Previously, the operator-keyword strip ran first with
+    ``\\b`` boundaries that didn't match ``_OR_``, then the underscore
+    strip exposed ``OR`` to FTS5 as an operator — leaking OR semantics
+    into what the ADR promises as implicit-AND."""
+    await add_memory(bootstrapped_db, kind="fact", content="only coffee here")
+    # Pre-fix: this query returned the row (OR semantics, matched "coffee").
+    # Post-fix: "coffee_OR_tea" normalizes to "coffee tea" and the seed row
+    # doesn't contain "tea", so implicit-AND correctly rejects it.
+    hits = await search_memories(bootstrapped_db, "coffee_OR_tea")
+    assert hits == []
+
+    # Positive control: a seed that contains BOTH terms matches after
+    # the operator-keyword strip runs on the exposed ``OR``.
+    await add_memory(bootstrapped_db, kind="fact", content="coffee and tea together")
+    hits = await search_memories(bootstrapped_db, "coffee_OR_tea")
+    assert len(hits) == 1
+    assert hits[0].content == "coffee and tea together"
