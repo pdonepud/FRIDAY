@@ -824,3 +824,364 @@ async def test_search_memories_normalizes_underscore_glued_operator(bootstrapped
     hits = await search_memories(bootstrapped_db, "coffee_OR_tea")
     assert len(hits) == 1
     assert hits[0].content == "coffee and tea together"
+
+
+# =================================================================
+# #78 — Memory writer (explicit cues + classifier)
+# =================================================================
+
+
+# -----------------------------------------------------------------
+# detect_explicit_cue
+# -----------------------------------------------------------------
+
+
+def test_detect_explicit_cue_matches_remember_that():
+    """`remember that X` extracts X, kind=fact, cue_type=remember_that."""
+    from agent.memory import detect_explicit_cue
+
+    assert detect_explicit_cue("please remember that I like oat milk") == (
+        "fact",
+        "I like oat milk",
+        "remember_that",
+    )
+
+
+def test_detect_explicit_cue_matches_take_note():
+    """`take a note that X` extracts X, cue_type=take_a_note."""
+    from agent.memory import detect_explicit_cue
+
+    assert detect_explicit_cue("take a note that my manager's name is Ana") == (
+        "fact",
+        "my manager's name is Ana",
+        "take_a_note",
+    )
+
+
+def test_detect_explicit_cue_matches_dont_forget():
+    """Both `don't forget X` and `do not forget that X` match with
+    cue_type=dont_forget."""
+    from agent.memory import detect_explicit_cue
+
+    assert detect_explicit_cue("don't forget my dentist is Dr. Lee") == (
+        "fact",
+        "my dentist is Dr. Lee",
+        "dont_forget",
+    )
+    assert detect_explicit_cue("do not forget that the deadline is Friday") == (
+        "fact",
+        "the deadline is Friday",
+        "dont_forget",
+    )
+
+
+def test_detect_explicit_cue_case_insensitive():
+    """All-caps cues still match (voice-STT may uppercase proper nouns
+    or the whole utterance)."""
+    from agent.memory import detect_explicit_cue
+
+    result = detect_explicit_cue("REMEMBER THAT I use pyenv")
+    assert result is not None
+    assert result[0] == "fact"
+    assert result[1] == "I use pyenv"
+    assert result[2] == "remember_that"
+
+
+def test_detect_explicit_cue_no_match_on_absent_cue():
+    """Non-cue utterances return None."""
+    from agent.memory import detect_explicit_cue
+
+    assert detect_explicit_cue("I had coffee today") is None
+
+
+def test_detect_explicit_cue_no_match_on_cue_without_content():
+    """A cue followed by nothing (or just punctuation) is not a write
+    signal — return None rather than persist an empty content row."""
+    from agent.memory import detect_explicit_cue
+
+    assert detect_explicit_cue("remember that.") is None
+    assert detect_explicit_cue("remember that") is None
+
+
+def test_detect_explicit_cue_strips_trailing_punctuation():
+    """Sentence-terminating punctuation on the user turn's end is
+    stripped from the extracted content."""
+    from agent.memory import detect_explicit_cue
+
+    assert detect_explicit_cue("remember that I like espresso!") == (
+        "fact",
+        "I like espresso",
+        "remember_that",
+    )
+
+
+def test_detect_explicit_cue_known_edge_case_whitespace_prefix_matches():
+    """V1 known imperfection: whitespace-prefixed subordinate-clause
+    contexts DO match. Lock the current behavior in so a future
+    tightening (discourse-marker allowlist) surfaces as a visible
+    test change."""
+    from agent.memory import detect_explicit_cue
+
+    result = detect_explicit_cue("I had to remember that time")
+    assert result is not None
+    assert result[2] == "remember_that"
+    assert result[1] == "time"
+
+
+# -----------------------------------------------------------------
+# schedule_memory_classification
+# -----------------------------------------------------------------
+
+
+async def test_schedule_memory_classification_writes_on_true(bootstrapped_db, monkeypatch):
+    """When the classifier returns a MemoryClassification, the task
+    writes it to the DB via add_memory."""
+    from agent.claude import MemoryClassification
+    from agent.memory import schedule_memory_classification
+
+    async def fake_classify(user_turn, prior_assistant=None):
+        return MemoryClassification(kind="fact", content="hi there", metadata={})
+
+    monkeypatch.setattr("agent.memory.classify_turn_for_memory", fake_classify)
+
+    registry: set = set()
+    task = schedule_memory_classification(bootstrapped_db, "anything", task_registry=registry)
+    await task
+
+    async with aiosqlite.connect(bootstrapped_db) as db:
+        async with db.execute("SELECT COUNT(*) FROM memories") as cur:
+            (count,) = await cur.fetchone()
+    assert count == 1
+
+
+async def test_schedule_memory_classification_no_write_on_none(bootstrapped_db, monkeypatch):
+    """When the classifier returns None, no row is written."""
+    from agent.memory import schedule_memory_classification
+
+    async def fake_classify(user_turn, prior_assistant=None):
+        return None
+
+    monkeypatch.setattr("agent.memory.classify_turn_for_memory", fake_classify)
+
+    registry: set = set()
+    task = schedule_memory_classification(
+        bootstrapped_db, "nothing durable", task_registry=registry
+    )
+    await task
+
+    async with aiosqlite.connect(bootstrapped_db) as db:
+        async with db.execute("SELECT COUNT(*) FROM memories") as cur:
+            (count,) = await cur.fetchone()
+    assert count == 0
+
+
+async def test_schedule_memory_classification_swallows_classifier_exceptions(
+    bootstrapped_db, monkeypatch
+):
+    """Classifier raising doesn't leak into the event loop.
+    task.exception() is None after await (the body swallowed it)."""
+    from agent.memory import schedule_memory_classification
+
+    async def exploding_classify(user_turn, prior_assistant=None):
+        raise RuntimeError("simulated classifier failure")
+
+    monkeypatch.setattr("agent.memory.classify_turn_for_memory", exploding_classify)
+
+    registry: set = set()
+    task = schedule_memory_classification(bootstrapped_db, "anything", task_registry=registry)
+    await task
+    assert task.exception() is None
+
+
+async def test_schedule_memory_classification_retains_task_reference(bootstrapped_db, monkeypatch):
+    """The spawned task is in the registry BEFORE awaiting (strong
+    reference prevents asyncio GC) and discarded AFTER awaiting (the
+    done-callback runs)."""
+    from agent.memory import schedule_memory_classification
+
+    async def slow_classify(user_turn, prior_assistant=None):
+        # Give the test a window to observe membership before done.
+        await asyncio.sleep(0)
+        return None
+
+    monkeypatch.setattr("agent.memory.classify_turn_for_memory", slow_classify)
+
+    registry: set = set()
+    task = schedule_memory_classification(bootstrapped_db, "anything", task_registry=registry)
+    assert task in registry
+    await task
+    assert task not in registry
+
+
+# -----------------------------------------------------------------
+# process_turn_for_memory
+# -----------------------------------------------------------------
+
+
+async def test_process_turn_for_memory_explicit_cue_writes_synchronously(
+    bootstrapped_db, monkeypatch
+):
+    """An explicit cue writes within the same await — the row exists
+    BEFORE the classifier task is awaited."""
+    from agent.memory import process_turn_for_memory
+
+    async def fake_classify(user_turn, prior_assistant=None):
+        # Would spawn a second write; keep this test focused on the
+        # synchronous path.
+        return None
+
+    monkeypatch.setattr("agent.memory.classify_turn_for_memory", fake_classify)
+
+    registry: set = set()
+    explicit_id, task = await process_turn_for_memory(
+        bootstrapped_db,
+        "please remember that I like oat milk",
+        task_registry=registry,
+    )
+
+    # Before awaiting the classifier task: explicit row already exists.
+    assert isinstance(explicit_id, int) and explicit_id > 0
+    async with aiosqlite.connect(bootstrapped_db) as db:
+        async with db.execute("SELECT COUNT(*) FROM memories") as cur:
+            (count,) = await cur.fetchone()
+    assert count == 1
+
+    # Clean up the pending task so pytest doesn't warn.
+    await task
+
+
+async def test_process_turn_for_memory_also_spawns_classifier_on_cue(bootstrapped_db, monkeypatch):
+    """Both paths fire on a cue-containing turn: one explicit row +
+    one classifier row = two rows after awaiting the task."""
+    from agent.claude import MemoryClassification
+    from agent.memory import process_turn_for_memory
+
+    async def fake_classify(user_turn, prior_assistant=None):
+        return MemoryClassification(
+            kind="preference",
+            content="prefers oat milk (classifier)",
+            metadata={},
+        )
+
+    monkeypatch.setattr("agent.memory.classify_turn_for_memory", fake_classify)
+
+    registry: set = set()
+    explicit_id, task = await process_turn_for_memory(
+        bootstrapped_db,
+        "please remember that I like oat milk",
+        task_registry=registry,
+    )
+    await task
+
+    assert isinstance(explicit_id, int) and explicit_id > 0
+    async with aiosqlite.connect(bootstrapped_db) as db:
+        async with db.execute("SELECT content, metadata FROM memories ORDER BY id") as cur:
+            rows = [tuple(r) for r in await cur.fetchall()]
+    assert len(rows) == 2
+    # First row = explicit cue (source=explicit_cue).
+    assert '"source": "explicit_cue"' in rows[0][1]
+    # Second row = classifier (source=classifier).
+    assert '"source": "classifier"' in rows[1][1]
+
+
+async def test_process_turn_for_memory_classifier_only_on_non_cue(bootstrapped_db, monkeypatch):
+    """A turn with no cue returns explicit_id=None but still spawns
+    the classifier. After awaiting, there's exactly one row (the
+    classifier's)."""
+    from agent.claude import MemoryClassification
+    from agent.memory import process_turn_for_memory
+
+    async def fake_classify(user_turn, prior_assistant=None):
+        return MemoryClassification(
+            kind="fact",
+            content="user had coffee today (classifier)",
+            metadata={},
+        )
+
+    monkeypatch.setattr("agent.memory.classify_turn_for_memory", fake_classify)
+
+    registry: set = set()
+    explicit_id, task = await process_turn_for_memory(
+        bootstrapped_db,
+        "I had coffee today",
+        task_registry=registry,
+    )
+    await task
+
+    assert explicit_id is None
+    async with aiosqlite.connect(bootstrapped_db) as db:
+        async with db.execute("SELECT content, metadata FROM memories") as cur:
+            rows = [tuple(r) for r in await cur.fetchall()]
+    assert len(rows) == 1
+    assert '"source": "classifier"' in rows[0][1]
+
+
+def test_process_turn_for_memory_subprocess_integration(tmp_path):
+    """End-to-end subprocess test: spawn python, bootstrap a DB,
+    call process_turn_for_memory with a cue turn, exit cleanly,
+    then assert the explicit-cue row persisted to disk. The
+    classifier is mocked inside the subprocess so the test does
+    NOT hit the Anthropic API.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    REPO_ROOT = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "memory.db"
+
+    script = textwrap.dedent(
+        f"""
+        import asyncio
+        import sys
+        sys.path.insert(0, {str(REPO_ROOT)!r})
+        from pathlib import Path
+        from agent.memory import bootstrap_db, process_turn_for_memory
+
+        # Mock the classifier so we don't call Anthropic.
+        async def _fake_classify(user_turn, prior_assistant=None):
+            return None
+
+        import agent.memory as mem
+        mem.classify_turn_for_memory = _fake_classify
+
+        async def main():
+            db = Path({str(db_path)!r})
+            await bootstrap_db(db)
+            registry = set()
+            _explicit_id, task = await process_turn_for_memory(
+                db,
+                "remember that FRIDAY uses SQLite for long-term memory",
+                task_registry=registry,
+            )
+            await task
+
+        asyncio.run(main())
+        """
+    ).strip()
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, (
+        f"subprocess failed: stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    # Parent reads the DB and asserts the explicit-cue row persisted.
+    import sqlite3 as _sqlite3
+
+    conn = _sqlite3.connect(db_path)
+    try:
+        rows = list(conn.execute("SELECT kind, content, metadata FROM memories ORDER BY id"))
+    finally:
+        conn.close()
+
+    assert len(rows) == 1
+    kind, content, metadata_json = rows[0]
+    assert kind == "fact"
+    assert content == "FRIDAY uses SQLite for long-term memory"
+    assert '"source": "explicit_cue"' in metadata_json
+    assert '"cue_type": "remember_that"' in metadata_json
