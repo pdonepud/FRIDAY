@@ -119,6 +119,7 @@ is #80):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -132,6 +133,7 @@ from typing import Any, Final
 
 import aiosqlite
 
+from agent.claude import classify_turn_for_memory
 from agent.paths import get_data_dir
 
 #: Filename under ``<data_dir>`` where the long-term store lives.
@@ -224,6 +226,49 @@ _FTS_TOPK_DEFAULT: Final[int] = 5
 #: when the running SQLite build lacks FTS5. Case-folded during probe
 #: match to handle future SQLite capitalization drift.
 _FTS5_UNAVAILABLE_MARKER: Final[str] = "no such module: fts5"
+
+#: Metadata source tags for #78 writer audit trail — stable string
+#: identifiers so the memory CLI (#80) can distinguish explicit-cue
+#: writes from classifier writes, and so future dedup (out of scope)
+#: has a cheap grouping key.
+_CUE_SOURCE: Final[str] = "explicit_cue"
+_CLASSIFIER_SOURCE: Final[str] = "classifier"
+
+#: Compiled cue pattern for :func:`detect_explicit_cue`. Three named
+#: groups map to stable ``cue_type`` identifiers that get stored in
+#: each explicit-cue write's metadata.
+#:
+#: The ``(?:^|[\s.!?])`` prefix is a known-imperfect boundary: it
+#: prevents mid-word matches but accepts whitespace-prefixed
+#: subordinate-clause contexts like "I had to remember that time". We
+#: ship that behavior for V1 because the natural-feeling cues ("please
+#: remember that …", "ok, remember that …") depend on whitespace-
+#: prefix matching. A test locks the current behavior in; tune via a
+#: discourse-marker allowlist in a follow-up if false positives bite.
+_CUE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"""
+    (?:^|[\s.!?])
+    (?:
+        (?P<remember_that>remember\s+that)
+        |
+        (?P<take_a_note>take\s+a\s+note\s+that)
+        |
+        (?P<dont_forget>(?:do\s+not|don't)\s+forget(?:\s+that)?)
+    )
+    \s+
+    (?P<content>.+?)
+    \s*[.!?]*\s*$
+    """,
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
+
+#: Strong references to in-flight classifier tasks. asyncio only
+#: holds weak refs to tasks internally — without this set a task may
+#: be garbage-collected mid-run. The done-callback discards entries
+#: on completion so the set doesn't grow unbounded. Not thread-safe;
+#: single-event-loop assumption holds throughout FRIDAY. Shutdown
+#: cancellation wiring lands with #101.
+_pending_tasks: set[asyncio.Task[None]] = set()
 
 _log = logging.getLogger("agent.memory")
 
@@ -682,3 +727,172 @@ async def search_memories(
             rows = await cur.fetchall()
 
     return [_row_to_memory(r) for r in rows]
+
+
+def detect_explicit_cue(text: str) -> tuple[str, str, str] | None:
+    """Detect an explicit "remember X" cue in a user turn.
+
+    Returns ``(kind, content, cue_type)`` on a match:
+
+    * ``kind`` — always ``"fact"`` for explicit-cue writes. The
+      classifier path (if it also fires on the same turn) does any
+      finer typing.
+    * ``content`` — the extracted text after the cue, with trailing
+      sentence-terminating punctuation and surrounding whitespace
+      stripped.
+    * ``cue_type`` — a stable identifier (``"remember_that"``,
+      ``"take_a_note"``, or ``"dont_forget"``) for the metadata audit
+      trail and future dedup grouping.
+
+    Returns ``None`` if no cue matches or the extracted content is
+    empty after stripping.
+
+    Known imperfection: the boundary rule is whitespace-permissive,
+    so subordinate-clause contexts like "I had to remember that time"
+    WILL match. We ship that for V1 because tightening it would
+    reject natural cues like "please remember that X" and "ok,
+    remember that X". A follow-up may introduce a discourse-marker
+    allowlist if the false positives bite in practice.
+
+    Pure function. No I/O, no DB access. Modality-agnostic per
+    ADR-0006 §Writer — identical behavior on voice-STT transcripts
+    and typed text.
+    """
+    m = _CUE_PATTERN.search(text)
+    if m is None:
+        return None
+    content = m.group("content").strip()
+    content = content.rstrip(".!?").strip()
+    if not content:
+        return None
+    if m.group("remember_that"):
+        cue_type = "remember_that"
+    elif m.group("take_a_note"):
+        cue_type = "take_a_note"
+    else:
+        cue_type = "dont_forget"
+    return ("fact", content, cue_type)
+
+
+async def _classify_and_write(
+    db_path: Path,
+    user_turn: str,
+    prior_assistant: str | None,
+) -> None:
+    """Background task body — classify, then write if durable.
+
+    Swallows every non-cancel exception with a WARNING log; never
+    re-raises into the event loop (an unhandled task exception
+    surfaces as a confusing "Task exception was never retrieved"
+    warning). :class:`asyncio.CancelledError` propagates so #101's
+    future shutdown-cancel flow can tear down pending tasks cleanly.
+    """
+    try:
+        result = await classify_turn_for_memory(user_turn, prior_assistant)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — writer never surfaces to user
+        _log.warning("classifier task: classify call failed: %s", exc)
+        return
+    if result is None:
+        return
+    try:
+        # Our audit tags clobber any model-returned metadata so the
+        # provenance record is tamper-resistant from the model's
+        # perspective.
+        metadata = {
+            **result.metadata,
+            "source": _CLASSIFIER_SOURCE,
+            "model": "claude-haiku-5-5",
+        }
+        await add_memory(
+            db_path,
+            kind=result.kind,
+            content=result.content,
+            metadata=metadata,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — writer never surfaces to user
+        _log.warning("classifier task: add_memory failed: %s", exc)
+
+
+def schedule_memory_classification(
+    db_path: Path,
+    user_turn: str,
+    prior_assistant: str | None = None,
+    *,
+    task_registry: set[asyncio.Task[None]] | None = None,
+) -> asyncio.Task[None]:
+    """Spawn a fire-and-forget classifier task.
+
+    Returns the spawned :class:`asyncio.Task`. Callers are NOT
+    required to await it — voice/text loops never will. The task is
+    added to a strong-reference registry (``task_registry`` if given,
+    else the module-level :data:`_pending_tasks`) with a done-callback
+    that discards on completion. Without this strong reference,
+    asyncio can garbage-collect the task mid-run because its internal
+    task set holds weak references only.
+
+    ``task_registry`` injection point exists so tests can assert on
+    registry membership without touching the module global.
+
+    The task body in :func:`_classify_and_write` swallows all
+    non-cancel exceptions per ADR-0006 §Writer.
+    """
+    registry = task_registry if task_registry is not None else _pending_tasks
+    task = asyncio.create_task(_classify_and_write(db_path, user_turn, prior_assistant))
+    registry.add(task)
+    task.add_done_callback(registry.discard)
+    return task
+
+
+async def process_turn_for_memory(
+    db_path: Path,
+    user_turn: str,
+    prior_assistant: str | None = None,
+    *,
+    task_registry: set[asyncio.Task[None]] | None = None,
+) -> tuple[int | None, asyncio.Task[None]]:
+    """Run both writer paths for a single user turn.
+
+    Synchronous path: :func:`detect_explicit_cue` on ``user_turn``.
+    On a match, awaits :func:`add_memory` immediately so the row
+    lands within the turn (AC 1 of #78). A DB failure logs a WARNING
+    and returns ``None`` for the explicit id so the caller can decide
+    whether to retry or move on.
+
+    Background path: always spawns a classifier task via
+    :func:`schedule_memory_classification`. Returns the task so tests
+    can await it; the loops never will.
+
+    Returns ``(explicit_memory_id_or_None, classifier_task)``.
+
+    Modality-agnostic — identical behavior whether called from
+    ``voice_loop`` or ``text_loop`` (loop wiring lands in #101).
+    """
+    explicit_id: int | None = None
+    cue = detect_explicit_cue(user_turn)
+    if cue is not None:
+        kind, content, cue_type = cue
+        try:
+            explicit_id = await add_memory(
+                db_path,
+                kind=kind,
+                content=content,
+                metadata={
+                    "source": _CUE_SOURCE,
+                    "cue_type": cue_type,
+                    "cue_phrase": user_turn,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 — writer never surfaces to user
+            _log.warning("explicit-cue write failed: %s", exc)
+            explicit_id = None
+    classifier_task = schedule_memory_classification(
+        db_path,
+        user_turn,
+        prior_assistant,
+        task_registry=task_registry,
+    )
+    return (explicit_id, classifier_task)

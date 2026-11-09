@@ -32,8 +32,12 @@ mandatory finalization flush at generator close, not by the
 boundary regex).
 """
 
+import json
+import logging
 import re
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+from typing import Any, Final
 
 import httpx2
 from anthropic import (
@@ -48,11 +52,15 @@ from agent.models import MODEL
 __all__ = [
     "APIConnectionError",
     "AuthenticationError",
+    "MemoryClassification",
     "NetworkError",
     "RateLimitError",
+    "classify_turn_for_memory",
     "stream_sentences",
     "stream_tokens",
 ]
+
+_log = logging.getLogger("agent.claude")
 
 
 class NetworkError(Exception):
@@ -73,6 +81,35 @@ class NetworkError(Exception):
 
 
 _MAX_TOKENS: int = 1024
+
+# #78 memory writer — classifier knobs. Smallest capable Claude per
+# ADR-0006 Implementation Notes (classifier model is deliberately
+# not routed through agent/models.py; that constant stays the single
+# source of truth for the main-conversation model per Tier 1 §15).
+# TODO(#78-tuning): revisit if extraction quality is poor in practice.
+_CLASSIFIER_MODEL: Final[str] = "claude-haiku-5-5"
+_CLASSIFIER_MAX_TOKENS: Final[int] = 512
+_CLASSIFIER_TIMEOUT_SECONDS: Final[float] = 10.0
+
+# Frozen prompt. A snapshot test asserts it does not drift silently —
+# the classifier's output distribution is prompt-dependent, so any
+# rewrite should be a visible test change.
+_CLASSIFIER_SYSTEM_PROMPT: Final[str] = (
+    "You decide whether a user's turn contains a durable fact worth "
+    "remembering long-term for a personal assistant named FRIDAY. "
+    "Durable means: preferences, relationships, projects, facts the "
+    "user has stated about themselves or their world — the kind of "
+    "thing a close colleague would remember. Not durable: small talk, "
+    "momentary feelings, questions, acknowledgements, requests for "
+    "action.\n\n"
+    "Respond with ONE JSON object and nothing else. On a durable fact:\n"
+    '  {"remember": true, "kind": "<fact|preference|person|project>", '
+    '"content": "<concise third-person statement>", "metadata": {}}\n'
+    "On no durable fact:\n"
+    '  {"remember": false}\n\n'
+    'Keep "content" short (under 160 chars), third-person, declarative. '
+    "Never include the user's name — the storage layer handles ownership."
+)
 
 # Safety valve for pathological output: prose walls without punctuation
 # (code blocks, ASCII art, long URLs). Inference basis — typical Claude
@@ -286,3 +323,130 @@ async def stream_sentences(messages: list[dict], system: str) -> AsyncIterator[s
             raise NetworkError(str(e)) from e
     finally:
         await tokens.aclose()
+
+
+@dataclass(frozen=True)
+class MemoryClassification:
+    """Structured result from :func:`classify_turn_for_memory`.
+
+    Returned when the classifier decides a turn contains a durable
+    fact. Fields mirror :class:`agent.memory.Memory` so the writer
+    scheduler can feed directly into :func:`agent.memory.add_memory`.
+    """
+
+    kind: str
+    content: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+async def classify_turn_for_memory(
+    user_turn: str,
+    prior_assistant: str | None = None,
+) -> MemoryClassification | None:
+    """Ask Claude whether ``user_turn`` contains a durable fact.
+
+    Returns a :class:`MemoryClassification` on
+    ``{"remember": true, ...}`` with a valid ``kind`` + ``content``,
+    or ``None`` on ``{"remember": false}``, malformed JSON, invalid
+    structure, empty response, or any API error. All failure modes
+    log a WARNING under ``agent.claude`` and return ``None`` — callers
+    do NOT need to catch exceptions. This matches ADR-0006 §Writer's
+    "Failures log and do not surface to the user" directive at the
+    actual failure site.
+
+    ``prior_assistant``, when provided, is included in the user
+    message as additional context (ADR-0006 open question: starting
+    assumption is latest user turn + prior assistant turn).
+
+    One-shot non-streaming call with a 10s request timeout and a 512
+    max-tokens cap. Model: :data:`_CLASSIFIER_MODEL`.
+    """
+    if prior_assistant is not None:
+        user_msg = f"Prior assistant: {prior_assistant}\nUser turn: {user_turn}"
+    else:
+        user_msg = f"User turn: {user_turn}"
+
+    try:
+        client = _get_client()
+        response = await client.messages.create(
+            model=_CLASSIFIER_MODEL,
+            max_tokens=_CLASSIFIER_MAX_TOKENS,
+            system=_CLASSIFIER_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_msg}],
+            timeout=_CLASSIFIER_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001 — writer never surfaces to user
+        # Broad Exception rather than anthropic.APIError specifically:
+        # the SDK can also surface httpx errors on connection drops
+        # (same shape as #55 D4 for mid-stream). Log + return None.
+        _log.warning("classifier call failed: %s", exc)
+        return None
+
+    if not response.content:
+        _log.warning("classifier returned empty content")
+        return None
+
+    # Select the first TEXT block. Claude Haiku-5.5 (and other 5.x
+    # models) can emit a ``thinking`` block before the text block
+    # even when extended thinking is NOT explicitly requested by the
+    # caller. A ThinkingBlock exposes ``.thinking``, not ``.text``, so
+    # blind ``content[0].text`` indexing would AttributeError, get
+    # swallowed by the broad except Exception above the write task,
+    # and silently drop the classification. ``getattr`` instead of
+    # attribute access protects against future SDK shape drift and
+    # matches the SimpleNamespace-based mocks our tests use.
+    text_block = next(
+        (b for b in response.content if getattr(b, "type", None) == "text"),
+        None,
+    )
+    if text_block is None:
+        block_types = [getattr(b, "type", None) for b in response.content]
+        _log.warning(
+            "classifier response has no text block; block types=%r",
+            block_types,
+        )
+        return None
+
+    raw = text_block.text.strip()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        truncated = raw if len(raw) <= 200 else raw[:200] + "…"
+        _log.warning(
+            "classifier returned malformed JSON (%s); raw=%r",
+            exc,
+            truncated,
+        )
+        return None
+
+    if not isinstance(payload, dict):
+        _log.warning(
+            "classifier payload is not an object; got %s",
+            type(payload).__name__,
+        )
+        return None
+
+    if payload.get("remember") is not True:
+        # Explicit false or missing — "nothing to save" is not a failure.
+        return None
+
+    kind = payload.get("kind")
+    content = payload.get("content")
+    if not isinstance(kind, str) or not kind:
+        _log.warning(
+            "classifier remember=true but kind is missing/empty; payload=%r",
+            payload,
+        )
+        return None
+    if not isinstance(content, str) or not content:
+        _log.warning(
+            "classifier remember=true but content is missing/empty; payload=%r",
+            payload,
+        )
+        return None
+
+    metadata = payload.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    return MemoryClassification(kind=kind, content=content, metadata=metadata)

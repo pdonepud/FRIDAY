@@ -549,3 +549,287 @@ async def test_stream_sentences_consumer_break_closes_provider(monkeypatch, mock
     assert not resource_warnings, (
         f"ResourceWarnings during teardown: {[str(w.message) for w in resource_warnings]}"
     )
+
+
+# =================================================================
+# #78 — classify_turn_for_memory
+# =================================================================
+
+
+def _make_classifier_response(text: str):
+    """Build a SimpleNamespace that mimics an anthropic Message
+    response object with a single ``type="text"`` content block.
+
+    The classifier selects the first block whose ``.type == "text"``
+    (see #78 CR fix: Haiku-5.5 can emit a ``thinking`` block ahead of
+    the text block), so every mock block here carries ``type="text"``
+    explicitly.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)])
+
+
+def _patch_messages_create(monkeypatch, *, text: str | None = None, side_effect=None):
+    """Replace agent.claude._get_client() with a MagicMock whose
+    messages.create is an AsyncMock. Returns the create AsyncMock
+    so the caller can inspect call_args.
+    """
+    create_mock = AsyncMock()
+    if side_effect is not None:
+        create_mock.side_effect = side_effect
+    else:
+        create_mock.return_value = _make_classifier_response(text or "")
+
+    fake_client = MagicMock(name="AsyncAnthropic()")
+    fake_client.messages.create = create_mock
+    monkeypatch.setattr("agent.claude._get_client", lambda: fake_client)
+    return create_mock
+
+
+async def test_classify_turn_for_memory_remember_true_returns_classification(
+    monkeypatch,
+):
+    """A well-formed ``remember: true`` payload round-trips into a
+    MemoryClassification with all three fields preserved."""
+    _patch_messages_create(
+        monkeypatch,
+        text=(
+            '{"remember": true, "kind": "preference", '
+            '"content": "likes oat milk", "metadata": {"confidence": 0.9}}'
+        ),
+    )
+
+    result = await agent.claude.classify_turn_for_memory("I like oat milk")
+    assert result is not None
+    assert result.kind == "preference"
+    assert result.content == "likes oat milk"
+    assert result.metadata == {"confidence": 0.9}
+
+
+async def test_classify_turn_for_memory_remember_false_returns_none(monkeypatch):
+    """``remember: false`` is the "nothing to save" path — None, no warn."""
+    _patch_messages_create(monkeypatch, text='{"remember": false}')
+    result = await agent.claude.classify_turn_for_memory("just small talk")
+    assert result is None
+
+
+async def test_classify_turn_for_memory_malformed_json_returns_none_and_warns(monkeypatch, caplog):
+    """Malformed JSON falls back to None + WARNING naming the failure
+    mode. Raw payload is truncated in the log line."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="agent.claude")
+    _patch_messages_create(monkeypatch, text="not valid json {{{")
+
+    result = await agent.claude.classify_turn_for_memory("anything")
+    assert result is None
+    assert any("malformed JSON" in rec.message for rec in caplog.records), (
+        f"expected 'malformed JSON' in logs; got {[r.message for r in caplog.records]}"
+    )
+
+
+async def test_classify_turn_for_memory_api_error_returns_none_and_warns(monkeypatch, caplog):
+    """Any exception from the SDK call surfaces as None + WARNING
+    containing ``classifier call failed``. Broad-Exception catch is
+    deliberate: SDK can raise httpx-origin errors on connection
+    drops that aren't anthropic.APIError subclasses."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="agent.claude")
+    _patch_messages_create(monkeypatch, side_effect=RuntimeError("simulated network"))
+
+    result = await agent.claude.classify_turn_for_memory("anything")
+    assert result is None
+    assert any("classifier call failed" in rec.message for rec in caplog.records)
+
+
+async def test_classify_turn_for_memory_includes_prior_assistant(monkeypatch):
+    """When prior_assistant is passed, it's embedded in the user
+    message so Claude sees the one-turn conversational context ADR-0006
+    §Open Questions's starting assumption calls for."""
+    create_mock = _patch_messages_create(monkeypatch, text='{"remember": false}')
+    await agent.claude.classify_turn_for_memory(
+        "I moved to SF",
+        prior_assistant="Where did you move?",
+    )
+    # Inspect the call shape.
+    _, kwargs = create_mock.call_args
+    messages = kwargs["messages"]
+    assert len(messages) == 1
+    user_content = messages[0]["content"]
+    assert "Prior assistant: Where did you move?" in user_content
+    assert "User turn: I moved to SF" in user_content
+
+
+def test_classifier_system_prompt_snapshot():
+    """Snapshot guard. If the classifier prompt changes, this test
+    must be explicitly updated — the classifier's output distribution
+    is prompt-dependent, so silent drift corrupts memory quality over
+    time."""
+    from agent.claude import _CLASSIFIER_SYSTEM_PROMPT
+
+    assert _CLASSIFIER_SYSTEM_PROMPT.startswith(
+        "You decide whether a user's turn contains a durable fact"
+    )
+    assert "Never include the user's name" in _CLASSIFIER_SYSTEM_PROMPT
+    # Rough length guards — content shape should be stable to ~2x.
+    assert 500 <= len(_CLASSIFIER_SYSTEM_PROMPT) <= 1500
+
+
+# -----------------------------------------------------------------
+# classify_turn_for_memory — defensive branches
+# -----------------------------------------------------------------
+
+
+async def test_classify_turn_for_memory_empty_content_returns_none_and_warns(monkeypatch, caplog):
+    """SDK-edge-case guard: response.content is an empty list. Must
+    warn + return None rather than IndexError on content[0]."""
+    import logging
+    from types import SimpleNamespace
+
+    caplog.set_level(logging.WARNING, logger="agent.claude")
+    fake_client = MagicMock(name="AsyncAnthropic()")
+    fake_client.messages.create = AsyncMock(return_value=SimpleNamespace(content=[]))
+    monkeypatch.setattr("agent.claude._get_client", lambda: fake_client)
+
+    result = await agent.claude.classify_turn_for_memory("anything")
+    assert result is None
+    assert any("empty content" in rec.message for rec in caplog.records)
+
+
+async def test_classify_turn_for_memory_non_dict_payload_returns_none_and_warns(
+    monkeypatch, caplog
+):
+    """Valid JSON that parses to a non-object (list/str/number) is
+    corrupt by contract — log + None."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="agent.claude")
+    _patch_messages_create(monkeypatch, text="[1, 2, 3]")
+
+    result = await agent.claude.classify_turn_for_memory("anything")
+    assert result is None
+    assert any("payload is not an object" in rec.message for rec in caplog.records)
+
+
+async def test_classify_turn_for_memory_remember_true_missing_kind_returns_none(
+    monkeypatch, caplog
+):
+    """``remember: true`` with no ``kind`` is malformed structure —
+    log + None rather than raise."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="agent.claude")
+    _patch_messages_create(
+        monkeypatch,
+        text='{"remember": true, "content": "something"}',
+    )
+
+    result = await agent.claude.classify_turn_for_memory("anything")
+    assert result is None
+    assert any("kind is missing/empty" in rec.message for rec in caplog.records)
+
+
+async def test_classify_turn_for_memory_remember_true_missing_content_returns_none(
+    monkeypatch, caplog
+):
+    """``remember: true`` with no ``content`` is malformed — log + None."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="agent.claude")
+    _patch_messages_create(
+        monkeypatch,
+        text='{"remember": true, "kind": "fact"}',
+    )
+
+    result = await agent.claude.classify_turn_for_memory("anything")
+    assert result is None
+    assert any("content is missing/empty" in rec.message for rec in caplog.records)
+
+
+async def test_classify_turn_for_memory_non_dict_metadata_falls_back_to_empty(
+    monkeypatch,
+):
+    """``metadata`` that isn't a dict silently falls back to ``{}``
+    rather than failing the whole classification. Keeps the write
+    path robust against minor model output variation."""
+    _patch_messages_create(
+        monkeypatch,
+        text=('{"remember": true, "kind": "fact", "content": "x", "metadata": [1, 2, 3]}'),
+    )
+
+    result = await agent.claude.classify_turn_for_memory("anything")
+    assert result is not None
+    assert result.metadata == {}
+
+
+# -----------------------------------------------------------------
+# classify_turn_for_memory — thinking-block handling (#78 CR F1)
+# -----------------------------------------------------------------
+
+
+async def test_classify_turn_for_memory_skips_thinking_block_returns_text_block_payload(
+    monkeypatch,
+):
+    """Claude Haiku-5.5 can emit a thinking block before the text
+    block even when extended thinking isn't requested. The classifier
+    must skip the thinking block and parse the text block's payload
+    rather than AttributeError on ``.text``."""
+    from types import SimpleNamespace
+
+    thinking = SimpleNamespace(type="thinking", thinking="let me reason about this...")
+    text = SimpleNamespace(type="text", text='{"remember": false}')
+    response = SimpleNamespace(content=[thinking, text])
+    fake_client = MagicMock(name="AsyncAnthropic()")
+    fake_client.messages.create = AsyncMock(return_value=response)
+    monkeypatch.setattr("agent.claude._get_client", lambda: fake_client)
+
+    result = await agent.claude.classify_turn_for_memory("just small talk")
+    assert result is None  # the text block's "remember: false" was honored
+
+
+async def test_classify_turn_for_memory_thinking_before_remember_true_round_trips(
+    monkeypatch,
+):
+    """Thinking block + text block with ``remember: true`` must
+    produce a MemoryClassification — proves the thinking-first case
+    works end-to-end for both the false AND true branches."""
+    from types import SimpleNamespace
+
+    thinking = SimpleNamespace(type="thinking", thinking="...")
+    text = SimpleNamespace(
+        type="text",
+        text=(
+            '{"remember": true, "kind": "fact", "content": "user likes espresso", "metadata": {}}'
+        ),
+    )
+    response = SimpleNamespace(content=[thinking, text])
+    fake_client = MagicMock(name="AsyncAnthropic()")
+    fake_client.messages.create = AsyncMock(return_value=response)
+    monkeypatch.setattr("agent.claude._get_client", lambda: fake_client)
+
+    result = await agent.claude.classify_turn_for_memory("I love espresso")
+    assert result is not None
+    assert result.kind == "fact"
+    assert result.content == "user likes espresso"
+
+
+async def test_classify_turn_for_memory_only_thinking_no_text_returns_none_and_warns(
+    monkeypatch, caplog
+):
+    """Degenerate: all blocks are thinking, no text block at all.
+    Log + None rather than IndexError or AttributeError."""
+    import logging
+    from types import SimpleNamespace
+
+    caplog.set_level(logging.WARNING, logger="agent.claude")
+    thinking = SimpleNamespace(type="thinking", thinking="...")
+    response = SimpleNamespace(content=[thinking])
+    fake_client = MagicMock(name="AsyncAnthropic()")
+    fake_client.messages.create = AsyncMock(return_value=response)
+    monkeypatch.setattr("agent.claude._get_client", lambda: fake_client)
+
+    result = await agent.claude.classify_turn_for_memory("anything")
+    assert result is None
+    assert any("no text block" in rec.message for rec in caplog.records)
