@@ -386,7 +386,28 @@ async def classify_turn_for_memory(
         _log.warning("classifier returned empty content")
         return None
 
-    raw = response.content[0].text.strip()
+    # Select the first TEXT block. Claude Haiku-5.5 (and other 5.x
+    # models) can emit a ``thinking`` block before the text block
+    # even when extended thinking is NOT explicitly requested by the
+    # caller. A ThinkingBlock exposes ``.thinking``, not ``.text``, so
+    # blind ``content[0].text`` indexing would AttributeError, get
+    # swallowed by the broad except Exception above the write task,
+    # and silently drop the classification. ``getattr`` instead of
+    # attribute access protects against future SDK shape drift and
+    # matches the SimpleNamespace-based mocks our tests use.
+    text_block = next(
+        (b for b in response.content if getattr(b, "type", None) == "text"),
+        None,
+    )
+    if text_block is None:
+        block_types = [getattr(b, "type", None) for b in response.content]
+        _log.warning(
+            "classifier response has no text block; block types=%r",
+            block_types,
+        )
+        return None
+
+    raw = text_block.text.strip()
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:

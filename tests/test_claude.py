@@ -558,10 +558,16 @@ async def test_stream_sentences_consumer_break_closes_provider(monkeypatch, mock
 
 def _make_classifier_response(text: str):
     """Build a SimpleNamespace that mimics an anthropic Message
-    response object with a single text content block."""
+    response object with a single ``type="text"`` content block.
+
+    The classifier selects the first block whose ``.type == "text"``
+    (see #78 CR fix: Haiku-5.5 can emit a ``thinking`` block ahead of
+    the text block), so every mock block here carries ``type="text"``
+    explicitly.
+    """
     from types import SimpleNamespace
 
-    return SimpleNamespace(content=[SimpleNamespace(text=text)])
+    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)])
 
 
 def _patch_messages_create(monkeypatch, *, text: str | None = None, side_effect=None):
@@ -756,3 +762,74 @@ async def test_classify_turn_for_memory_non_dict_metadata_falls_back_to_empty(
     result = await agent.claude.classify_turn_for_memory("anything")
     assert result is not None
     assert result.metadata == {}
+
+
+# -----------------------------------------------------------------
+# classify_turn_for_memory — thinking-block handling (#78 CR F1)
+# -----------------------------------------------------------------
+
+
+async def test_classify_turn_for_memory_skips_thinking_block_returns_text_block_payload(
+    monkeypatch,
+):
+    """Claude Haiku-5.5 can emit a thinking block before the text
+    block even when extended thinking isn't requested. The classifier
+    must skip the thinking block and parse the text block's payload
+    rather than AttributeError on ``.text``."""
+    from types import SimpleNamespace
+
+    thinking = SimpleNamespace(type="thinking", thinking="let me reason about this...")
+    text = SimpleNamespace(type="text", text='{"remember": false}')
+    response = SimpleNamespace(content=[thinking, text])
+    fake_client = MagicMock(name="AsyncAnthropic()")
+    fake_client.messages.create = AsyncMock(return_value=response)
+    monkeypatch.setattr("agent.claude._get_client", lambda: fake_client)
+
+    result = await agent.claude.classify_turn_for_memory("just small talk")
+    assert result is None  # the text block's "remember: false" was honored
+
+
+async def test_classify_turn_for_memory_thinking_before_remember_true_round_trips(
+    monkeypatch,
+):
+    """Thinking block + text block with ``remember: true`` must
+    produce a MemoryClassification — proves the thinking-first case
+    works end-to-end for both the false AND true branches."""
+    from types import SimpleNamespace
+
+    thinking = SimpleNamespace(type="thinking", thinking="...")
+    text = SimpleNamespace(
+        type="text",
+        text=(
+            '{"remember": true, "kind": "fact", "content": "user likes espresso", "metadata": {}}'
+        ),
+    )
+    response = SimpleNamespace(content=[thinking, text])
+    fake_client = MagicMock(name="AsyncAnthropic()")
+    fake_client.messages.create = AsyncMock(return_value=response)
+    monkeypatch.setattr("agent.claude._get_client", lambda: fake_client)
+
+    result = await agent.claude.classify_turn_for_memory("I love espresso")
+    assert result is not None
+    assert result.kind == "fact"
+    assert result.content == "user likes espresso"
+
+
+async def test_classify_turn_for_memory_only_thinking_no_text_returns_none_and_warns(
+    monkeypatch, caplog
+):
+    """Degenerate: all blocks are thinking, no text block at all.
+    Log + None rather than IndexError or AttributeError."""
+    import logging
+    from types import SimpleNamespace
+
+    caplog.set_level(logging.WARNING, logger="agent.claude")
+    thinking = SimpleNamespace(type="thinking", thinking="...")
+    response = SimpleNamespace(content=[thinking])
+    fake_client = MagicMock(name="AsyncAnthropic()")
+    fake_client.messages.create = AsyncMock(return_value=response)
+    monkeypatch.setattr("agent.claude._get_client", lambda: fake_client)
+
+    result = await agent.claude.classify_turn_for_memory("anything")
+    assert result is None
+    assert any("no text block" in rec.message for rec in caplog.records)
