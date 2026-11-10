@@ -291,3 +291,30 @@ def test_buffer_token_count_updates_on_eviction():
     # Append a third → first is evicted, so 10 drops out and new 2 joins.
     buf.append(Turn(role="user", content="c" * 8))  # 2 tokens
     assert buf.token_count() == 7  # 5 + 2
+
+
+def test_pop_last_returns_most_recent_turn_and_shrinks():
+    """pop_last removes the last Turn and returns it; len drops by
+    one; as_messages() loses only that turn's dict."""
+    buf = ConversationBuffer(turn_limit=5)
+    t_user1 = Turn(role="user", content="first")
+    t_assistant = Turn(role="assistant", content="reply")
+    t_user2 = Turn(role="user", content="second")
+    buf.append(t_user1)
+    buf.append(t_assistant)
+    buf.append(t_user2)
+
+    popped = buf.pop_last()
+
+    assert popped is t_user2
+    assert len(buf) == 2
+    assert buf.as_messages() == [t_user1.to_message(), t_assistant.to_message()]
+
+
+def test_pop_last_on_empty_buffer_returns_none():
+    """pop_last on an empty buffer returns None without raising —
+    callers in error-recovery paths don't need to pre-check length."""
+    buf = ConversationBuffer()
+    assert buf.pop_last() is None
+    assert len(buf) == 0
+    assert buf.as_messages() == []

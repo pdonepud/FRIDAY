@@ -15,6 +15,51 @@ public surfaces unchanged. Both loops share ``agent/claude.py`` as the
 single LLM seam per ADR-0002: ``stream_tokens`` for text REPL
 character-level streaming, ``stream_sentences`` for voice-path
 sentence-chunking into TTS.
+
+## Conversation state (#101)
+
+Both loops consume a single :class:`agent.buffer.ConversationBuffer`
+instance loaded once by :func:`run` via :func:`_init_session_state`.
+The same instance flows to whichever loop takes control, including
+the voice-to-text fallback on audio-device unavailability — so there
+is no double-load of ``session.json``.
+
+User and assistant turns are appended as :class:`agent.buffer.Turn`
+objects; ``stream_tokens`` / ``stream_sentences`` consume
+``buffer.as_messages()`` at call time. Every ``messages.pop()`` site
+from #55's error-recovery scaffolding migrates to
+``buffer.pop_last()`` one-for-one; the recovery structure is
+unchanged.
+
+## Writer wiring (#78 via #101)
+
+After each user Turn is appended, both loops call
+:func:`agent.memory.process_turn_for_memory` with the second-to-last
+Turn's content as ``prior_assistant`` context. Classifier tasks are
+registered in :data:`agent.memory._pending_tasks` (private attribute
+imported directly here because this loop module is the sole shutdown-
+drain owner; the alternative of a public accessor is scope creep).
+
+## Shutdown ordering
+
+On clean exit:
+
+1. The loop's outer ``try/finally`` drains pending classifier tasks
+   via :func:`_drain_classifier_tasks` with a
+   :data:`_CLASSIFIER_DRAIN_TIMEOUT_S` budget. On timeout the
+   stragglers are explicitly cancelled to avoid "Task was destroyed
+   but it is pending!" asyncio warnings.
+2. Control returns from the loop coroutine; ``asyncio.run()`` tears
+   down.
+3. The ``atexit`` callback registered by #75's
+   :func:`agent.session.register_shutdown_save` fires and writes
+   ``session.json``.
+
+``session.json`` captures conversation Turn state only; classifier
+writes target ``memory.db`` (a different store), so there is no race
+between the two by design — the drain is best-effort for the
+classifier's independent write path, not a correctness requirement
+for session persistence.
 """
 
 from __future__ import annotations
@@ -22,13 +67,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import logging
 import os
 import sys
 from collections.abc import AsyncIterator
+from typing import Final
 
 from dotenv import load_dotenv
 
 from agent import audio, ptt, stt, tts
+from agent.buffer import ConversationBuffer, Turn
 from agent.claude import (
     APIConnectionError,
     AuthenticationError,
@@ -38,8 +86,32 @@ from agent.claude import (
     stream_tokens,
 )
 from agent.events import BargeInEvent
+
+# ``_pending_tasks`` is a private module-level attribute of
+# ``agent.memory`` (added in #78) — this loop module is the sole
+# shutdown-drain owner, so importing it by name here is preferable to
+# adding a public accessor just for us. Documented in the module
+# docstring §Writer wiring.
+from agent.memory import (
+    _pending_tasks,
+    bootstrap_db,
+    default_memory_db_path,
+    process_turn_for_memory,
+)
+from agent.session import (
+    default_session_path,
+    load_session,
+    register_shutdown_save,
+)
 from agent.system_prompt import SYSTEM_PROMPT
 from agent.turn_state import TurnState, TurnStateMachine
+
+_log = logging.getLogger("agent.loop")
+
+#: Budget for :func:`_drain_classifier_tasks` on clean loop exit.
+#: Short enough to not wedge Ctrl+C shutdown; long enough that a
+#: typical Claude Haiku classifier call (p95 ~1-2 s) can finish.
+_CLASSIFIER_DRAIN_TIMEOUT_S: Final[float] = 3.0
 
 # --- Banners + stock messages -------------------------------------------
 _BANNER: str = "FRIDAY — Tier 1 baseline. Type to talk. Ctrl+C to exit."
@@ -259,7 +331,89 @@ async def _watch_release(
         ptt_release.set()
 
 
-async def text_loop() -> int:
+def _init_session_state() -> ConversationBuffer:
+    """Load the persisted session buffer and register the shutdown save.
+
+    Called exactly once from :func:`run` before dispatching to a
+    loop. Returns the buffer (empty on first run; populated from
+    ``session.json`` otherwise). Also registers the ``atexit``
+    callback so the buffer persists on clean process exit.
+
+    Idempotent per #75's :func:`agent.session.register_shutdown_save`
+    design — a hypothetical second call with the same ``(buffer,
+    path)`` pair is a silent no-op.
+    """
+    path = default_session_path()
+    buffer = load_session(path)
+    register_shutdown_save(buffer, path)
+    return buffer
+
+
+async def _init_memory_db() -> None:
+    """Idempotently bootstrap the long-term memory DB at startup.
+
+    Must run before any writer path (:func:`process_turn_for_memory`)
+    fires. :func:`agent.memory.bootstrap_db` is idempotent per #76
+    — a second call on an up-to-date DB is a no-op. Also surfaces
+    FTS5-unavailability (:class:`agent.memory.FTS5UnavailableError`)
+    at startup rather than mid-turn.
+    """
+    await bootstrap_db(default_memory_db_path())
+
+
+def _prior_assistant_text(buffer: ConversationBuffer) -> str | None:
+    """Return the Turn-before-last's content, or None if unavailable.
+
+    Called after appending a user Turn — the second-to-last Turn is
+    then the previous assistant turn (or absent on first-ever turn).
+    Role-alternation is a loop invariant enforced at append time, so
+    this is always an assistant Turn when it exists.
+
+    Returns None if the buffer has fewer than 2 Turns.
+    """
+    turns = list(buffer)
+    if len(turns) < 2:
+        return None
+    return turns[-2].content
+
+
+async def _drain_classifier_tasks() -> None:
+    """Best-effort drain of in-flight classifier tasks on clean exit.
+
+    Wait up to :data:`_CLASSIFIER_DRAIN_TIMEOUT_S` for any pending
+    :mod:`agent.memory` classifier tasks to finish; cancel any that
+    overrun so Python's asyncio runtime doesn't emit "Task was
+    destroyed but it is pending!" warnings on teardown.
+
+    Called from both loops' outermost ``finally`` block, BEFORE any
+    SDK-stream cleanup, so a long-running classifier can still write
+    to ``memory.db`` without blocking the loop's own teardown by
+    more than the budget.
+    """
+    pending = [t for t in _pending_tasks if not t.done()]
+    if not pending:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*pending, return_exceptions=True),
+            timeout=_CLASSIFIER_DRAIN_TIMEOUT_S,
+        )
+    except TimeoutError:
+        # Python 3.11+ aliases asyncio.TimeoutError → builtin
+        # TimeoutError, so the builtin name is correct and ruff-clean.
+        cancelled = 0
+        for t in pending:
+            if not t.done():
+                t.cancel()
+                cancelled += 1
+        _log.warning(
+            "drained %d classifier task(s) via cancel after %ss timeout",
+            cancelled,
+            _CLASSIFIER_DRAIN_TIMEOUT_S,
+        )
+
+
+async def text_loop(buffer: ConversationBuffer) -> int:
     """Tier-2-preserved keyboard REPL. ``run()`` dispatches here on ``--text``.
 
     Exit codes:
@@ -267,63 +421,83 @@ async def text_loop() -> int:
         2 — unrecoverable auth failure mid-session.
 
     Assumes ``run()`` has already loaded ``.env`` and verified
-    ``ANTHROPIC_API_KEY`` is present.
+    ``ANTHROPIC_API_KEY`` is present, and loaded ``buffer`` via
+    :func:`_init_session_state`.
     """
     print(_BANNER)
-    messages: list[dict] = []
+    try:
+        while True:
+            # --- prompt for a user turn ------------------------------
+            try:
+                # sync input() is deliberate — text REPL has no
+                # concurrent coroutines and pauses on stdin by design.
+                user = input("you > ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print(_GOODBYE)
+                return 0
+            if not user:
+                continue
 
-    while True:
-        # --- prompt for a user turn ----------------------------------
-        try:
-            # sync input() is deliberate — text REPL has no concurrent
-            # coroutines and pauses on stdin by design.
-            user = input("you > ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print(_GOODBYE)
-            return 0
-        if not user:
-            continue
+            # --- append user turn + fire writer ----------------------
+            buffer.append(Turn(role="user", content=user))
+            # #78 writer paths fire after the Turn lands on the buffer
+            # so ``_prior_assistant_text`` sees the previous assistant
+            # Turn as context (or None on the first turn). Any failure
+            # inside ``process_turn_for_memory`` is already logged and
+            # swallowed by that function per ADR-0006 §Writer; it
+            # cannot block or surface here.
+            await process_turn_for_memory(
+                default_memory_db_path(),
+                user,
+                prior_assistant=_prior_assistant_text(buffer),
+                task_registry=_pending_tasks,
+            )
 
-        # --- send it and stream the reply ----------------------------
-        messages.append({"role": "user", "content": user})
-        print("friday > ", end="", flush=True)
-        chunks: list[str] = []
-        try:
-            async for chunk in stream_tokens(messages, SYSTEM_PROMPT):
-                print(chunk, end="", flush=True)
-                chunks.append(chunk)
-            print()
-            messages.append({"role": "assistant", "content": "".join(chunks)})
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            # #55 D3 (R4): mid-stream Ctrl+C. Under asyncio.run (the
-            # only driver today) SIGINT delivers via main-task
-            # cancellation → CancelledError at the next await inside
-            # stream_tokens. KeyboardInterrupt is kept defensively for
-            # alternate drivers that don't install Runner's SIGINT
-            # handler. Text REPL users expect Ctrl+C to end the
-            # session (not interrupt the current token stream); the
-            # "interrupt what Friday is saying" UX lives in voice
-            # mode's Phase 5 handler.
-            print(_GOODBYE)
-            return 0
-        except AuthenticationError:
-            print("\n[auth] ANTHROPIC_API_KEY isn't working. Check your .env and restart.")
-            return 2
-        except RateLimitError:
-            print("\n[rate] Hit the rate limit — give it a moment.")
-            messages.pop()
-        except (APIConnectionError, NetworkError):
-            # NetworkError covers mid-stream httpx2.TransportError
-            # drops the SDK does NOT translate into APIConnectionError
-            # (see agent/claude.py; verified empirically in #55 D4).
-            print("\n[net] Can't reach Claude right now — check your connection.")
-            messages.pop()
-        except Exception as e:  # noqa: BLE001 — final safety net for text loop
-            print(f"\n[err] {type(e).__name__}: {e}")
-            messages.pop()
+            # --- send it and stream the reply ------------------------
+            print("friday > ", end="", flush=True)
+            chunks: list[str] = []
+            try:
+                async for chunk in stream_tokens(buffer.as_messages(), SYSTEM_PROMPT):
+                    print(chunk, end="", flush=True)
+                    chunks.append(chunk)
+                print()
+                buffer.append(Turn(role="assistant", content="".join(chunks)))
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                # #55 D3 (R4): mid-stream Ctrl+C. Under asyncio.run
+                # (the only driver today) SIGINT delivers via main-
+                # task cancellation → CancelledError at the next
+                # await inside stream_tokens. KeyboardInterrupt is
+                # kept defensively for alternate drivers that don't
+                # install Runner's SIGINT handler. Text REPL users
+                # expect Ctrl+C to end the session (not interrupt
+                # the current token stream); the "interrupt what
+                # Friday is saying" UX lives in voice mode's Phase 5
+                # handler.
+                print(_GOODBYE)
+                return 0
+            except AuthenticationError:
+                print("\n[auth] ANTHROPIC_API_KEY isn't working. Check your .env and restart.")
+                return 2
+            except RateLimitError:
+                print("\n[rate] Hit the rate limit — give it a moment.")
+                buffer.pop_last()
+            except (APIConnectionError, NetworkError):
+                # NetworkError covers mid-stream httpx2.TransportError
+                # drops the SDK does NOT translate into
+                # APIConnectionError (see agent/claude.py; verified
+                # empirically in #55 D4).
+                print("\n[net] Can't reach Claude right now — check your connection.")
+                buffer.pop_last()
+            except Exception as e:  # noqa: BLE001 — final safety net for text loop
+                print(f"\n[err] {type(e).__name__}: {e}")
+                buffer.pop_last()
+    finally:
+        # #101: best-effort drain so classifier writes get a chance to
+        # finish on clean exit. See module docstring §Shutdown ordering.
+        await _drain_classifier_tasks()
 
 
-async def voice_loop() -> int:
+async def voice_loop(buffer: ConversationBuffer) -> int:
     """Tier-3 push-to-talk pipeline. ``run()`` dispatches here by default.
 
     One turn: PRESSED → ``audio.capture`` → ``stt.transcribe`` →
@@ -347,7 +521,6 @@ async def voice_loop() -> int:
     three keys are present.
     """
     print(_VOICE_BANNER)
-    messages: list[dict] = []
     # #72 commit 3: voice_loop is the single owner of the state
     # machine. Observers (transcript store, metrics) register at
     # setup and never fire or hold state outside their own objects.
@@ -446,7 +619,19 @@ async def voice_loop() -> int:
                     continue
 
                 # --- Phase 4: user turn append ---------------------
-                messages.append({"role": "user", "content": transcript})
+                buffer.append(Turn(role="user", content=transcript))
+                # #78 writer paths: fire after the Turn lands on the
+                # buffer so ``_prior_assistant_text`` sees the previous
+                # assistant Turn as context (or None on the first
+                # turn). Any failure inside ``process_turn_for_memory``
+                # is already logged and swallowed by that function per
+                # ADR-0006 §Writer; it cannot block or surface here.
+                await process_turn_for_memory(
+                    default_memory_db_path(),
+                    transcript,
+                    prior_assistant=_prior_assistant_text(buffer),
+                    task_registry=_pending_tasks,
+                )
 
                 # --- Phase 5: Claude + TTS + playback --------------
                 collect: list[str] = []
@@ -507,7 +692,7 @@ async def voice_loop() -> int:
                 sentence_iter: AsyncIterator[str] | None = None
                 synth_iter: AsyncIterator[bytes] | None = None
                 try:
-                    sentence_iter = stream_sentences(messages, SYSTEM_PROMPT)
+                    sentence_iter = stream_sentences(buffer.as_messages(), SYSTEM_PROMPT)
                     synth_iter = tts.synthesize(_tee(sentence_iter, collect))
 
                     # #87: THINKING -> SPEAKING must fire only when
@@ -723,7 +908,7 @@ async def voice_loop() -> int:
                         # abort paths further down this except
                         # chain.
                         print("[no reply]")
-                        messages.pop()
+                        buffer.pop_last()
                         continue
                     if barged_in:
                         # BARGE_IN -> LISTENING fires after the inner
@@ -748,7 +933,7 @@ async def voice_loop() -> int:
                         # user alive without a popped-or-appended
                         # assistant would violate Anthropic's role-
                         # alternation requirement on the next turn.
-                        messages.pop()
+                        buffer.pop_last()
                         continue
                 except asyncio.CancelledError:
                     # #55 D3: mid-response Ctrl+C. Under asyncio.run
@@ -768,7 +953,7 @@ async def voice_loop() -> int:
                         raise
                     print("\n[stopped]")
                     _recover_to_listening_from_phase5(machine)
-                    messages.pop()
+                    buffer.pop_last()
                     continue
                 except AuthenticationError:
                     # #55 D6: name the env var so the user knows which
@@ -782,7 +967,7 @@ async def voice_loop() -> int:
                 except RateLimitError:
                     print("\n[rate] Hit the rate limit — give it a moment.")
                     _recover_to_listening_from_phase5(machine)
-                    messages.pop()
+                    buffer.pop_last()
                     continue
                 except (APIConnectionError, NetworkError):
                     # #55 D4: NetworkError covers mid-stream
@@ -792,7 +977,7 @@ async def voice_loop() -> int:
                     # at connect-time.
                     print("\n[net] Lost connection mid-response — try again.")
                     _recover_to_listening_from_phase5(machine)
-                    messages.pop()
+                    buffer.pop_last()
                     continue
                 except audio.AudioPlaybackError as e:
                     # #55 D1: output device failed mid-stream. The
@@ -811,11 +996,11 @@ async def voice_loop() -> int:
                         # on the user's next turn. Comment must stay —
                         # explains intent for future refactors.
                         print(f"friday > {full_reply}")
-                        messages.append({"role": "assistant", "content": full_reply})
+                        buffer.append(Turn(role="assistant", content=full_reply))
                     else:
                         # No sentence emitted before the device died;
                         # drop the pending user turn and let them retry.
-                        messages.pop()
+                        buffer.pop_last()
                     continue
                 except tts.TTSError as e:
                     # #55 D2: TTS stream died. Don't retry (circular +
@@ -823,16 +1008,16 @@ async def voice_loop() -> int:
                     print(f"\n[tts] {e}")
                     print("[friday] Sorry, I lost my voice. Try again.")
                     _recover_to_listening_from_phase5(machine)
-                    messages.pop()
+                    buffer.pop_last()
                     continue
                 except Exception as e:  # noqa: BLE001 — final safety net for voice loop
                     print(f"\n[err] {type(e).__name__}: {e}")
                     _recover_to_listening_from_phase5(machine)
-                    messages.pop()
+                    buffer.pop_last()
                     continue
 
                 # --- Phase 6: assistant turn append (clean path) ---
-                messages.append({"role": "assistant", "content": "".join(collect)})
+                buffer.append(Turn(role="assistant", content="".join(collect)))
             finally:
                 # Tear down the per-turn watcher so it doesn't eat the
                 # next PRESSED off the pumped queue. On RELEASED-seen
@@ -849,6 +1034,10 @@ async def voice_loop() -> int:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await watcher_task
     finally:
+        # #101: best-effort classifier drain FIRST so background
+        # memory writes get a chance to finish before we tear down
+        # the PTT pipeline. See module docstring §Shutdown ordering.
+        await _drain_classifier_tasks()
         # Tear down the pump before closing the iterator so pynput's
         # Listener stops cleanly on any exit path. Cancellation on the
         # pump is safe here because ``_ptt_pump`` is the only task
@@ -898,7 +1087,9 @@ async def run() -> int:
         if not os.environ.get("ANTHROPIC_API_KEY"):
             print(_MISSING_KEY)
             return 1
-        return await text_loop()
+        buffer = _init_session_state()
+        await _init_memory_db()
+        return await text_loop(buffer)
 
     missing = [key for key in _VOICE_REQUIRED_KEYS if not os.environ.get(key)]
     if missing:
@@ -915,6 +1106,14 @@ async def run() -> int:
         audio.probe_output_device()
     except audio.AudioDeviceUnavailable as e:
         print(f"[audio] {e}; falling back to text mode.")
-        return await text_loop()
+        # #101: load the buffer ONCE — the same instance flows from
+        # ``run`` into whichever loop takes control, including the
+        # voice→text fallback, so there is no double-load of
+        # session.json on first entry here.
+        buffer = _init_session_state()
+        await _init_memory_db()
+        return await text_loop(buffer)
 
-    return await voice_loop()
+    buffer = _init_session_state()
+    await _init_memory_db()
+    return await voice_loop(buffer)
