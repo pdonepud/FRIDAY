@@ -362,19 +362,35 @@ async def _init_memory_db() -> None:
 
 
 def _prior_assistant_text(buffer: ConversationBuffer) -> str | None:
-    """Return the Turn-before-last's content, or None if unavailable.
+    """Return the prior assistant Turn's content, or None.
 
-    Called after appending a user Turn — the second-to-last Turn is
-    then the previous assistant turn (or absent on first-ever turn).
-    Role-alternation is a loop invariant enforced at append time, so
-    this is always an assistant Turn when it exists.
+    Called after appending a user Turn — the second-to-last Turn
+    is NORMALLY the previous assistant turn under role alternation
+    within a session. Role alternation is NOT enforced by
+    :meth:`ConversationBuffer.append` (it's a storage layer, not a
+    validator), and it breaks across session boundaries: a session
+    that returns early on auth failure or Ctrl+C without popping
+    its just-appended user Turn persists that Turn via the atexit
+    save, so the next session can load ``[user_old]`` and after
+    appending ``user_new`` the second-to-last Turn is ``user_old``,
+    NOT an assistant turn.
 
-    Returns None if the buffer has fewer than 2 Turns.
+    This function defends against that exposure by returning
+    ``None`` when the second-to-last Turn is not an assistant Turn.
+    Classifier context is one-turn best-effort (ADR-0006 Open
+    Question flagged "revisitable"); dropping it on role drift is
+    strictly better than feeding a user turn as prior-assistant.
+
+    Returns None if the buffer has fewer than 2 Turns OR the
+    second-to-last Turn's role is not ``"assistant"``.
     """
     turns = list(buffer)
     if len(turns) < 2:
         return None
-    return turns[-2].content
+    prior = turns[-2]
+    if prior.role != "assistant":
+        return None
+    return prior.content
 
 
 async def _drain_classifier_tasks() -> None:

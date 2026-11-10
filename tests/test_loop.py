@@ -2116,6 +2116,55 @@ def _install_text_stream_tokens(monkeypatch, *, tokens=("hi",), side_effect=None
 # -----------------------------------------------------------------
 
 
+# -----------------------------------------------------------------
+# _prior_assistant_text — role-drift defence (#101 CR F1)
+# -----------------------------------------------------------------
+
+
+def test_prior_assistant_text_returns_none_on_consecutive_user_turns():
+    """CR fix: when a prior session persisted a trailing user Turn
+    (auth failure or Ctrl+C before pop), loading + appending a new
+    user Turn produces [user, user]. `_prior_assistant_text` must
+    NOT return the earlier user's content as prior_assistant — it
+    must return None so the classifier gets no context rather than
+    wrong context."""
+    from agent.buffer import ConversationBuffer, Turn
+    from agent.loop import _prior_assistant_text
+
+    buffer = ConversationBuffer()
+    buffer.append(Turn(role="user", content="trailing from prior session"))
+    buffer.append(Turn(role="user", content="fresh user turn"))
+
+    assert _prior_assistant_text(buffer) is None
+
+
+def test_prior_assistant_text_returns_content_on_normal_alternation():
+    """Positive control: normal within-session role alternation
+    returns the assistant turn's content as expected."""
+    from agent.buffer import ConversationBuffer, Turn
+    from agent.loop import _prior_assistant_text
+
+    buffer = ConversationBuffer()
+    buffer.append(Turn(role="user", content="hi"))
+    buffer.append(Turn(role="assistant", content="hello"))
+    buffer.append(Turn(role="user", content="follow up"))
+
+    assert _prior_assistant_text(buffer) == "hello"
+
+
+def test_prior_assistant_text_returns_none_on_short_buffer():
+    """Fewer than 2 Turns returns None (unchanged behavior)."""
+    from agent.buffer import ConversationBuffer, Turn
+    from agent.loop import _prior_assistant_text
+
+    empty = ConversationBuffer()
+    assert _prior_assistant_text(empty) is None
+
+    single = ConversationBuffer()
+    single.append(Turn(role="user", content="only"))
+    assert _prior_assistant_text(single) is None
+
+
 def test_init_session_state_loads_and_registers(monkeypatch):
     """`_init_session_state` wires `load_session` + `register_shutdown_save`
     exactly once, returns the loaded buffer."""
