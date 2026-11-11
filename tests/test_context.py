@@ -533,3 +533,67 @@ async def test_build_messages_integration_with_real_search_memories(
     # At least one seeded content should land in the section.
     assert ("FRIDAY uses SQLite" in system) or ("FRIDAY uses FTS5" in system)
     assert messages[-1]["content"] == "FRIDAY"
+
+
+# =================================================================
+# #79 CR F1 — tiktoken special-token-literal handling
+# =================================================================
+
+
+_SPECIAL = "<|endoftext|>"
+
+
+@pytest.mark.parametrize("vector", ["base_system", "current_turn", "buffer_turn", "memory"])
+async def test_build_messages_counts_special_token_literals_as_plain_text(monkeypatch, vector):
+    """CR F1: ``tiktoken.Encoding.encode`` defaults to
+    ``disallowed_special='all'`` and raises ValueError on literal
+    special-token strings. Every input to build_messages flows through
+    ``_count_tokens``; a user who types any such string would brick
+    text_loop (user Turn already appended + writer already fired;
+    ValueError escapes Phase 5, Turn poisoned into session.json, next
+    load re-crashes). Fixed by switching ``_count_tokens`` to
+    ``encode_ordinary``, which treats input as plain bytes.
+
+    This parametrized test covers all four input vectors — base_system,
+    current_turn, a buffer Turn, and a returned Memory — each asserts
+    ``build_messages`` returns without raising AND the literal is
+    preserved verbatim in whichever slot originated it (no
+    stripping / re-encoding on the way through)."""
+    base_system = "You are FRIDAY."
+    current_turn = "hello"
+    buffer_turns = [("user", "earlier"), ("assistant", "ok"), ("user", current_turn)]
+    memories: list = []
+
+    if vector == "base_system":
+        base_system = f"You are FRIDAY. {_SPECIAL}"
+    elif vector == "current_turn":
+        current_turn = f"hello {_SPECIAL} world"
+        buffer_turns[-1] = ("user", current_turn)
+    elif vector == "buffer_turn":
+        buffer_turns[0] = ("user", f"earlier with {_SPECIAL} inside")
+    elif vector == "memory":
+        memories = [_fake_memory(1, f"a memory containing {_SPECIAL} verbatim")]
+
+    _install_fake_search(monkeypatch, memories)
+    buf = _buffer_with(buffer_turns)
+
+    # Primary assertion: does not raise.
+    system, messages = await build_messages(current_turn, buf, base_system)
+
+    # Return shape sanity.
+    assert isinstance(system, str)
+    assert isinstance(messages, list)
+    assert messages[-1] == {"role": "user", "content": current_turn}
+
+    # Literal preserved verbatim in its originating slot.
+    if vector == "base_system":
+        assert _SPECIAL in system
+    elif vector == "current_turn":
+        assert _SPECIAL in messages[-1]["content"]
+    elif vector == "buffer_turn":
+        # The oldest prior Turn should still contain the literal
+        # (small buffer, nothing dropped).
+        assert any(_SPECIAL in m["content"] for m in messages[:-1])
+    elif vector == "memory":
+        # The memory section should carry the bullet with the literal.
+        assert _SPECIAL in system

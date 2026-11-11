@@ -171,7 +171,20 @@ def _count_tokens(text: str) -> int:
     enc = _get_encoder()
     if enc is None:
         return max(1, len(text) // 4)
-    return len(enc.encode(text))
+    # #79 CR F1: ``enc.encode(text)`` defaults to
+    # ``disallowed_special="all"`` and raises ValueError on any literal
+    # tiktoken special-token string in the input (``<|endoftext|>``,
+    # ``<|fim_prefix|>``, ``<|endofprompt|>``, …). Every input to
+    # :func:`build_messages` flows through here — a user who types any
+    # of those strings would (a) brick ``text_loop`` because the
+    # ValueError escapes outside Phase 5's try block AFTER the user
+    # Turn was appended and the writer ran, poisoning session.json and
+    # re-crashing on every subsequent load until FIFO eviction drops
+    # it, and (b) lose the turn in ``voice_loop`` via its generic
+    # safety-net ``except``. ``encode_ordinary`` treats the input as
+    # plain bytes end-to-end, which is exactly what a length-only
+    # counter wants — special-token recognition is dead weight here.
+    return len(enc.encode_ordinary(text))
 
 
 def _format_memory_section(memories: list) -> str:
