@@ -60,6 +60,7 @@ import json
 import os
 import sys
 import tempfile
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
@@ -74,6 +75,7 @@ from agent.memory import (
     list_memories,
     search_memories,
 )
+from agent.session import default_session_path
 
 #: Default cap on ``list`` output rows when ``--limit`` is not passed.
 #: Matches ADR-0006 §Public surface's ``list_memories(limit=100)``
@@ -109,6 +111,65 @@ _FORGET_PREVIEW_CHARS: Final[int] = 80
 #: and forget-prompt truncation. ASCII ``"..."`` would misalign the
 #: fixed-width table by two characters.
 _HORIZONTAL_ELLIPSIS: Final[str] = "…"
+
+#: Replacement codepoint substituted for terminal-unsafe characters by
+#: :func:`_sanitize_for_terminal`. ASCII ``?`` keeps the fixed-width
+#: table aligned (single column) and is visible on any encoding.
+_SANITIZE_REPLACEMENT: Final[str] = "?"
+
+
+def _protected_paths() -> set[Path]:
+    """FRIDAY's own data-file paths (resolved) that ``export`` must not overwrite.
+
+    CR F1 (PR #107): ``memory export <memory.db> --force`` would
+    otherwise clobber the SQLite file with JSONL and brick the next
+    voice/text session. ``--force`` is meant for overwriting arbitrary
+    user-chosen files, not for overriding data integrity on FRIDAY's
+    own stores. :func:`_cmd_export` consults this set before any
+    filesystem I/O.
+
+    Resolving guarantees uniform treatment of symlinks, ``.`` / ``..``
+    segments, and relative paths — a user running
+    ``memory export ./memory.db`` from inside the data directory still
+    hits the guard.
+    """
+    return {
+        default_memory_db_path().resolve(),
+        default_session_path().resolve(),
+    }
+
+
+def _sanitize_for_terminal(text: str) -> str:
+    """Replace terminal-unsafe characters with ``?`` for text-mode rendering.
+
+    CR F2 (PR #107): ``_format_memories_table`` and ``_confirm_forget``
+    print ``memory.kind`` / ``memory.content`` directly to stdout.
+    :func:`agent.memory.add_memory` validates both as non-empty strings
+    but does NOT filter control characters, so a seeded memory whose
+    content contains an ANSI escape sequence (e.g. ``\\x1b[2J`` clears
+    the screen; ``\\x1b]0;...\\x07`` sets the terminal title) would
+    execute when printed in text mode.
+
+    Covers:
+
+    * Unicode category ``Cc`` (C0 + C1 control chars: ESC ``\\x1b``,
+      newline ``\\x0a``, carriage return ``\\x0d``, TAB ``\\x09``,
+      DEL ``\\x7f``, …). Also subsumes the ad-hoc newline replacement
+      the pre-CR :func:`_truncate_preview` performed.
+    * Line separator U+2028 and paragraph separator U+2029 (category
+      ``Zl`` / ``Zp``; not ``Cc`` but visually line-breaking in some
+      terminals).
+
+    Applied only in the human-readable text renderers. JSON
+    (``--format json`` on ``list`` / ``search``) and JSONL export go
+    through ``json.dumps``, which escapes control characters natively
+    and preserves on-wire fidelity for ``jq`` consumers and
+    backup/restore use cases.
+    """
+    return "".join(
+        _SANITIZE_REPLACEMENT if (unicodedata.category(ch) == "Cc" or ch in "  ") else ch
+        for ch in text
+    )
 
 
 def _positive_int(raw: str) -> int:
@@ -330,6 +391,20 @@ async def _cmd_export(args: argparse.Namespace) -> int:
        write seam, so this is defense-in-depth).
     """
     path: Path = args.path
+    # CR F1: refuse to overwrite FRIDAY's own data files even under
+    # ``--force``. ``--force`` is for arbitrary user-owned targets; the
+    # memory DB and the session JSON are our own integrity contract.
+    # Check FIRST — before parent-is-dir / exists probes — so a bad
+    # target never touches the filesystem, and ``resolve()`` handles
+    # ``.`` / ``..`` / symlinks uniformly.
+    resolved_target = path.resolve()
+    if resolved_target in _protected_paths():
+        print(
+            f"error: refusing to export over FRIDAY's own data file "
+            f"({resolved_target}). Pick a different target.",
+            file=sys.stderr,
+        )
+        return 1
     if not path.parent.is_dir():
         print(
             f"export target directory {path.parent} does not exist",
@@ -406,31 +481,44 @@ def _format_memories_table(memories: list[Memory]) -> str:
     * ``kind`` — left-aligned, width = ``max(_KIND_MIN_WIDTH,
       max(len(kind) for kind in result))``.
     * ``content`` — truncated to ``_CONTENT_PREVIEW_CHARS`` with
-      U+2026 if longer. Embedded newlines replaced with spaces so a
-      content with ``\\n`` doesn't break row alignment.
+      U+2026 if longer.
+
+    CR F2 (PR #107): ``kind`` and ``content`` flow through
+    :func:`_sanitize_for_terminal` BEFORE width calculation and
+    truncation, so an ANSI-escape-laced content can't execute on
+    stdout and a newline-laced kind can't break row alignment. Width
+    math uses the sanitized values so column widths match what's
+    rendered.
     """
-    kind_width = max(_KIND_MIN_WIDTH, max(len(m.kind) for m in memories))
+    safe_kinds = [_sanitize_for_terminal(m.kind) for m in memories]
+    kind_width = max(_KIND_MIN_WIDTH, max(len(k) for k in safe_kinds))
     header = f"{'id':>4}  {'created_at':<19}  {'kind':<{kind_width}}  content"
     lines = [header]
-    for m in memories:
+    for m, safe_kind in zip(memories, safe_kinds, strict=True):
         when = m.created_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
-        content = m.content.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
-        if len(content) > _CONTENT_PREVIEW_CHARS:
-            content = content[:_CONTENT_PREVIEW_CHARS] + _HORIZONTAL_ELLIPSIS
-        lines.append(f"{m.id:>4}  {when:<19}  {m.kind:<{kind_width}}  {content}")
+        safe_content = _sanitize_for_terminal(m.content)
+        if len(safe_content) > _CONTENT_PREVIEW_CHARS:
+            safe_content = safe_content[:_CONTENT_PREVIEW_CHARS] + _HORIZONTAL_ELLIPSIS
+        lines.append(f"{m.id:>4}  {when:<19}  {safe_kind:<{kind_width}}  {safe_content}")
     return "\n".join(lines)
 
 
 def _truncate_preview(text: str, max_chars: int = _FORGET_PREVIEW_CHARS) -> str:
     """One-line truncated preview for the ``forget`` confirmation prompt.
 
-    Newlines collapse to spaces so the prompt stays on a single line
-    regardless of the memory's content shape; U+2026 marks truncation.
+    CR F2 (PR #107): sanitize first via :func:`_sanitize_for_terminal`
+    so terminal-unsafe characters (ANSI escapes, screen-clear sequences,
+    OSC fake-prompt payloads) can't execute from a seeded memory's
+    content when echoed back to the user. The sanitizer's ``Cc`` rule
+    also replaces embedded newlines with ``?`` so the prompt stays on
+    a single line — subsumes the pre-CR
+    ``.replace("\\r\\n", " ")`` chain. Any future caller of
+    :func:`_truncate_preview` gets the safety for free.
     """
-    normalized = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
-    if len(normalized) <= max_chars:
-        return normalized
-    return normalized[:max_chars] + _HORIZONTAL_ELLIPSIS
+    sanitized = _sanitize_for_terminal(text)
+    if len(sanitized) <= max_chars:
+        return sanitized
+    return sanitized[:max_chars] + _HORIZONTAL_ELLIPSIS
 
 
 def _stdin_is_tty() -> bool:

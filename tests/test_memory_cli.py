@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import sys
+import unicodedata
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -288,7 +289,12 @@ async def test_forget_content_with_newline_preview_truncates_safely(
     bootstrapped_db, isolate_db, monkeypatch, capsys
 ):
     """Content containing embedded newlines + >80 chars must produce a
-    one-line prompt (newlines replaced with spaces) ending in U+2026."""
+    one-line prompt (every C0/C1 control char — newline included —
+    replaced with ``?`` by :func:`_sanitize_for_terminal`) ending in
+    U+2026. CR R1 F2 widens the pre-CR "no raw newline" assertion to
+    "no Unicode category Cc char anywhere in the prompt," which
+    subsumes the old newline-only check and also catches ANSI escapes,
+    TAB, DEL, etc."""
     content = "first line\nsecond line " + "x" * 80
     new_id = await add_memory(bootstrapped_db, kind="fact", content=content)
     isolate_db(bootstrapped_db)
@@ -306,8 +312,10 @@ async def test_forget_content_with_newline_preview_truncates_safely(
     assert rc == 1  # declined
     assert len(captured_prompts) == 1
     prompt = captured_prompts[0]
-    # Prompt is a single line (no literal \n inside the preview).
-    assert "\n" not in prompt
+    # No Cc-category character leaks into the prompt (subsumes the
+    # pre-CR "\n not in prompt" assertion and also guards against ANSI,
+    # TAB, DEL, etc.).
+    assert all(unicodedata.category(ch) != "Cc" for ch in prompt)
     # Truncation marker present.
     assert "…" in prompt
 
@@ -661,3 +669,183 @@ async def test_memory_list_dispatch_calls_bootstrap_db(bootstrapped_db, isolate_
     assert rc == 0
     assert bootstrap_mock.call_count == 1
     assert bootstrap_mock.call_args.args[0] == bootstrapped_db
+
+
+# =================================================================
+# CR R1 F1 — refuse exporting over FRIDAY's own data files
+# =================================================================
+
+
+async def test_export_refuses_memory_db_target_even_with_force(tmp_path, monkeypatch, capsys):
+    """``memory export <memory.db> --force`` must refuse to overwrite
+    the long-term memory DB: silently clobbering it with JSONL would
+    brick the next voice/text session. Guard sits above ``--force``."""
+    fake_memory_db = tmp_path / "memory.db"
+    fake_memory_db.write_bytes(b"ORIGINAL SQLITE BYTES")
+    monkeypatch.setattr(
+        "agent.memory_cli.default_memory_db_path",
+        lambda: fake_memory_db,
+    )
+    # Also isolate session.json so the protected-set helper doesn't
+    # touch the user's real file when it resolves default_session_path.
+    monkeypatch.setattr(
+        "agent.memory_cli.default_session_path",
+        lambda: tmp_path / "session.json",
+    )
+
+    # bootstrap_db is a no-op — we've already laid down the "DB" file.
+    async def _noop_bootstrap(path):
+        return None
+
+    monkeypatch.setattr("agent.memory_cli.bootstrap_db", _noop_bootstrap)
+
+    rc = await _run_cli(["memory", "export", str(fake_memory_db), "--force"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "refusing to export over FRIDAY's own data file" in captured.err
+    assert fake_memory_db.read_bytes() == b"ORIGINAL SQLITE BYTES"
+
+
+async def test_export_refuses_session_json_target_even_with_force(tmp_path, monkeypatch, capsys):
+    """Same guard applies to ``session.json`` — a clobbered session
+    file would wipe the conversation buffer on the next startup."""
+    fake_memory_db = tmp_path / "memory.db"
+    fake_session_json = tmp_path / "session.json"
+    await bootstrap_db(fake_memory_db)
+    fake_session_json.write_text('{"version": 1, "turns": []}', encoding="utf-8")
+    original_session = fake_session_json.read_text(encoding="utf-8")
+    monkeypatch.setattr(
+        "agent.memory_cli.default_memory_db_path",
+        lambda: fake_memory_db,
+    )
+    monkeypatch.setattr(
+        "agent.memory_cli.default_session_path",
+        lambda: fake_session_json,
+    )
+
+    rc = await _run_cli(["memory", "export", str(fake_session_json), "--force"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "refusing to export over FRIDAY's own data file" in captured.err
+    assert fake_session_json.read_text(encoding="utf-8") == original_session
+
+
+async def test_export_refuses_memory_db_via_relative_path(tmp_path, monkeypatch, capsys):
+    """``./memory.db`` from inside the data dir must still be caught —
+    ``Path.resolve()`` normalizes the relative target before the
+    protected-set comparison. Covers the ``.`` / ``..`` / symlink
+    equivalence class."""
+    fake_memory_db = tmp_path / "memory.db"
+    await bootstrap_db(fake_memory_db)
+    monkeypatch.setattr(
+        "agent.memory_cli.default_memory_db_path",
+        lambda: fake_memory_db,
+    )
+    monkeypatch.setattr(
+        "agent.memory_cli.default_session_path",
+        lambda: tmp_path / "session.json",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    rc = await _run_cli(["memory", "export", "./memory.db", "--force"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "refusing to export over FRIDAY's own data file" in captured.err
+
+
+# =================================================================
+# CR R1 F2 — sanitize terminal output in text-mode renderers
+# =================================================================
+
+
+async def test_list_text_sanitizes_ansi_escape_in_content(bootstrapped_db, isolate_db, capsys):
+    """ANSI escape sequence in content must not execute on stdout —
+    ESC (0x1B) is Unicode category Cc and gets replaced with ``?``.
+    The literal letters survive so the row is still recognizable."""
+    await add_memory(bootstrapped_db, kind="fact", content="\x1b[31mred text\x1b[0m")
+    isolate_db(bootstrapped_db)
+
+    rc = await _run_cli(["memory", "list"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "\x1b" not in captured.out
+    assert "?" in captured.out
+    assert "red text" in captured.out
+
+
+async def test_list_text_sanitizes_newline_in_kind(bootstrapped_db, isolate_db, capsys):
+    """A memory whose kind contains ``\\n`` (bypassing add_memory's
+    non-empty check via a raw INSERT) must NOT split the table row
+    on display. Width math + rendering both operate on the sanitized
+    value."""
+    now_iso = datetime.now(UTC).isoformat()
+    async with aiosqlite.connect(bootstrapped_db) as db:
+        await db.execute(
+            "INSERT INTO memories (created_at, updated_at, kind, content, metadata) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (now_iso, now_iso, "fact\nhack", "benign content", "{}"),
+        )
+        await db.commit()
+    isolate_db(bootstrapped_db)
+
+    rc = await _run_cli(["memory", "list"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    # Header + one data row = 2 lines total. If the newline leaked
+    # through, the data row would split into two and the total would
+    # be 3+ lines.
+    lines = captured.out.rstrip("\n").split("\n")
+    assert len(lines) == 2, f"expected 2 lines (header + 1 row), got {len(lines)}: {lines!r}"
+    # Replacement character appears somewhere in the data row.
+    assert "fact?hack" in lines[1]
+
+
+async def test_list_json_preserves_control_chars(bootstrapped_db, isolate_db, capsys):
+    """JSON mode does NOT sanitize — ``json.dumps`` escapes control
+    chars natively and round-trip fidelity matters for ``jq`` /
+    programmatic consumers. The parsed JSON's content field carries
+    the literal ESC character."""
+    original = "\x1b[31mred text\x1b[0m"
+    await add_memory(bootstrapped_db, kind="fact", content=original)
+    isolate_db(bootstrapped_db)
+
+    rc = await _run_cli(["memory", "list", "--format", "json"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    parsed = json.loads(captured.out)
+    assert len(parsed) == 1
+    # Round-trip fidelity: the content is byte-for-byte equal to seeded.
+    assert parsed[0]["content"] == original
+    # Raw ESC must not appear bare in stdout — json.dumps escapes it
+    # as \u001b (a sanity cross-check that proves JSON mode uses the
+    # stdlib escape path rather than the text-mode sanitizer).
+    assert "\x1b" not in captured.out
+    assert "\\u001b" in captured.out
+
+
+async def test_forget_preview_sanitizes_ansi_in_content(
+    bootstrapped_db, isolate_db, monkeypatch, capsys
+):
+    """The ``forget`` confirmation prompt echoes back the memory's
+    content — ANSI escapes seeded by an attacker must not execute
+    when the prompt renders."""
+    new_id = await add_memory(bootstrapped_db, kind="fact", content="\x1b[2Jbenign body")
+    isolate_db(bootstrapped_db)
+    monkeypatch.setattr("agent.memory_cli._stdin_is_tty", lambda: True)
+
+    captured_prompts: list[str] = []
+
+    def record_prompt(prompt: str) -> str:
+        captured_prompts.append(prompt)
+        return "n"
+
+    monkeypatch.setattr("builtins.input", record_prompt)
+
+    rc = await _run_cli(["memory", "forget", str(new_id)])
+    assert rc == 1  # declined
+    assert len(captured_prompts) == 1
+    prompt = captured_prompts[0]
+    assert "\x1b" not in prompt
+    assert "?" in prompt
+    # The surviving literal body stays recognizable in the preview.
+    assert "benign body" in prompt
