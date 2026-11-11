@@ -349,6 +349,67 @@ def _init_session_state() -> ConversationBuffer:
     return buffer
 
 
+async def _try_process_turn_for_memory(
+    user_text: str,
+    buffer: ConversationBuffer,
+) -> None:
+    """Call :func:`process_turn_for_memory` with writer-safety semantics.
+
+    Catches all non-cancellation exceptions, logs them, and returns
+    ``None`` so the loop can continue replying to the user. Memory
+    failures never break the conversation per ADR-0006 §Writer
+    ("Failures log and do not surface to the user"). The classifier
+    task body already honors this; this wrapper extends the same
+    posture to the synchronous call site, including the
+    :func:`default_memory_db_path` / :func:`agent.paths.get_data_dir`
+    resolution which can raise on disk or permission errors mid-session.
+
+    :class:`asyncio.CancelledError` propagates so shutdown-cancel
+    teardown still works cleanly.
+    """
+    try:
+        await process_turn_for_memory(
+            default_memory_db_path(),
+            user_text,
+            prior_assistant=_prior_assistant_text(buffer),
+            task_registry=_pending_tasks,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — writer never breaks conversation
+        _log.warning("memory write path failed: %s", exc)
+
+
+def _as_user_first_messages(buffer: ConversationBuffer) -> list[dict[str, str]]:
+    """Return :meth:`ConversationBuffer.as_messages` with any leading
+    non-user Turns stripped.
+
+    Anthropic's Messages API requires ``messages[0]["role"] == "user"``.
+    :class:`ConversationBuffer`'s FIFO eviction on overflow (default
+    ``turn_limit=20``) can leave an assistant Turn at position 0 when
+    a user turn evicts the oldest user turn in a full, role-alternating
+    buffer. Without this helper the resulting request fails with a
+    400, the generic error handler pops the just-appended user Turn
+    (shrinking to 19), the next user turn re-triggers the same
+    eviction, and every subsequent request fails until the session is
+    wiped — a persistent brick because the state also round-trips
+    through ``session.json``.
+
+    This helper keeps :class:`ConversationBuffer` semantically pure
+    (storage-only, no Anthropic-specific logic) and localizes the
+    API-shape invariant at the one place it matters: the call
+    boundary into :func:`stream_tokens` / :func:`stream_sentences`.
+
+    Returns a possibly-empty list when the buffer holds only non-user
+    Turns (shouldn't happen under normal role alternation, but
+    guarded as a defensive floor).
+    """
+    msgs = buffer.as_messages()
+    while msgs and msgs[0]["role"] != "user":
+        msgs.pop(0)
+    return msgs
+
+
 async def _init_memory_db() -> None:
     """Idempotently bootstrap the long-term memory DB at startup.
 
@@ -458,22 +519,21 @@ async def text_loop(buffer: ConversationBuffer) -> int:
             buffer.append(Turn(role="user", content=user))
             # #78 writer paths fire after the Turn lands on the buffer
             # so ``_prior_assistant_text`` sees the previous assistant
-            # Turn as context (or None on the first turn). Any failure
-            # inside ``process_turn_for_memory`` is already logged and
-            # swallowed by that function per ADR-0006 §Writer; it
-            # cannot block or surface here.
-            await process_turn_for_memory(
-                default_memory_db_path(),
-                user,
-                prior_assistant=_prior_assistant_text(buffer),
-                task_registry=_pending_tasks,
-            )
+            # Turn as context (or None on the first turn). #101 CR R2
+            # F1: the call-site wrapper catches any non-cancel
+            # exception so a disk / permission failure in
+            # ``default_memory_db_path`` never breaks the conversation.
+            await _try_process_turn_for_memory(user, buffer)
 
             # --- send it and stream the reply ------------------------
             print("friday > ", end="", flush=True)
             chunks: list[str] = []
             try:
-                async for chunk in stream_tokens(buffer.as_messages(), SYSTEM_PROMPT):
+                # #101 CR R2 F2: strip any leading non-user Turn from
+                # the as_messages() view so Anthropic's "messages[0]
+                # must be role=user" invariant isn't violated after
+                # FIFO overflow in a full, role-alternating buffer.
+                async for chunk in stream_tokens(_as_user_first_messages(buffer), SYSTEM_PROMPT):
                     print(chunk, end="", flush=True)
                     chunks.append(chunk)
                 print()
@@ -636,18 +696,14 @@ async def voice_loop(buffer: ConversationBuffer) -> int:
 
                 # --- Phase 4: user turn append ---------------------
                 buffer.append(Turn(role="user", content=transcript))
-                # #78 writer paths: fire after the Turn lands on the
+                # #78 writer paths fire after the Turn lands on the
                 # buffer so ``_prior_assistant_text`` sees the previous
                 # assistant Turn as context (or None on the first
-                # turn). Any failure inside ``process_turn_for_memory``
-                # is already logged and swallowed by that function per
-                # ADR-0006 §Writer; it cannot block or surface here.
-                await process_turn_for_memory(
-                    default_memory_db_path(),
-                    transcript,
-                    prior_assistant=_prior_assistant_text(buffer),
-                    task_registry=_pending_tasks,
-                )
+                # turn). #101 CR R2 F1: the call-site wrapper catches
+                # any non-cancel exception so a disk / permission
+                # failure in ``default_memory_db_path`` never breaks
+                # the conversation.
+                await _try_process_turn_for_memory(transcript, buffer)
 
                 # --- Phase 5: Claude + TTS + playback --------------
                 collect: list[str] = []
@@ -708,7 +764,12 @@ async def voice_loop(buffer: ConversationBuffer) -> int:
                 sentence_iter: AsyncIterator[str] | None = None
                 synth_iter: AsyncIterator[bytes] | None = None
                 try:
-                    sentence_iter = stream_sentences(buffer.as_messages(), SYSTEM_PROMPT)
+                    # #101 CR R2 F2: strip any leading non-user Turn
+                    # from the as_messages() view so Anthropic's
+                    # "messages[0] must be role=user" invariant isn't
+                    # violated after FIFO overflow in a full, role-
+                    # alternating buffer.
+                    sentence_iter = stream_sentences(_as_user_first_messages(buffer), SYSTEM_PROMPT)
                     synth_iter = tts.synthesize(_tee(sentence_iter, collect))
 
                     # #87: THINKING -> SPEAKING must fire only when

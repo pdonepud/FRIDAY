@@ -2165,6 +2165,138 @@ def test_prior_assistant_text_returns_none_on_short_buffer():
     assert _prior_assistant_text(single) is None
 
 
+# -----------------------------------------------------------------
+# _try_process_turn_for_memory — writer-safety at call site (#101 CR R2 F1)
+# -----------------------------------------------------------------
+
+
+async def test_text_loop_continues_when_memory_call_raises(monkeypatch):
+    """CR R2 F1 fix: `process_turn_for_memory` raising (simulating a
+    `default_memory_db_path` OSError or any other mid-call failure)
+    must log + swallow and let text_loop still reply. Memory-path
+    failures must not break the conversation per ADR-0006 §Writer."""
+
+    async def raising_ptm(*args, **kwargs):
+        raise OSError("simulated data-dir failure")
+
+    monkeypatch.setattr("agent.loop.process_turn_for_memory", raising_ptm)
+
+    buffer = ConversationBuffer()
+    _make_input_script(monkeypatch, ["hello", EOFError()])
+    captured = _install_text_stream_tokens(monkeypatch, tokens=("hi",))
+
+    from agent.loop import text_loop
+
+    # Should NOT raise — loop proceeds to reply.
+    rc = await text_loop(buffer)
+    assert rc == 0
+
+    # The reply was actually streamed.
+    assert len(captured) == 1
+    # And the assistant Turn landed on the buffer.
+    assistant_turns = [t for t in buffer if t.role == "assistant"]
+    assert len(assistant_turns) == 1
+    assert assistant_turns[0].content == "hi"
+
+
+# -----------------------------------------------------------------
+# _as_user_first_messages — strip non-user leader (#101 CR R2 F2)
+# -----------------------------------------------------------------
+
+
+def test_as_user_first_messages_strips_leading_assistant():
+    """`_as_user_first_messages` drops leading non-user Turns so
+    the returned list is safe to send to Anthropic's Messages API."""
+    from agent.buffer import ConversationBuffer, Turn
+    from agent.loop import _as_user_first_messages
+
+    buffer = ConversationBuffer(turn_limit=5)
+    buffer.append(Turn(role="assistant", content="stale"))
+    buffer.append(Turn(role="user", content="u1"))
+    buffer.append(Turn(role="assistant", content="a1"))
+    buffer.append(Turn(role="user", content="u2"))
+
+    msgs = _as_user_first_messages(buffer)
+
+    assert msgs[0]["role"] == "user"
+    assert msgs[0]["content"] == "u1"
+    # No turns were dropped beyond the leading assistant.
+    assert len(msgs) == 3
+
+
+def test_as_user_first_messages_already_user_first_is_passthrough():
+    """When buffer already starts with a user Turn, the helper is a
+    passthrough (no-op)."""
+    from agent.buffer import ConversationBuffer, Turn
+    from agent.loop import _as_user_first_messages
+
+    buffer = ConversationBuffer()
+    buffer.append(Turn(role="user", content="u1"))
+    buffer.append(Turn(role="assistant", content="a1"))
+
+    msgs = _as_user_first_messages(buffer)
+
+    assert len(msgs) == 2
+    assert msgs[0]["role"] == "user"
+
+
+def test_as_user_first_messages_all_assistant_returns_empty():
+    """Pathological: a buffer of only assistant Turns returns an
+    empty list rather than raising. Defensive floor; shouldn't
+    happen under normal role alternation."""
+    from agent.buffer import ConversationBuffer, Turn
+    from agent.loop import _as_user_first_messages
+
+    buffer = ConversationBuffer()
+    buffer.append(Turn(role="assistant", content="a"))
+
+    assert _as_user_first_messages(buffer) == []
+
+
+async def test_text_loop_strips_leading_assistant_on_full_buffer_overflow(monkeypatch):
+    """CR R2 F2 fix: when the buffer is full and the oldest user Turn
+    is evicted by a new user append, the first message sent to
+    `stream_tokens` must still have role='user'. Pre-fix this would
+    send an assistant-first message list and 400 the request on every
+    subsequent turn, permanently bricking the installation since the
+    broken state round-trips through session.json.
+
+    Seeds a full turn_limit=20 buffer, then appends one more user
+    turn (triggering the overflow). Asserts the captured messages
+    payload has role='user' at index 0 — proving the strip at the
+    call boundary works."""
+    from agent.buffer import ConversationBuffer, Turn
+
+    buffer = ConversationBuffer(turn_limit=20)
+    # 10 complete exchanges → buffer at capacity, oldest is user.
+    for i in range(10):
+        buffer.append(Turn(role="user", content=f"u{i}"))
+        buffer.append(Turn(role="assistant", content=f"a{i}"))
+
+    # Precondition: buffer is full, starts with user.
+    assert len(list(buffer)) == 20
+    assert list(buffer)[0].role == "user"
+
+    _make_input_script(monkeypatch, ["new user turn", EOFError()])
+    captured = _install_text_stream_tokens(monkeypatch, tokens=("ok",))
+
+    from agent.loop import text_loop
+
+    await text_loop(buffer)
+
+    # The call to stream_tokens got a user-first view — even though
+    # the raw buffer.as_messages() at that moment started with an
+    # assistant Turn (``a0``, promoted to index 0 when ``u0`` got
+    # evicted by the new user append). The direct unit test
+    # ``test_as_user_first_messages_strips_leading_assistant`` proves
+    # the raw as_messages() shape; here we care that the LIVE call
+    # into Claude never saw it.
+    assert len(captured) == 1
+    assert captured[0][0]["role"] == "user", (
+        f"first message was role={captured[0][0]['role']!r}; full payload: {captured[0]!r}"
+    )
+
+
 def test_init_session_state_loads_and_registers(monkeypatch):
     """`_init_session_state` wires `load_session` + `register_shutdown_save`
     exactly once, returns the loaded buffer."""
