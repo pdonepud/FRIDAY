@@ -99,6 +99,7 @@ from agent.memory import (
     default_memory_db_path,
     process_turn_for_memory,
 )
+from agent.memory_cli import build_memory_subparser, run_memory_cli
 from agent.session import (
     default_session_path,
     load_session,
@@ -1133,9 +1134,26 @@ async def run() -> int:
         action="store_true",
         help="Run the keyboard REPL instead of the voice pipeline.",
     )
+    # #80: add the ``memory`` subcommand surface onto the existing
+    # parser. ``required=False`` so ``python -m agent`` alone still
+    # dispatches to the voice loop (``args.subcommand is None``) and
+    # ``python -m agent --text`` still dispatches to the text REPL —
+    # the subparsers group is purely additive here. Git-style layered
+    # argparse. See ``agent/memory_cli.py`` for the sub-subparsers.
+    subparsers = parser.add_subparsers(dest="subcommand", required=False)
+    build_memory_subparser(subparsers)
     args = parser.parse_args()
 
     load_dotenv()
+
+    # #80: memory CLI dispatch sits BEFORE the voice/text key checks
+    # because the CLI never calls Claude, never opens an audio stream,
+    # and does not need the conversation buffer. ``run_memory_cli``
+    # bootstraps ``memory.db`` idempotently so a brand-new install's
+    # first ``memory list`` prints the empty-result message instead
+    # of ``FileNotFoundError``.
+    if args.subcommand == "memory":
+        return await run_memory_cli(args)
 
     if args.text:
         if not os.environ.get("ANTHROPIC_API_KEY"):

@@ -1,0 +1,537 @@
+"""Memory inspection CLI (#80) — ``python -m agent memory ...``.
+
+Four subcommands under a ``memory`` positional on the existing
+``python -m agent`` entry point, backed by the long-term DB from #76
+and the ``list_memories`` surface this PR adds to :mod:`agent.memory`.
+
+## Scope
+
+**Does:** list, FTS5-search, forget (delete), and export memory rows
+for the solo-user ``memory.db`` under ``agent.paths.get_data_dir()``.
+Owns the argparse subparser factory, the four subcommand handlers,
+the human-readable table + JSON output formatters, the TTY-detect
+confirmation prompt for ``forget``, and the atomic tempfile JSONL
+export writer. The :mod:`agent.memory` module stays the sole SQL
+seam per ADR-0002 — this file issues zero raw SQL and reaches the
+DB only through ``list_memories`` / ``search_memories`` /
+``get_memory`` / ``delete_memory``.
+
+**Does not:** call Claude (no :mod:`agent.claude` import), touch the
+conversation buffer (no :mod:`agent.session` / :mod:`agent.buffer`
+import), open an audio stream, or start the token-counter warmup. On
+dispatch from :func:`agent.loop.run`, ``warm_encoder`` and
+``_init_session_state`` are explicitly skipped (see the module-level
+dispatch edit in ``agent/loop.py``). Full ADR-0006 Open-Question-#3
+confirmation-gate semantics stay deferred to Tier 7.
+
+## Exit codes
+
+Taxonomy shared across all four subcommands:
+
+* **0** — success. Includes empty result sets from ``list`` / ``search``
+  (an empty DB is not an error).
+* **1** — operational failure: missing memory id on ``forget``,
+  user declined at the ``forget`` confirmation prompt, I/O failure on
+  ``export``, export target exists without ``--force``, the
+  :data:`_EXPORT_MAX_ROWS` ceiling hit on ``export``.
+* **2** — argparse / parser misuse: empty-after-strip query on
+  ``search``, a non-positive ``--limit`` (rejected at argparse parse
+  time via :func:`_positive_int`), an unknown subcommand.
+
+## Export format
+
+JSONL. Line 1 is a header carrying ``schema_version`` (mirrors
+:data:`agent.memory.SCHEMA_VERSION`), ``exported_at`` (ISO 8601 UTC
+tz-aware), and ``count`` (exact count of data lines that follow).
+Lines 2..N+1 are one ``Memory`` per line, serialized via the private
+:func:`_memory_to_dict` helper that ``--format json`` on ``list`` /
+``search`` also uses, so the on-wire shape never diverges between
+stdout and file surfaces. Rows are ordered ``created_at`` ASC
+(chronological) so a hypothetical replay-import walks the user's
+history forward in time. File is written atomically via
+``tempfile.mkstemp`` + ``os.replace`` + POSIX ``0o600`` — mirrors
+:mod:`agent.session`'s precedent (ADR-0006 §Short-term).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Final
+
+from agent.memory import (
+    SCHEMA_VERSION,
+    Memory,
+    bootstrap_db,
+    default_memory_db_path,
+    delete_memory,
+    get_memory,
+    list_memories,
+    search_memories,
+)
+
+#: Default cap on ``list`` output rows when ``--limit`` is not passed.
+#: Matches ADR-0006 §Public surface's ``list_memories(limit=100)``
+#: default so the CLI surface and the DB surface agree.
+_DEFAULT_LIST_LIMIT: Final[int] = 100
+
+#: Default ``k`` for the ``search`` subcommand when ``--limit`` is not
+#: passed. Matches :data:`agent.memory._FTS_TOPK_DEFAULT` (5) per
+#: ADR-0006 Implementation Notes.
+_DEFAULT_SEARCH_LIMIT: Final[int] = 5
+
+#: Hard ceiling for ``export`` rows. TODO(#80-tuning): add a streaming
+#: export variant if a real user ever exceeds this on a single-user
+#: ``memory.db``. Current ceiling is defense-in-depth against
+#: pathological growth — the single-pass in-memory export reads the
+#: full result list through :func:`agent.memory.list_memories` before
+#: writing, so a cap bounds worst-case footprint without needing a
+#: schema change.
+_EXPORT_MAX_ROWS: Final[int] = 1_000_000
+
+#: Truncation ceiling for the ``content`` column in the text
+#: ``list`` / ``search`` table.
+_CONTENT_PREVIEW_CHARS: Final[int] = 60
+
+#: Minimum column width for ``kind`` in the text table so the header
+#: has a stable minimum shape regardless of result-set kinds.
+_KIND_MIN_WIDTH: Final[int] = 10
+
+#: Truncation ceiling for the ``forget`` confirmation-prompt preview.
+_FORGET_PREVIEW_CHARS: Final[int] = 80
+
+#: Single-codepoint ellipsis (U+2026) used by both table truncation
+#: and forget-prompt truncation. ASCII ``"..."`` would misalign the
+#: fixed-width table by two characters.
+_HORIZONTAL_ELLIPSIS: Final[str] = "…"
+
+
+def _positive_int(raw: str) -> int:
+    """argparse ``type`` function: reject non-positive ``--limit``.
+
+    ``argparse.ArgumentTypeError`` propagates as argparse's own
+    exit-code-2 misuse path, keeping the exit-code taxonomy consistent
+    with other argparse misuse (unknown subcommand, missing required
+    positional, etc.) without adding a per-handler validation branch.
+    """
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"must be an int; got {raw!r}") from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive int; got {value}")
+    return value
+
+
+def build_memory_subparser(parent: argparse._SubParsersAction) -> None:
+    """Register the ``memory`` subparser (with four sub-subparsers) on ``parent``.
+
+    Called once from :func:`agent.loop.run` while the top-level parser
+    is being built. The outer ``parent`` subparsers group is created
+    with ``required=False`` so ``python -m agent`` alone still
+    dispatches to the voice loop; this function adds ``memory`` as one
+    valid subcommand without changing that fallthrough.
+    """
+    memory_p = parent.add_parser(
+        "memory",
+        help="Inspect long-term memory (list / search / forget / export).",
+        description="FRIDAY memory inspection CLI (#80).",
+    )
+    subs = memory_p.add_subparsers(
+        dest="memory_subcommand",
+        required=True,
+        metavar="SUBCOMMAND",
+    )
+
+    list_p = subs.add_parser("list", help="List memories (newest first).")
+    list_p.add_argument(
+        "--kind",
+        default=None,
+        help="Filter to rows whose kind column is exactly this value.",
+    )
+    list_p.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=_DEFAULT_LIST_LIMIT,
+        help=f"Cap on returned rows (default {_DEFAULT_LIST_LIMIT}).",
+    )
+    list_p.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format (default: fixed-width text table).",
+    )
+
+    search_p = subs.add_parser("search", help="FTS5 keyword search over content.")
+    search_p.add_argument("query", help="Search terms (bag-of-words, implicit-AND).")
+    search_p.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=_DEFAULT_SEARCH_LIMIT,
+        help=f"Cap on returned rows (default {_DEFAULT_SEARCH_LIMIT}).",
+    )
+    search_p.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format (default: fixed-width text table).",
+    )
+
+    forget_p = subs.add_parser("forget", help="Delete a memory by id.")
+    forget_p.add_argument("id", type=int, help="Memory row id.")
+    forget_p.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Skip the interactive confirmation prompt.",
+    )
+
+    export_p = subs.add_parser("export", help="Export all memories as JSONL.")
+    export_p.add_argument("path", type=Path, help="Destination JSONL file.")
+    export_p.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite the destination file if it already exists.",
+    )
+
+
+async def run_memory_cli(args: argparse.Namespace) -> int:
+    """Dispatch the parsed ``memory`` subcommand to its handler.
+
+    Called by :func:`agent.loop.run` when ``args.subcommand == "memory"``.
+    First idempotently bootstraps ``memory.db`` so a brand-new install
+    never hits a ``FileNotFoundError`` on ``memory list``. Then routes
+    to one of ``_cmd_list`` / ``_cmd_search`` / ``_cmd_forget`` /
+    ``_cmd_export`` and returns its int exit code.
+
+    An unknown ``memory_subcommand`` (should be unreachable since the
+    subparser is declared ``required=True``) exits 2 to keep the
+    argparse-misuse exit code consistent.
+    """
+    await bootstrap_db(default_memory_db_path())
+    sub = args.memory_subcommand
+    if sub == "list":
+        return await _cmd_list(args)
+    if sub == "search":
+        return await _cmd_search(args)
+    if sub == "forget":
+        return await _cmd_forget(args)
+    if sub == "export":
+        return await _cmd_export(args)
+    print(f"error: unknown memory subcommand {sub!r}", file=sys.stderr)
+    return 2
+
+
+async def _cmd_list(args: argparse.Namespace) -> int:
+    """Handle ``memory list``.
+
+    Empty-result UX: text mode prints ``"No memories match."`` to
+    stderr and exits 0 (empty is not an error); json mode prints
+    ``[]`` to stdout so a JSON consumer can parse without a special
+    case.
+    """
+    memories = await list_memories(
+        default_memory_db_path(),
+        kind=args.kind,
+        limit=args.limit,
+    )
+    if not memories:
+        if args.format == "json":
+            print("[]")
+        else:
+            print("No memories match.", file=sys.stderr)
+        return 0
+    if args.format == "json":
+        print(_format_memories_json(memories))
+    else:
+        print(_format_memories_table(memories))
+    return 0
+
+
+async def _cmd_search(args: argparse.Namespace) -> int:
+    """Handle ``memory search "query"``.
+
+    Empty-after-strip queries exit 2 (argparse-misuse semantics —
+    passing only whitespace is a parser-level user error, not an
+    operational one). Empty result sets exit 0 like ``list``.
+    """
+    query = args.query.strip()
+    if not query:
+        print("error: query must be non-empty.", file=sys.stderr)
+        return 2
+    memories = await search_memories(
+        default_memory_db_path(),
+        query,
+        k=args.limit,
+    )
+    if not memories:
+        if args.format == "json":
+            print("[]")
+        else:
+            print("No memories match.", file=sys.stderr)
+        return 0
+    if args.format == "json":
+        print(_format_memories_json(memories))
+    else:
+        print(_format_memories_table(memories))
+    return 0
+
+
+async def _cmd_forget(args: argparse.Namespace) -> int:
+    """Handle ``memory forget <id>``.
+
+    Unix ``rm -i`` posture: an interactive TTY stdin prompts for
+    ``[y/N]``; piped stdin or ``--yes`` skips the prompt. User
+    decline exits 1 (operational failure; the request was refused),
+    missing id exits 1 (also operational), successful delete exits 0.
+    """
+    db_path = default_memory_db_path()
+    memory = await get_memory(db_path, args.id)
+    if memory is None:
+        print(f"No memory with id={args.id}", file=sys.stderr)
+        return 1
+    if not _confirm_forget(memory, assume_yes=args.yes):
+        print("aborted.", file=sys.stderr)
+        return 1
+    removed = await delete_memory(db_path, args.id)
+    if not removed:
+        # Defensive: the row vanished between the get and the delete.
+        # Can't happen under the single-process model, but surface it
+        # cleanly rather than lying with "Forgot" when nothing was.
+        print(f"No memory with id={args.id}", file=sys.stderr)
+        return 1
+    print(f"Forgot memory {args.id}.")
+    return 0
+
+
+async def _cmd_export(args: argparse.Namespace) -> int:
+    """Handle ``memory export <path.jsonl>``.
+
+    Flow:
+
+    1. Verify the target directory exists (argparse ``type=Path``
+       guarantees the arg parses, but not that the parent dir is real).
+    2. Fetch up to ``_EXPORT_MAX_ROWS + 1`` memories via
+       :func:`agent.memory.list_memories`; refuse if the DB has more
+       than the ceiling (indicated by a result length > the ceiling).
+    3. Reverse the DESC result into chronological ASC order.
+    4. Write via :func:`_write_jsonl_export` — atomic tempfile +
+       ``os.replace`` + POSIX ``0o600`` (mirrors
+       :func:`agent.session.save_session`). The writer raises
+       :class:`FileExistsError` on target-exists-without-force,
+       :class:`OSError` on any I/O failure, and :class:`UnicodeError`
+       on any content that can't serialize to UTF-8 (which
+       :func:`agent.memory.add_memory` already guards against at the
+       write seam, so this is defense-in-depth).
+    """
+    path: Path = args.path
+    if not path.parent.is_dir():
+        print(
+            f"export target directory {path.parent} does not exist",
+            file=sys.stderr,
+        )
+        return 1
+    db_path = default_memory_db_path()
+    # Query one past the ceiling so a result-length check distinguishes
+    # "at or below the ceiling" (export proceeds) from "over the
+    # ceiling" (refuse) without a separate COUNT(*) query.
+    memories_desc = await list_memories(db_path, limit=_EXPORT_MAX_ROWS + 1)
+    if len(memories_desc) > _EXPORT_MAX_ROWS:
+        print(
+            f"error: refusing to export {_EXPORT_MAX_ROWS:,}+ rows "
+            f"(ceiling: {_EXPORT_MAX_ROWS:,}). Export a subset with --kind, "
+            f"or file a request for streaming export.",
+            file=sys.stderr,
+        )
+        return 1
+    memories = list(reversed(memories_desc))
+    try:
+        await _write_jsonl_export(memories, path, force=args.force)
+    except FileExistsError:
+        print(
+            f"target {path} exists (pass --force to overwrite)",
+            file=sys.stderr,
+        )
+        return 1
+    except (OSError, UnicodeError) as exc:
+        print(f"export failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"Exported {len(memories)} memories to {path}.")
+    return 0
+
+
+# -----------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------
+
+
+def _memory_to_dict(memory: Memory) -> dict[str, object]:
+    """Shared Memory → dict serializer for JSON stdout + JSONL export.
+
+    Timestamps serialize via :meth:`datetime.datetime.isoformat`
+    (tz-aware round-trip preserved); ``metadata`` passes through as
+    the dict :class:`agent.memory.Memory` already validated it to be.
+    """
+    return {
+        "id": memory.id,
+        "created_at": memory.created_at.isoformat(),
+        "updated_at": memory.updated_at.isoformat(),
+        "kind": memory.kind,
+        "content": memory.content,
+        "metadata": memory.metadata,
+    }
+
+
+def _format_memories_json(memories: list[Memory]) -> str:
+    """JSON array of :func:`_memory_to_dict` entries, pretty-indented."""
+    return json.dumps(
+        [_memory_to_dict(m) for m in memories],
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def _format_memories_table(memories: list[Memory]) -> str:
+    """Fixed-width ``id | created_at | kind | content`` table.
+
+    Column widths:
+
+    * ``id`` — right-aligned, min width 4.
+    * ``created_at`` — UTC, ``YYYY-MM-DD HH:MM:SS`` (19 chars).
+    * ``kind`` — left-aligned, width = ``max(_KIND_MIN_WIDTH,
+      max(len(kind) for kind in result))``.
+    * ``content`` — truncated to ``_CONTENT_PREVIEW_CHARS`` with
+      U+2026 if longer. Embedded newlines replaced with spaces so a
+      content with ``\\n`` doesn't break row alignment.
+    """
+    kind_width = max(_KIND_MIN_WIDTH, max(len(m.kind) for m in memories))
+    header = f"{'id':>4}  {'created_at':<19}  {'kind':<{kind_width}}  content"
+    lines = [header]
+    for m in memories:
+        when = m.created_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        content = m.content.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+        if len(content) > _CONTENT_PREVIEW_CHARS:
+            content = content[:_CONTENT_PREVIEW_CHARS] + _HORIZONTAL_ELLIPSIS
+        lines.append(f"{m.id:>4}  {when:<19}  {m.kind:<{kind_width}}  {content}")
+    return "\n".join(lines)
+
+
+def _truncate_preview(text: str, max_chars: int = _FORGET_PREVIEW_CHARS) -> str:
+    """One-line truncated preview for the ``forget`` confirmation prompt.
+
+    Newlines collapse to spaces so the prompt stays on a single line
+    regardless of the memory's content shape; U+2026 marks truncation.
+    """
+    normalized = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[:max_chars] + _HORIZONTAL_ELLIPSIS
+
+
+def _stdin_is_tty() -> bool:
+    """Module-indirect ``sys.stdin.isatty()`` so tests can monkeypatch cleanly.
+
+    Monkeypatching ``sys.stdin.isatty`` directly is fragile under
+    pytest's capture (``sys.stdin`` is a captured stream, not a
+    terminal, and the method may not be present or settable). A
+    module-local function sidesteps that: tests target
+    ``agent.memory_cli._stdin_is_tty`` with a lambda.
+    """
+    return sys.stdin.isatty()
+
+
+def _confirm_forget(memory: Memory, *, assume_yes: bool) -> bool:
+    """Return True if the ``forget`` should proceed, False to abort.
+
+    Three paths:
+
+    * ``assume_yes`` (``--yes`` / ``-y``) → True without prompting.
+    * stdin is not a TTY (piped input) → True without prompting. Unix
+      pattern for ``rm -i`` behavior — piping always proceeds.
+    * Interactive TTY → emit a one-line prompt and accept ``y`` / ``yes``
+      (case-insensitive) as approval; anything else aborts.
+    """
+    if assume_yes:
+        return True
+    if not _stdin_is_tty():
+        return True
+    preview = _truncate_preview(memory.content)
+    answer = input(f'Forget "{preview}"? [y/N] ').strip().lower()
+    return answer in {"y", "yes"}
+
+
+async def _write_jsonl_export(
+    memories: list[Memory],
+    path: Path,
+    *,
+    force: bool,
+) -> None:
+    """Atomically write ``memories`` as JSONL to ``path``.
+
+    Raises:
+        FileExistsError: ``path`` already exists and ``force`` is False.
+        OSError: any underlying filesystem error from mkstemp /
+            write / fsync / replace.
+        UnicodeError: a Memory's content or metadata holds a
+            non-UTF-8-encodable value (defense-in-depth —
+            :func:`agent.memory.add_memory` already guards at the
+            write seam).
+
+    Writes through a sibling tempfile in ``path.parent``, ``fsync``s,
+    chmods to 0o600 on POSIX, then ``os.replace``s onto ``path``
+    (atomic on same-filesystem on POSIX, atomic-rename on Windows).
+    Mirrors :func:`agent.session.save_session` exactly.
+    """
+    if path.exists() and not force:
+        raise FileExistsError(f"{path} exists")
+
+    header = {
+        "schema_version": SCHEMA_VERSION,
+        "exported_at": datetime.now(UTC).isoformat(),
+        "count": len(memories),
+    }
+
+    tmp_path: str | None = None
+    replaced = False
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".memory_export.",
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
+        tmp_path = tmp_name
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(header, ensure_ascii=False, separators=(",", ":")) + "\n")
+            for memory in memories:
+                f.write(
+                    json.dumps(
+                        _memory_to_dict(memory),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+            f.flush()
+            os.fsync(f.fileno())
+        if sys.platform != "win32":
+            # mkstemp's own default is 0o600 on POSIX, but belt-and-
+            # suspenders over a hostile umask matches session.py's
+            # posture. Windows is a no-op (NTFS uses ACLs; the
+            # agent/paths.py 0o700 parent dir carries the guarantee).
+            os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
+        replaced = True
+    finally:
+        if tmp_path is not None and not replaced:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except OSError:
+                # Best-effort cleanup — the original failure has
+                # already been raised; a tempfile-unlink failure on
+                # top of it would mask the real cause.
+                pass

@@ -102,8 +102,7 @@ a follow-up, mirroring #75's Option-1 wiring posture). Promotion to a
 singleton is a mechanical no-API-break change later if measurable
 throughput demands it.
 
-Public surface (ADR-0006 §public-surface, subset — ``list_memories``
-is #80):
+Public surface (ADR-0006 §public-surface, complete after #80):
 
 * :class:`Memory` — frozen dataclass.
 * :class:`MemoryDBError` — raised for schema/migration failures.
@@ -115,6 +114,8 @@ is #80):
 * :func:`add_memory`, :func:`get_memory`, :func:`delete_memory` —
   CRUD on individual memories.
 * :func:`search_memories` — ranked FTS5 keyword retrieval.
+* :func:`list_memories` — chronological listing with optional ``kind``
+  filter, ordered newest-first.
 """
 
 from __future__ import annotations
@@ -724,6 +725,72 @@ async def search_memories(
             """,
             (normalized, k),
         ) as cur:
+            rows = await cur.fetchall()
+
+    return [_row_to_memory(r) for r in rows]
+
+
+async def list_memories(
+    db_path: Path,
+    kind: str | None = None,
+    limit: int = 100,
+) -> list[Memory]:
+    """List memories ordered by ``created_at`` DESC (newest first).
+
+    ADR-0006 §Public surface spec (deferred from #76 since UX
+    concerns — ordering, default limit — were #80's question).
+    DESC ordering matches the dominant inspection use case ("what
+    did I just write?"); callers that want chronological-replay
+    order (e.g. the #80 export writer) reverse the result in
+    Python. Returns a possibly-empty list.
+
+    Rows are parsed through :func:`_row_to_memory`, so corrupt
+    ``metadata`` JSON on any hit surfaces as the same WARNING-log
+    + empty-dict fallback that :func:`get_memory` and
+    :func:`search_memories` emit — consistent read-path behavior
+    across every surface.
+
+    Args:
+        db_path: Path to ``memory.db`` (via
+            :func:`default_memory_db_path` in the common case).
+        kind: Optional exact-match filter on the ``kind`` column
+            (case-sensitive, matching the write path). ``None`` =
+            no filter.
+        limit: Positive-int cap on rows returned. Default 100.
+
+    Raises:
+        ValueError: ``limit`` is not a positive ``int`` (``None``,
+            ``bool``, ``float``, string, or ``<= 0``). ``bool`` is
+            rejected despite ``isinstance(True, int)`` — mirrors
+            :func:`search_memories`'s ``k`` posture.
+        ValueError: ``kind`` is not a ``str`` or ``None``.
+        aiosqlite.Error / sqlite3.DatabaseError: DB errors propagate.
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        raise ValueError(f"limit must be a positive int; got {limit!r}")
+    if kind is not None and not isinstance(kind, str):
+        raise ValueError(f"kind must be a str or None; got {kind!r}")
+
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        if kind is None:
+            sql = (
+                "SELECT id, created_at, updated_at, kind, content, metadata "
+                "FROM memories "
+                "ORDER BY created_at DESC "
+                "LIMIT ?"
+            )
+            params: tuple[Any, ...] = (limit,)
+        else:
+            sql = (
+                "SELECT id, created_at, updated_at, kind, content, metadata "
+                "FROM memories "
+                "WHERE kind = ? "
+                "ORDER BY created_at DESC "
+                "LIMIT ?"
+            )
+            params = (kind, limit)
+        async with db.execute(sql, params) as cur:
             rows = await cur.fetchall()
 
     return [_row_to_memory(r) for r in rows]
