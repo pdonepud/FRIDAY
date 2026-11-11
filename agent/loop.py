@@ -85,6 +85,7 @@ from agent.claude import (
     stream_sentences,
     stream_tokens,
 )
+from agent.context import build_messages
 from agent.events import BargeInEvent
 
 # ``_pending_tasks`` is a private module-level attribute of
@@ -380,36 +381,6 @@ async def _try_process_turn_for_memory(
         _log.warning("memory write path failed: %s", exc)
 
 
-def _as_user_first_messages(buffer: ConversationBuffer) -> list[dict[str, str]]:
-    """Return :meth:`ConversationBuffer.as_messages` with any leading
-    non-user Turns stripped.
-
-    Anthropic's Messages API requires ``messages[0]["role"] == "user"``.
-    :class:`ConversationBuffer`'s FIFO eviction on overflow (default
-    ``turn_limit=20``) can leave an assistant Turn at position 0 when
-    a user turn evicts the oldest user turn in a full, role-alternating
-    buffer. Without this helper the resulting request fails with a
-    400, the generic error handler pops the just-appended user Turn
-    (shrinking to 19), the next user turn re-triggers the same
-    eviction, and every subsequent request fails until the session is
-    wiped — a persistent brick because the state also round-trips
-    through ``session.json``.
-
-    This helper keeps :class:`ConversationBuffer` semantically pure
-    (storage-only, no Anthropic-specific logic) and localizes the
-    API-shape invariant at the one place it matters: the call
-    boundary into :func:`stream_tokens` / :func:`stream_sentences`.
-
-    Returns a possibly-empty list when the buffer holds only non-user
-    Turns (shouldn't happen under normal role alternation, but
-    guarded as a defensive floor).
-    """
-    msgs = buffer.as_messages()
-    while msgs and msgs[0]["role"] != "user":
-        msgs.pop(0)
-    return msgs
-
-
 async def _init_memory_db() -> None:
     """Idempotently bootstrap the long-term memory DB at startup.
 
@@ -526,14 +497,16 @@ async def text_loop(buffer: ConversationBuffer) -> int:
             await _try_process_turn_for_memory(user, buffer)
 
             # --- send it and stream the reply ------------------------
+            # #79: context assembly builds the (system, messages) pair
+            # per ADR-0007 — memories retrieved + budget-pruned, buffer
+            # pruned chronologically, role-alternation defended at the
+            # call boundary. Replaces the ad-hoc #101 CR R2
+            # ``_as_user_first_messages`` strip.
+            assembled_system, assembled_messages = await build_messages(user, buffer, SYSTEM_PROMPT)
             print("friday > ", end="", flush=True)
             chunks: list[str] = []
             try:
-                # #101 CR R2 F2: strip any leading non-user Turn from
-                # the as_messages() view so Anthropic's "messages[0]
-                # must be role=user" invariant isn't violated after
-                # FIFO overflow in a full, role-alternating buffer.
-                async for chunk in stream_tokens(_as_user_first_messages(buffer), SYSTEM_PROMPT):
+                async for chunk in stream_tokens(assembled_messages, assembled_system):
                     print(chunk, end="", flush=True)
                     chunks.append(chunk)
                 print()
@@ -764,12 +737,16 @@ async def voice_loop(buffer: ConversationBuffer) -> int:
                 sentence_iter: AsyncIterator[str] | None = None
                 synth_iter: AsyncIterator[bytes] | None = None
                 try:
-                    # #101 CR R2 F2: strip any leading non-user Turn
-                    # from the as_messages() view so Anthropic's
-                    # "messages[0] must be role=user" invariant isn't
-                    # violated after FIFO overflow in a full, role-
-                    # alternating buffer.
-                    sentence_iter = stream_sentences(_as_user_first_messages(buffer), SYSTEM_PROMPT)
+                    # #79: context assembly builds the (system,
+                    # messages) pair per ADR-0007 — memories retrieved
+                    # + budget-pruned, buffer pruned chronologically,
+                    # role-alternation defended at the call boundary.
+                    # Replaces the ad-hoc #101 CR R2
+                    # ``_as_user_first_messages`` strip.
+                    assembled_system, assembled_messages = await build_messages(
+                        transcript, buffer, SYSTEM_PROMPT
+                    )
+                    sentence_iter = stream_sentences(assembled_messages, assembled_system)
                     synth_iter = tts.synthesize(_tee(sentence_iter, collect))
 
                     # #87: THINKING -> SPEAKING must fire only when
