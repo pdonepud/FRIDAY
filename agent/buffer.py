@@ -23,8 +23,8 @@ change tracked at that point.
 Public surface:
     Turn — frozen dataclass (role, content, timestamp).
     ConversationBuffer — bounded FIFO ring exposing
-        ``append``, ``as_messages``, ``clear``, ``token_count``,
-        ``__len__``, and ``__iter__``.
+        ``append``, ``pop_last``, ``as_messages``, ``clear``,
+        ``token_count``, ``__len__``, and ``__iter__``.
 """
 
 from __future__ import annotations
@@ -192,6 +192,25 @@ class ConversationBuffer:
                 construction, not here.
         """
         self._turns.append(turn)
+
+    def pop_last(self) -> Turn | None:
+        """Remove and return the most recent Turn, or None if empty.
+
+        Symmetric with :meth:`append`. Used by the loop's mid-stream
+        error recovery path (#55 D-series): on a NetworkError during
+        the LLM stream, the just-appended user Turn is popped so the
+        next attempt doesn't double-send it in the conversation
+        history. Also used post-TTS-failure to drop a half-committed
+        assistant Turn.
+
+        Returns the popped :class:`Turn` on success, or ``None`` on
+        an empty buffer. The latter is a no-op by design — callers
+        in error paths don't need to pre-check length.
+        """
+        try:
+            return self._turns.pop()
+        except IndexError:
+            return None
 
     def as_messages(self) -> list[dict[str, str]]:
         """Return the buffered turns in Anthropic message format.

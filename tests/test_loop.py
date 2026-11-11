@@ -25,7 +25,69 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent import audio, ptt, stt, tts
+from agent.buffer import ConversationBuffer
 from agent.claude import APIConnectionError, AuthenticationError, RateLimitError
+
+# --- #101 wiring neutralization --------------------------------------
+#
+# Every test in this module invokes agent.loop.run(), which (post-#101)
+# calls _init_session_state() → load_session + register_shutdown_save
+# against the REAL disk, and fires process_turn_for_memory() after each
+# user turn (would hit the real memory.db + spawn a classifier task
+# against the real Anthropic API). Autouse fixture replaces both with
+# harmless stubs so tests stay unit-level and don't pollute the user's
+# data directory / burn API tokens / leave behind atexit handlers.
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_loop_wirings_101(monkeypatch):
+    """Stub out #101's session + writer wirings so unit tests stay
+    hermetic.
+
+    - ``load_session`` → return a fresh empty buffer.
+    - ``register_shutdown_save`` → no-op (no atexit side effect).
+    - ``process_turn_for_memory`` → no-op that returns
+      ``(None, done_task)`` so loop code that unpacks the tuple works
+      unchanged.
+    - Clear ``agent.memory._pending_tasks`` before each test so the
+      drain in the outer finally sees an empty set (fast path).
+    """
+    monkeypatch.setattr(
+        "agent.loop.load_session",
+        lambda path: ConversationBuffer(),
+    )
+    monkeypatch.setattr(
+        "agent.loop.register_shutdown_save",
+        lambda buffer, path: None,
+    )
+
+    async def _noop_process_turn(db_path, user_turn, prior_assistant=None, *, task_registry=None):
+        # Return an already-done Task so unpacking (id, task) works
+        # whether or not the caller awaits the task.
+        async def _done() -> None:
+            pass
+
+        task = asyncio.create_task(_done())
+        await task
+        return (None, task)
+
+    monkeypatch.setattr("agent.loop.process_turn_for_memory", _noop_process_turn)
+
+    async def _noop_init_memory_db() -> None:
+        return None
+
+    monkeypatch.setattr("agent.loop._init_memory_db", _noop_init_memory_db)
+
+    # Empty the pending-tasks set so the drain fast-path returns
+    # immediately. This isn't strictly needed when
+    # ``_noop_process_turn`` already awaits its task — ``_pending_tasks``
+    # stays untouched under that stub — but keep the clear as
+    # defence-in-depth against tests that monkeypatch ``process_turn``
+    # back to the real one.
+    import agent.memory
+
+    agent.memory._pending_tasks.clear()
+
 
 # --- Fake async-iterator helpers ----------------------------------------
 #
@@ -1999,3 +2061,747 @@ async def test_voice_mode_barge_in_at_stream_end_races_cleanly(monkeypatch, caps
     # No traceback / error prints — both race outcomes tear down cleanly.
     for marker in ("Traceback", "RuntimeError", "AssertionError", "[err]"):
         assert marker not in out, f"unexpected error marker {marker!r} in output: {out!r}"
+
+
+# =================================================================
+# #101 — loop wiring tests
+# =================================================================
+
+
+def _make_input_script(monkeypatch, replies):
+    """Scripted ``input()`` replacement.
+
+    ``replies`` is a list of either strings (returned on the next
+    ``input()`` call) or exception instances (raised). Tests drive
+    text_loop iterations by feeding replies in order.
+    """
+    it = iter(replies)
+
+    def fake_input(_prompt):
+        v = next(it)
+        if isinstance(v, BaseException):
+            raise v
+        return v
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+
+def _install_text_stream_tokens(monkeypatch, *, tokens=("hi",), side_effect=None):
+    """Replace ``agent.loop.stream_tokens`` with a scripted async
+    generator; capture the ``messages`` arg of every call."""
+    captured: list[list[dict]] = []
+
+    def fake_stream_tokens(messages, _system):
+        captured.append([dict(m) for m in messages])
+        if side_effect is not None:
+
+            async def _raiser():
+                raise side_effect
+                yield  # pragma: no cover — keeps this an async generator
+
+            return _raiser()
+
+        async def _gen():
+            for t in tokens:
+                yield t
+
+        return _gen()
+
+    monkeypatch.setattr("agent.loop.stream_tokens", fake_stream_tokens)
+    return captured
+
+
+# -----------------------------------------------------------------
+# _init_session_state
+# -----------------------------------------------------------------
+
+
+# -----------------------------------------------------------------
+# _prior_assistant_text — role-drift defence (#101 CR F1)
+# -----------------------------------------------------------------
+
+
+def test_prior_assistant_text_returns_none_on_consecutive_user_turns():
+    """CR fix: when a prior session persisted a trailing user Turn
+    (auth failure or Ctrl+C before pop), loading + appending a new
+    user Turn produces [user, user]. `_prior_assistant_text` must
+    NOT return the earlier user's content as prior_assistant — it
+    must return None so the classifier gets no context rather than
+    wrong context."""
+    from agent.buffer import ConversationBuffer, Turn
+    from agent.loop import _prior_assistant_text
+
+    buffer = ConversationBuffer()
+    buffer.append(Turn(role="user", content="trailing from prior session"))
+    buffer.append(Turn(role="user", content="fresh user turn"))
+
+    assert _prior_assistant_text(buffer) is None
+
+
+def test_prior_assistant_text_returns_content_on_normal_alternation():
+    """Positive control: normal within-session role alternation
+    returns the assistant turn's content as expected."""
+    from agent.buffer import ConversationBuffer, Turn
+    from agent.loop import _prior_assistant_text
+
+    buffer = ConversationBuffer()
+    buffer.append(Turn(role="user", content="hi"))
+    buffer.append(Turn(role="assistant", content="hello"))
+    buffer.append(Turn(role="user", content="follow up"))
+
+    assert _prior_assistant_text(buffer) == "hello"
+
+
+def test_prior_assistant_text_returns_none_on_short_buffer():
+    """Fewer than 2 Turns returns None (unchanged behavior)."""
+    from agent.buffer import ConversationBuffer, Turn
+    from agent.loop import _prior_assistant_text
+
+    empty = ConversationBuffer()
+    assert _prior_assistant_text(empty) is None
+
+    single = ConversationBuffer()
+    single.append(Turn(role="user", content="only"))
+    assert _prior_assistant_text(single) is None
+
+
+# -----------------------------------------------------------------
+# _try_process_turn_for_memory — writer-safety at call site (#101 CR R2 F1)
+# -----------------------------------------------------------------
+
+
+async def test_text_loop_continues_when_memory_call_raises(monkeypatch):
+    """CR R2 F1 fix: `process_turn_for_memory` raising (simulating a
+    `default_memory_db_path` OSError or any other mid-call failure)
+    must log + swallow and let text_loop still reply. Memory-path
+    failures must not break the conversation per ADR-0006 §Writer."""
+
+    async def raising_ptm(*args, **kwargs):
+        raise OSError("simulated data-dir failure")
+
+    monkeypatch.setattr("agent.loop.process_turn_for_memory", raising_ptm)
+
+    buffer = ConversationBuffer()
+    _make_input_script(monkeypatch, ["hello", EOFError()])
+    captured = _install_text_stream_tokens(monkeypatch, tokens=("hi",))
+
+    from agent.loop import text_loop
+
+    # Should NOT raise — loop proceeds to reply.
+    rc = await text_loop(buffer)
+    assert rc == 0
+
+    # The reply was actually streamed.
+    assert len(captured) == 1
+    # And the assistant Turn landed on the buffer.
+    assistant_turns = [t for t in buffer if t.role == "assistant"]
+    assert len(assistant_turns) == 1
+    assert assistant_turns[0].content == "hi"
+
+
+# -----------------------------------------------------------------
+# _as_user_first_messages — strip non-user leader (#101 CR R2 F2)
+# -----------------------------------------------------------------
+
+
+def test_as_user_first_messages_strips_leading_assistant():
+    """`_as_user_first_messages` drops leading non-user Turns so
+    the returned list is safe to send to Anthropic's Messages API."""
+    from agent.buffer import ConversationBuffer, Turn
+    from agent.loop import _as_user_first_messages
+
+    buffer = ConversationBuffer(turn_limit=5)
+    buffer.append(Turn(role="assistant", content="stale"))
+    buffer.append(Turn(role="user", content="u1"))
+    buffer.append(Turn(role="assistant", content="a1"))
+    buffer.append(Turn(role="user", content="u2"))
+
+    msgs = _as_user_first_messages(buffer)
+
+    assert msgs[0]["role"] == "user"
+    assert msgs[0]["content"] == "u1"
+    # No turns were dropped beyond the leading assistant.
+    assert len(msgs) == 3
+
+
+def test_as_user_first_messages_already_user_first_is_passthrough():
+    """When buffer already starts with a user Turn, the helper is a
+    passthrough (no-op)."""
+    from agent.buffer import ConversationBuffer, Turn
+    from agent.loop import _as_user_first_messages
+
+    buffer = ConversationBuffer()
+    buffer.append(Turn(role="user", content="u1"))
+    buffer.append(Turn(role="assistant", content="a1"))
+
+    msgs = _as_user_first_messages(buffer)
+
+    assert len(msgs) == 2
+    assert msgs[0]["role"] == "user"
+
+
+def test_as_user_first_messages_all_assistant_returns_empty():
+    """Pathological: a buffer of only assistant Turns returns an
+    empty list rather than raising. Defensive floor; shouldn't
+    happen under normal role alternation."""
+    from agent.buffer import ConversationBuffer, Turn
+    from agent.loop import _as_user_first_messages
+
+    buffer = ConversationBuffer()
+    buffer.append(Turn(role="assistant", content="a"))
+
+    assert _as_user_first_messages(buffer) == []
+
+
+async def test_text_loop_strips_leading_assistant_on_full_buffer_overflow(monkeypatch):
+    """CR R2 F2 fix: when the buffer is full and the oldest user Turn
+    is evicted by a new user append, the first message sent to
+    `stream_tokens` must still have role='user'. Pre-fix this would
+    send an assistant-first message list and 400 the request on every
+    subsequent turn, permanently bricking the installation since the
+    broken state round-trips through session.json.
+
+    Seeds a full turn_limit=20 buffer, then appends one more user
+    turn (triggering the overflow). Asserts the captured messages
+    payload has role='user' at index 0 — proving the strip at the
+    call boundary works."""
+    from agent.buffer import ConversationBuffer, Turn
+
+    buffer = ConversationBuffer(turn_limit=20)
+    # 10 complete exchanges → buffer at capacity, oldest is user.
+    for i in range(10):
+        buffer.append(Turn(role="user", content=f"u{i}"))
+        buffer.append(Turn(role="assistant", content=f"a{i}"))
+
+    # Precondition: buffer is full, starts with user.
+    assert len(list(buffer)) == 20
+    assert list(buffer)[0].role == "user"
+
+    _make_input_script(monkeypatch, ["new user turn", EOFError()])
+    captured = _install_text_stream_tokens(monkeypatch, tokens=("ok",))
+
+    from agent.loop import text_loop
+
+    await text_loop(buffer)
+
+    # The call to stream_tokens got a user-first view — even though
+    # the raw buffer.as_messages() at that moment started with an
+    # assistant Turn (``a0``, promoted to index 0 when ``u0`` got
+    # evicted by the new user append). The direct unit test
+    # ``test_as_user_first_messages_strips_leading_assistant`` proves
+    # the raw as_messages() shape; here we care that the LIVE call
+    # into Claude never saw it.
+    assert len(captured) == 1
+    assert captured[0][0]["role"] == "user", (
+        f"first message was role={captured[0][0]['role']!r}; full payload: {captured[0]!r}"
+    )
+
+
+def test_init_session_state_loads_and_registers(monkeypatch):
+    """`_init_session_state` wires `load_session` + `register_shutdown_save`
+    exactly once, returns the loaded buffer."""
+    from agent.buffer import ConversationBuffer
+
+    sentinel_buffer = ConversationBuffer()
+    load_mock = MagicMock(return_value=sentinel_buffer)
+    register_mock = MagicMock()
+    monkeypatch.setattr("agent.loop.load_session", load_mock)
+    monkeypatch.setattr("agent.loop.register_shutdown_save", register_mock)
+
+    import agent.loop
+
+    result = agent.loop._init_session_state()
+
+    assert result is sentinel_buffer
+    assert load_mock.call_count == 1
+    assert register_mock.call_count == 1
+    # register_shutdown_save receives (buffer, path); path is whatever
+    # default_session_path returned.
+    args, _kw = register_mock.call_args
+    assert args[0] is sentinel_buffer
+
+
+# -----------------------------------------------------------------
+# text_loop — buffer adoption
+# -----------------------------------------------------------------
+
+
+async def test_text_loop_appends_user_turn_to_buffer(monkeypatch):
+    """A typed user turn lands on the buffer as a `role="user"` Turn."""
+    buffer = ConversationBuffer()
+    _make_input_script(monkeypatch, ["hello", EOFError()])
+    _install_text_stream_tokens(monkeypatch, tokens=("reply",))
+
+    from agent.loop import text_loop
+
+    rc = await text_loop(buffer)
+    assert rc == 0
+
+    turns = list(buffer)
+    user_turns = [t for t in turns if t.role == "user"]
+    assert any(t.content == "hello" for t in user_turns)
+
+
+async def test_text_loop_appends_assistant_turn_to_buffer(monkeypatch):
+    """After a clean stream, the assistant's joined chunks land on the
+    buffer as a `role="assistant"` Turn."""
+    buffer = ConversationBuffer()
+    _make_input_script(monkeypatch, ["hello", EOFError()])
+    _install_text_stream_tokens(monkeypatch, tokens=("hi ", "there"))
+
+    from agent.loop import text_loop
+
+    await text_loop(buffer)
+
+    turns = list(buffer)
+    assistant_turns = [t for t in turns if t.role == "assistant"]
+    assert len(assistant_turns) == 1
+    assert assistant_turns[0].content == "hi there"
+
+
+async def test_text_loop_passes_as_messages_to_claude(monkeypatch):
+    """`stream_tokens` receives `buffer.as_messages()` output — the
+    user turn is present at the exact shape Anthropic's SDK expects."""
+    buffer = ConversationBuffer()
+    _make_input_script(monkeypatch, ["ping", EOFError()])
+    captured = _install_text_stream_tokens(monkeypatch, tokens=("pong",))
+
+    from agent.loop import text_loop
+
+    await text_loop(buffer)
+
+    assert len(captured) == 1
+    assert captured[0] == [{"role": "user", "content": "ping"}]
+
+
+async def test_text_loop_mid_stream_failure_pops_last_user_turn(monkeypatch):
+    """On a NetworkError mid-stream, the just-appended user Turn is
+    popped so the buffer isn't desynced on the next attempt."""
+    from agent.claude import NetworkError
+
+    buffer = ConversationBuffer()
+    _make_input_script(monkeypatch, ["first", EOFError()])
+    _install_text_stream_tokens(monkeypatch, side_effect=NetworkError("boom"))
+
+    from agent.loop import text_loop
+
+    await text_loop(buffer)
+
+    # The failed turn got popped → buffer is empty.
+    turns = list(buffer)
+    assert len(turns) == 0, f"expected 0 turns, got {[(t.role, t.content) for t in turns]}"
+
+
+# -----------------------------------------------------------------
+# voice_loop — buffer adoption
+# -----------------------------------------------------------------
+
+
+async def test_voice_loop_appends_user_turn_to_buffer(monkeypatch):
+    """Phase 4 user-Turn append via the voice path: STT transcript
+    lands on the buffer as a `role="user"` Turn."""
+    buffer = ConversationBuffer()
+    _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_result="hi from voice",
+    )
+
+    from agent.loop import voice_loop
+
+    # voice_loop exits code 2 when the PTT event stream exhausts
+    # after the scripted events — that's the expected test-driven
+    # termination for the voice_loop smoke tests here.
+    await voice_loop(buffer)
+
+    user_turns = [t for t in buffer if t.role == "user"]
+    assert any(t.content == "hi from voice" for t in user_turns)
+
+
+async def test_voice_loop_mid_stream_failure_pops_last_user_turn(monkeypatch):
+    """On a NetworkError during Phase 5, the Phase-4-appended user
+    Turn is popped — role-alternation parity for the next turn."""
+    from agent.claude import NetworkError
+
+    buffer = ConversationBuffer()
+    _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_result="user turn one",
+        sentences=NetworkError("mid-stream drop"),
+    )
+
+    from agent.loop import voice_loop
+
+    await voice_loop(buffer)
+
+    # The failed user Turn got popped; buffer empty.
+    assert list(buffer) == []
+
+
+# -----------------------------------------------------------------
+# Writer wiring (#78 via #101)
+# -----------------------------------------------------------------
+
+
+async def test_text_loop_fires_process_turn_for_memory_on_user_turn(monkeypatch):
+    """After each user append, text_loop awaits `process_turn_for_memory`
+    with `(db_path, user_text, prior_assistant=<previous assistant or None>,
+    task_registry=_pending_tasks)`."""
+    import agent.memory
+
+    calls = []
+
+    async def capture_ptm(db_path, user_turn, prior_assistant=None, *, task_registry=None):
+        calls.append(
+            {
+                "db_path": db_path,
+                "user_turn": user_turn,
+                "prior_assistant": prior_assistant,
+                "task_registry": task_registry,
+            }
+        )
+
+        async def _done():
+            pass
+
+        task = asyncio.create_task(_done())
+        await task
+        return (None, task)
+
+    monkeypatch.setattr("agent.loop.process_turn_for_memory", capture_ptm)
+
+    buffer = ConversationBuffer()
+    _make_input_script(monkeypatch, ["hello world", EOFError()])
+    _install_text_stream_tokens(monkeypatch, tokens=("hi",))
+
+    from agent.loop import text_loop
+
+    await text_loop(buffer)
+
+    assert len(calls) == 1
+    assert calls[0]["user_turn"] == "hello world"
+    assert calls[0]["prior_assistant"] is None  # first turn
+    assert calls[0]["task_registry"] is agent.memory._pending_tasks
+
+
+async def test_voice_loop_fires_process_turn_for_memory_with_prior_assistant(
+    monkeypatch,
+):
+    """When the buffer already contains (user, assistant) Turns,
+    voice_loop passes the assistant's content as `prior_assistant`
+    for the next user turn's classifier call."""
+    from agent.buffer import Turn
+
+    buffer = ConversationBuffer()
+    buffer.append(Turn(role="user", content="earlier"))
+    buffer.append(Turn(role="assistant", content="earlier reply"))
+
+    calls = []
+
+    async def capture_ptm(db_path, user_turn, prior_assistant=None, *, task_registry=None):
+        calls.append({"user_turn": user_turn, "prior_assistant": prior_assistant})
+
+        async def _done():
+            pass
+
+        task = asyncio.create_task(_done())
+        await task
+        return (None, task)
+
+    monkeypatch.setattr("agent.loop.process_turn_for_memory", capture_ptm)
+
+    _install_voice_pipeline_mocks(
+        monkeypatch,
+        ptt_script=[
+            ("yield", ptt.PTTEvent.PRESSED),
+            ("yield", ptt.PTTEvent.RELEASED),
+        ],
+        stt_result="follow up",
+    )
+
+    from agent.loop import voice_loop
+
+    await voice_loop(buffer)
+
+    assert len(calls) >= 1
+    first = calls[0]
+    assert first["user_turn"] == "follow up"
+    assert first["prior_assistant"] == "earlier reply"
+
+
+# -----------------------------------------------------------------
+# Classifier-task drain on exit
+# -----------------------------------------------------------------
+
+
+async def test_loop_drains_pending_classifier_tasks_on_exit(monkeypatch):
+    """A classifier-ish task left in `_pending_tasks` at loop-exit
+    time gets awaited to completion within the drain budget."""
+    import agent.memory
+
+    completed = asyncio.Event()
+
+    async def fake_classifier_task():
+        await asyncio.sleep(0.01)
+        completed.set()
+
+    async def spawning_ptm(db_path, user_turn, prior_assistant=None, *, task_registry=None):
+        # Spawn a task INTO the registry so the drain can see it.
+        task = asyncio.create_task(fake_classifier_task())
+        agent.memory._pending_tasks.add(task)
+        task.add_done_callback(agent.memory._pending_tasks.discard)
+        return (None, task)
+
+    monkeypatch.setattr("agent.loop.process_turn_for_memory", spawning_ptm)
+
+    buffer = ConversationBuffer()
+    _make_input_script(monkeypatch, ["ping", EOFError()])
+    _install_text_stream_tokens(monkeypatch, tokens=("pong",))
+
+    from agent.loop import text_loop
+
+    await text_loop(buffer)
+
+    # The drain in the outer finally should have awaited the task.
+    assert completed.is_set()
+
+
+async def test_loop_cancels_stragglers_on_drain_timeout(monkeypatch, caplog):
+    """When `asyncio.wait_for` times out, the drain explicitly cancels
+    stragglers and logs a WARNING."""
+    import logging
+
+    import agent.memory
+
+    caplog.set_level(logging.WARNING, logger="agent.loop")
+
+    # Patch wait_for to raise TimeoutError regardless of what's awaited.
+    async def always_timeout(*_a, **_kw):
+        raise TimeoutError
+
+    monkeypatch.setattr("agent.loop.asyncio.wait_for", always_timeout)
+
+    # Spawn a task that'd otherwise block forever.
+    blocking = asyncio.create_task(asyncio.Event().wait())
+
+    try:
+        agent.memory._pending_tasks.add(blocking)
+        blocking.add_done_callback(agent.memory._pending_tasks.discard)
+
+        buffer = ConversationBuffer()
+        _make_input_script(monkeypatch, ["ping", EOFError()])
+        _install_text_stream_tokens(monkeypatch, tokens=("pong",))
+
+        from agent.loop import text_loop
+
+        await text_loop(buffer)
+
+        # Let the just-cancel()ed task reach its final state; cancel()
+        # only schedules — the task is still "cancelling" until it
+        # yields to the event loop.
+        with contextlib.suppress(asyncio.CancelledError):
+            await blocking
+
+        assert blocking.cancelled() or blocking.done()
+        assert any("cancel after" in rec.message for rec in caplog.records)
+    finally:
+        if not blocking.done():
+            blocking.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await blocking
+
+
+# -----------------------------------------------------------------
+# run() wiring
+# -----------------------------------------------------------------
+
+
+async def test_run_calls_init_session_state_once_on_audio_probe_failure(monkeypatch):
+    """When voice probes fail, `run()` falls back to text_loop AND
+    only calls `_init_session_state` once (no double-load)."""
+    monkeypatch.setattr("sys.argv", ["agent"])
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "x")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "x")
+
+    def failing_probe():
+        raise audio.AudioDeviceUnavailable("no mic")
+
+    monkeypatch.setattr("agent.audio.probe_input_device", failing_probe)
+    monkeypatch.setattr("agent.audio.probe_output_device", lambda: None)
+
+    init_calls = []
+    sentinel_buffer = ConversationBuffer()
+
+    def fake_init():
+        init_calls.append(True)
+        return sentinel_buffer
+
+    monkeypatch.setattr("agent.loop._init_session_state", fake_init)
+
+    captured_buffer = {}
+
+    async def fake_text_loop(buffer):
+        captured_buffer["b"] = buffer
+        return 0
+
+    monkeypatch.setattr("agent.loop.text_loop", fake_text_loop)
+
+    from agent.loop import run
+
+    rc = await run()
+    assert rc == 0
+    assert len(init_calls) == 1
+    assert captured_buffer["b"] is sentinel_buffer
+
+
+# -----------------------------------------------------------------
+# Subprocess integration test
+# -----------------------------------------------------------------
+
+
+def test_text_loop_session_and_writer_persist_across_restart(tmp_path):
+    """End-to-end: typed "remember that X" + clean exit persists both
+    session.json (ConversationBuffer snapshot) AND memory.db row with
+    `source="explicit_cue"`. On restart, session.json is loaded and
+    carries the Turn.
+
+    The classifier is mocked inside the subprocess so no real Anthropic
+    call fires. The explicit-cue path is deterministic and is the real
+    AC-1 / AC-2 proof.
+    """
+    import json
+    import subprocess
+    import sys
+    import textwrap
+    from pathlib import Path as _Path
+
+    repo_root = _Path(__file__).resolve().parents[1]
+    data_dir = tmp_path / "friday-data"
+    data_dir.mkdir()
+
+    # Subprocess A: runs text_loop via run() with scripted stdin
+    # ("remember that X", EOF). Writes session.json + memory.db to
+    # tmp data dir.
+    script_a = textwrap.dedent(
+        f"""
+        import asyncio
+        import io
+        import sys
+        sys.path.insert(0, {str(repo_root)!r})
+
+        # Pin get_data_dir to the tmp dir so the loop persists into
+        # tmp_path, not the real user data dir. ``agent.memory`` and
+        # ``agent.session`` import ``get_data_dir`` at module load,
+        # so patching ``agent.paths`` alone is not enough — we must
+        # override each module's own binding.
+        from pathlib import Path
+        _tmp = lambda: Path({str(data_dir)!r})
+        import agent.paths
+        agent.paths.get_data_dir = _tmp
+        import agent.memory
+        agent.memory.get_data_dir = _tmp
+        import agent.session
+        agent.session.get_data_dir = _tmp
+
+        # Neutralize the classifier so no real Anthropic call fires.
+        import agent.claude
+        async def _noop_classifier(user_turn, prior_assistant=None):
+            return None
+        agent.claude.classify_turn_for_memory = _noop_classifier
+        import agent.memory
+        agent.memory.classify_turn_for_memory = _noop_classifier
+
+        # Required key check: text branch only needs ANTHROPIC_API_KEY.
+        import os
+        os.environ["ANTHROPIC_API_KEY"] = "test-key"
+
+        # Script stdin — one explicit-cue line, then EOF to exit.
+        sys.stdin = io.StringIO(
+            "please remember that FRIDAY uses SQLite for memory\\n"
+        )
+
+        # Mock the Anthropic streaming call so run() doesn't fire a
+        # real HTTP request after we append the user turn.
+        import agent.loop
+        async def _fake_tokens(messages, system):
+            yield "noted"
+        agent.loop.stream_tokens = _fake_tokens
+
+        sys.argv = ["agent", "--text"]
+        rc = asyncio.run(agent.loop.run())
+        sys.exit(rc)
+        """
+    ).strip()
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script_a],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, (
+        f"subprocess A failed: stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    # Verify session.json captured the user Turn.
+    session_path = data_dir / "session.json"
+    assert session_path.exists(), f"session.json not written to {data_dir}"
+    payload = json.loads(session_path.read_text(encoding="utf-8"))
+    user_turns = [t for t in payload.get("turns", []) if t.get("role") == "user"]
+    assert any("FRIDAY uses SQLite for memory" in t.get("content", "") for t in user_turns), (
+        f"session.json did not carry the user Turn: {payload}"
+    )
+
+    # Verify memory.db captured the explicit-cue row.
+    import sqlite3 as _sqlite3
+
+    mem_path = data_dir / "memory.db"
+    assert mem_path.exists(), f"memory.db not created at {mem_path}"
+    conn = _sqlite3.connect(mem_path)
+    try:
+        rows = list(conn.execute("SELECT kind, content, metadata FROM memories ORDER BY id"))
+    finally:
+        conn.close()
+
+    explicit_rows = [r for r in rows if '"source": "explicit_cue"' in (r[2] or "")]
+    assert len(explicit_rows) >= 1, f"no explicit_cue row in memory.db; rows={rows}"
+    assert "FRIDAY uses SQLite for memory" in explicit_rows[0][1]
+
+    # Subprocess B: reload session.json via load_session; assert the
+    # Turn comes back from disk.
+    script_b = textwrap.dedent(
+        f"""
+        import sys
+        sys.path.insert(0, {str(repo_root)!r})
+        from pathlib import Path
+        _tmp = lambda: Path({str(data_dir)!r})
+        import agent.paths
+        agent.paths.get_data_dir = _tmp
+        import agent.session
+        agent.session.get_data_dir = _tmp
+        from agent.session import load_session, default_session_path
+        buf = load_session(default_session_path())
+        texts = [t.content for t in buf]
+        print("|".join(texts))
+        sys.exit(0 if any("FRIDAY uses SQLite" in t for t in texts) else 1)
+        """
+    ).strip()
+
+    result_b = subprocess.run(
+        [sys.executable, "-I", "-c", script_b],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result_b.returncode == 0, (
+        f"subprocess B failed to find persisted Turn: "
+        f"stdout={result_b.stdout!r} stderr={result_b.stderr!r}"
+    )
