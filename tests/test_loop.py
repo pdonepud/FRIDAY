@@ -78,6 +78,11 @@ def _neutralize_loop_wirings_101(monkeypatch):
 
     monkeypatch.setattr("agent.loop._init_memory_db", _noop_init_memory_db)
 
+    async def _noop_warm_encoder(timeout: float = 15.0) -> None:
+        return None
+
+    monkeypatch.setattr("agent.loop.warm_encoder", _noop_warm_encoder)
+
     # #79: stub build_messages too so loop tests don't trigger real
     # context assembly (which calls search_memories against the user's
     # data dir). Return a minimal passthrough: (base_system,

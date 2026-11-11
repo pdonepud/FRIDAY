@@ -85,7 +85,7 @@ from agent.claude import (
     stream_sentences,
     stream_tokens,
 )
-from agent.context import build_messages
+from agent.context import build_messages, warm_encoder
 from agent.events import BargeInEvent
 
 # ``_pending_tasks`` is a private module-level attribute of
@@ -1143,6 +1143,7 @@ async def run() -> int:
             return 1
         buffer = _init_session_state()
         await _init_memory_db()
+        await warm_encoder()
         return await text_loop(buffer)
 
     missing = [key for key in _VOICE_REQUIRED_KEYS if not os.environ.get(key)]
@@ -1166,8 +1167,10 @@ async def run() -> int:
         # session.json on first entry here.
         buffer = _init_session_state()
         await _init_memory_db()
+        await warm_encoder()
         return await text_loop(buffer)
 
     buffer = _init_session_state()
     await _init_memory_db()
+    await warm_encoder()
     return await voice_loop(buffer)

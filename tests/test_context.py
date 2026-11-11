@@ -597,3 +597,132 @@ async def test_build_messages_counts_special_token_literals_as_plain_text(monkey
     elif vector == "memory":
         # The memory section should carry the bullet with the literal.
         assert _SPECIAL in system
+
+
+# =================================================================
+# #79 CR F2 — warm_encoder (off-event-loop tiktoken warmup)
+# =================================================================
+
+
+@pytest.fixture
+def _reset_encoder_state(monkeypatch):
+    """Reset the module-level encoder globals before each warm_encoder
+    test. ``agent.context`` carries one-shot state (``_encoder`` /
+    ``_encoder_available``) that would otherwise leak across tests."""
+    import agent.context
+
+    monkeypatch.setattr(agent.context, "_encoder", None, raising=False)
+    monkeypatch.setattr(agent.context, "_encoder_available", True, raising=False)
+
+
+async def test_warm_encoder_populates_encoder_on_happy_path(_reset_encoder_state, monkeypatch):
+    """Happy path: `warm_encoder` populates `_encoder` with whatever
+    `tiktoken.get_encoding` returns."""
+    import agent.context
+
+    sentinel = object()
+    called = []
+
+    def fake_get_encoding(name):
+        called.append(name)
+        return sentinel
+
+    monkeypatch.setattr("agent.context.tiktoken.get_encoding", fake_get_encoding)
+
+    await agent.context.warm_encoder()
+
+    assert agent.context._encoder is sentinel
+    assert agent.context._encoder_available is True
+    assert called == ["cl100k_base"]
+
+
+async def test_warm_encoder_falls_back_on_exception(_reset_encoder_state, monkeypatch, caplog):
+    """`tiktoken.get_encoding` raising flips `_encoder_available` to
+    False and emits the one-time WARNING, matching the lazy path's
+    posture so subsequent `_count_tokens` calls degrade to char/4."""
+    import agent.context
+
+    caplog.set_level(logging.WARNING, logger="agent.context")
+
+    def boom(name):
+        raise RuntimeError("simulated network failure")
+
+    monkeypatch.setattr("agent.context.tiktoken.get_encoding", boom)
+
+    await agent.context.warm_encoder()
+
+    assert agent.context._encoder is None
+    assert agent.context._encoder_available is False
+    assert any("tiktoken unavailable" in rec.message for rec in caplog.records)
+
+
+async def test_warm_encoder_falls_back_on_timeout(_reset_encoder_state, monkeypatch, caplog):
+    """A sync download that overruns the warmup timeout surfaces as
+    TimeoutError from asyncio.wait_for; warm_encoder catches it,
+    flips the fallback flag, and emits a WARNING. The background
+    thread is NOT cancelled (asyncio can't cancel a sync to_thread
+    worker) — documented in the function's docstring; the thread's
+    lingering work is harmless because `_get_encoder` would
+    transparently promote a late result."""
+    import time
+
+    import agent.context
+
+    caplog.set_level(logging.WARNING, logger="agent.context")
+
+    def slow_get_encoding(name):
+        # NOTE: time.sleep, not asyncio.sleep — this runs in the
+        # asyncio.to_thread worker where asyncio.sleep is a no-op.
+        time.sleep(0.5)
+        return object()
+
+    monkeypatch.setattr("agent.context.tiktoken.get_encoding", slow_get_encoding)
+
+    await agent.context.warm_encoder(timeout=0.1)
+
+    assert agent.context._encoder_available is False
+    assert any("warmup timed out" in rec.message for rec in caplog.records)
+
+
+async def test_warm_encoder_is_idempotent_when_already_warm(_reset_encoder_state, monkeypatch):
+    """When `_encoder` is already populated, `warm_encoder` returns
+    immediately and does NOT call `tiktoken.get_encoding` again."""
+    import agent.context
+
+    sentinel = object()
+    monkeypatch.setattr(agent.context, "_encoder", sentinel, raising=False)
+
+    called = []
+
+    def tracking(name):
+        called.append(name)
+        return object()
+
+    monkeypatch.setattr("agent.context.tiktoken.get_encoding", tracking)
+
+    await agent.context.warm_encoder()
+
+    assert agent.context._encoder is sentinel
+    assert called == []
+
+
+async def test_warm_encoder_is_idempotent_when_already_failed(_reset_encoder_state, monkeypatch):
+    """When `_encoder_available` is already False (a prior attempt
+    failed), `warm_encoder` returns immediately — no retry on
+    repeated warmups within a process lifetime."""
+    import agent.context
+
+    monkeypatch.setattr(agent.context, "_encoder_available", False, raising=False)
+
+    called = []
+
+    def tracking(name):
+        called.append(name)
+        return object()
+
+    monkeypatch.setattr("agent.context.tiktoken.get_encoding", tracking)
+
+    await agent.context.warm_encoder()
+
+    assert agent.context._encoder is None
+    assert called == []

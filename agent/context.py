@@ -63,9 +63,16 @@ Emitted on :class:`logging.Logger` ``"agent.context"``.
   voice-first latency UX (follow-up tracked for the Anthropic endpoint
   integration).
 * First call to :func:`tiktoken.get_encoding` fetches the BPE vocab from
-  Azure blob storage (~4MB, cached at ``~/.tiktoken/`` thereafter). A
-  network failure at first use degrades to ``max(1, len(text) // 4)``
-  estimation via the ``_encoder_available`` flag, not a crash.
+  Azure blob storage (~4MB, cached at tiktoken's default cache dir —
+  ``<tempdir>/data-gym-cache`` unless overridden via
+  ``TIKTOKEN_CACHE_DIR`` — thereafter). A network failure at first use
+  degrades to ``max(1, len(text) // 4)`` estimation via the
+  ``_encoder_available`` flag, not a crash.
+* :func:`warm_encoder` runs the fetch in a worker thread under
+  :func:`asyncio.wait_for` so startup doesn't stall the event loop on
+  a cold cache (relevant for ``voice_loop`` where a stalled main loop
+  would freeze the PTT pump, first-chunk waiter, playback task, and
+  barge-in detector).
 
 ## Signature deviation from ADR-0007
 
@@ -79,6 +86,7 @@ follow-up tracks the ADR wording update.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Final
 
@@ -125,6 +133,12 @@ _MEMORY_SECTION_HEADER: Final[str] = "Things I remember about Preetam:"
 #: tiktoken encoding name (ADR-0007 §Token counting).
 _TIKTOKEN_ENCODING: Final[str] = "cl100k_base"
 
+#: Upper bound for :func:`warm_encoder`'s async wait on the first
+#: tiktoken fetch. 15 s is a reasonable one-time startup hang bound;
+#: connections slower than that are probably better off in the char/4
+#: fallback anyway. TODO(#79-tuning).
+_ENCODER_WARM_TIMEOUT_S: Final[float] = 15.0
+
 _log = logging.getLogger("agent.context")
 
 # Module-level lazy encoder cache. ``_encoder_available`` is False once
@@ -157,6 +171,63 @@ def _get_encoder() -> tiktoken.Encoding | None:
         )
         return None
     return _encoder
+
+
+async def warm_encoder(timeout: float = _ENCODER_WARM_TIMEOUT_S) -> None:
+    """Prefetch the tiktoken encoding off the event loop.
+
+    Runs :func:`tiktoken.get_encoding` in a worker thread via
+    :func:`asyncio.to_thread`, bounded by :func:`asyncio.wait_for` so
+    a cold cache's ~4 MB vocab download doesn't block the event loop.
+    Relevant for :func:`agent.loop.voice_loop` where a stalled main
+    loop would freeze the PTT pump, the first-chunk waiter, the
+    playback task, and the barge-in detector all at once.
+
+    Idempotent in both directions:
+
+    * If :data:`_encoder` is already populated, returns immediately.
+    * If :data:`_encoder_available` is already ``False`` (a prior
+      attempt failed), returns immediately — no retry.
+
+    On ``TimeoutError`` from :func:`asyncio.wait_for` OR any exception
+    from the underlying :func:`tiktoken.get_encoding` call, flips
+    :data:`_encoder_available` to ``False`` and logs the one-time
+    WARNING via :func:`_get_encoder`'s existing guard (identical
+    message shape, matched by every log-asserting test) so subsequent
+    :func:`_count_tokens` calls degrade to char/4 estimation.
+
+    Known interaction: :func:`asyncio.wait_for` cannot cancel a sync
+    function running in :func:`asyncio.to_thread` — the background
+    thread keeps running after the timeout fires and may eventually
+    populate ``_encoder`` later. That's accepted because
+    :func:`_get_encoder`'s ``if _encoder is not None`` check will
+    transparently promote the late result on the next
+    :func:`_count_tokens` call. The warmup timeout only decides
+    whether STARTUP blocks, not whether tiktoken is ever used.
+    """
+    global _encoder, _encoder_available
+    if _encoder is not None:
+        return
+    if not _encoder_available:
+        return
+    try:
+        _encoder = await asyncio.wait_for(
+            asyncio.to_thread(tiktoken.get_encoding, _TIKTOKEN_ENCODING),
+            timeout=timeout,
+        )
+    except TimeoutError:
+        _encoder_available = False
+        _log.warning(
+            "tiktoken unavailable (warmup timed out after %.1fs); "
+            "falling back to char/4 token estimates",
+            timeout,
+        )
+    except Exception as exc:  # noqa: BLE001 — warmup failure must not crash startup
+        _encoder_available = False
+        _log.warning(
+            "tiktoken unavailable (%s); falling back to char/4 token estimates",
+            exc,
+        )
 
 
 def _count_tokens(text: str) -> int:
