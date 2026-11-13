@@ -24,6 +24,7 @@ from agent.memory import (
     delete_memory,
     ensure_fts5_available,
     get_memory,
+    list_memories,
     search_memories,
 )
 
@@ -824,6 +825,86 @@ async def test_search_memories_normalizes_underscore_glued_operator(bootstrapped
     hits = await search_memories(bootstrapped_db, "coffee_OR_tea")
     assert len(hits) == 1
     assert hits[0].content == "coffee and tea together"
+
+
+# =================================================================
+# #80 — list_memories (ADR-0006 §Public surface, deferred from #76)
+# =================================================================
+
+
+async def test_list_memories_empty_db_returns_empty_list(bootstrapped_db):
+    """No rows → []."""
+    assert await list_memories(bootstrapped_db) == []
+
+
+async def test_list_memories_returns_all_in_created_at_desc_order(bootstrapped_db, monkeypatch):
+    """Rows come back newest-first by ``created_at`` DESC. Timestamps
+    are seeded explicitly via raw INSERT so ordering is deterministic
+    without relying on inter-call sleep."""
+    base = datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
+    async with aiosqlite.connect(bootstrapped_db) as db:
+        for i in range(5):
+            ts = (base + timedelta(minutes=i)).isoformat()
+            await db.execute(
+                "INSERT INTO memories (created_at, updated_at, kind, content, metadata) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (ts, ts, "fact", f"row {i}", "{}"),
+            )
+        await db.commit()
+
+    results = await list_memories(bootstrapped_db)
+    assert [m.content for m in results] == [
+        "row 4",
+        "row 3",
+        "row 2",
+        "row 1",
+        "row 0",
+    ]
+
+
+async def test_list_memories_respects_limit(bootstrapped_db):
+    """``limit`` caps the result length even when more rows exist."""
+    for i in range(10):
+        await add_memory(bootstrapped_db, kind="fact", content=f"row {i}")
+    results = await list_memories(bootstrapped_db, limit=3)
+    assert len(results) == 3
+
+
+async def test_list_memories_filters_by_kind(bootstrapped_db):
+    """``kind=X`` filters to exact-match rows only."""
+    await add_memory(bootstrapped_db, kind="fact", content="a fact")
+    await add_memory(bootstrapped_db, kind="preference", content="a pref")
+    await add_memory(bootstrapped_db, kind="fact", content="another fact")
+
+    only_prefs = await list_memories(bootstrapped_db, kind="preference")
+    assert len(only_prefs) == 1
+    assert only_prefs[0].kind == "preference"
+
+    only_facts = await list_memories(bootstrapped_db, kind="fact")
+    assert len(only_facts) == 2
+    assert all(m.kind == "fact" for m in only_facts)
+
+
+async def test_list_memories_filter_by_kind_with_no_matches_returns_empty(bootstrapped_db):
+    """A ``kind`` value that matches nothing in the DB → []."""
+    await add_memory(bootstrapped_db, kind="fact", content="only facts here")
+    assert await list_memories(bootstrapped_db, kind="person") == []
+
+
+@pytest.mark.parametrize("bad_limit", [0, -1, 1.5, "3", True, None])
+async def test_list_memories_rejects_non_positive_limit(bootstrapped_db, bad_limit):
+    """``limit`` must be a positive ``int`` — bool rejected despite
+    being an int subclass, mirroring ``search_memories``'s posture."""
+    with pytest.raises(ValueError, match="limit must be a positive int"):
+        await list_memories(bootstrapped_db, limit=bad_limit)
+
+
+@pytest.mark.parametrize("bad_kind", [123, [], {}, 1.5])
+async def test_list_memories_rejects_non_string_kind(bootstrapped_db, bad_kind):
+    """``kind`` must be ``str`` or ``None`` — anything else raises
+    ValueError before any DB work."""
+    with pytest.raises(ValueError, match="kind must be a str or None"):
+        await list_memories(bootstrapped_db, kind=bad_kind)
 
 
 # =================================================================
