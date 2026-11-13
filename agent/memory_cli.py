@@ -56,6 +56,8 @@ history forward in time. File is written atomically via
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
 import json
 import os
 import sys
@@ -411,6 +413,18 @@ async def _cmd_export(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    # CR R2 F3: pre-check lives in _cmd_export (not inside the writer)
+    # so it stays a fast user-friendly error distinct from the writer's
+    # no-clobber install-step race detection. A FileExistsError from
+    # the writer is now ALWAYS the TOCTOU race case and flows through
+    # the "export failed: ..." OSError handler below with the writer's
+    # own "created mid-write; re-run with --force" message intact.
+    if path.exists() and not args.force:
+        print(
+            f"target {path} exists (pass --force to overwrite)",
+            file=sys.stderr,
+        )
+        return 1
     db_path = default_memory_db_path()
     # Query one past the ceiling so a result-length check distinguishes
     # "at or below the ceiling" (export proceeds) from "over the
@@ -427,13 +441,11 @@ async def _cmd_export(args: argparse.Namespace) -> int:
     memories = list(reversed(memories_desc))
     try:
         await _write_jsonl_export(memories, path, force=args.force)
-    except FileExistsError:
-        print(
-            f"target {path} exists (pass --force to overwrite)",
-            file=sys.stderr,
-        )
-        return 1
     except (OSError, UnicodeError) as exc:
+        # OSError here includes the writer's own FileExistsError on
+        # the no-clobber TOCTOU-race case (FileExistsError IS an
+        # OSError) with the "created mid-write" message, plus the
+        # hard-link-unsupported OSError on FAT/exFAT per CR R2 F3.
         print(f"export failed: {exc}", file=sys.stderr)
         return 1
     print(f"Exported {len(memories)} memories to {path}.")
@@ -562,21 +574,47 @@ async def _write_jsonl_export(
     """Atomically write ``memories`` as JSONL to ``path``.
 
     Raises:
-        FileExistsError: ``path`` already exists and ``force`` is False.
-        OSError: any underlying filesystem error from mkstemp /
-            write / fsync / replace.
+        FileExistsError: ``path`` already exists and ``force`` is False —
+            either caught at the :func:`_cmd_export` pre-check (fast
+            user-friendly path) or at the no-clobber install step
+            below (CR R2 F3's TOCTOU guard).
+        OSError: any underlying filesystem error from mkstemp / write /
+            fsync / install, including the no-hardlink-support
+            ``errno.EPERM`` / ``EOPNOTSUPP`` / ``ENOSYS`` surfaced by
+            :func:`os.link` on filesystems like FAT/exFAT.
         UnicodeError: a Memory's content or metadata holds a
             non-UTF-8-encodable value (defense-in-depth —
             :func:`agent.memory.add_memory` already guards at the
             write seam).
 
     Writes through a sibling tempfile in ``path.parent``, ``fsync``s,
-    chmods to 0o600 on POSIX, then ``os.replace``s onto ``path``
-    (atomic on same-filesystem on POSIX, atomic-rename on Windows).
-    Mirrors :func:`agent.session.save_session` exactly.
+    chmods to 0o600 on POSIX, then installs onto ``path`` with a
+    platform-aware no-clobber step when ``force`` is False:
+
+    * ``force=True``: :func:`os.replace` (unconditional overwrite —
+      matches the user's explicit intent).
+    * ``force=False`` on POSIX: :func:`os.link` (atomic — raises
+      :class:`FileExistsError` if ``path`` exists at link time; does
+      NOT remove the source entry, so ``finally`` cleans the tempfile).
+    * ``force=False`` on Windows: :func:`os.rename` (Python 3.11+
+      raises :class:`FileExistsError` on existing destination; moves
+      the source so tempfile cleanup is a no-op via the
+      ``FileNotFoundError`` suppression below).
+
+    CR R2 F3 (PR #107): the pre-check in :func:`_cmd_export` closes
+    the common case, and this no-clobber install step closes the
+    TOCTOU window between that pre-check and here — another writer
+    (second ``memory export`` call, concurrent FRIDAY process, user
+    shell ``touch``) can race in between and silently get its content
+    overwritten by an unconditional :func:`os.replace`. Mirrors
+    :func:`agent.session.save_session`'s atomic-rename intent plus
+    this extra no-clobber discipline.
     """
-    if path.exists() and not force:
-        raise FileExistsError(f"{path} exists")
+    # CR R2 F3: the pre-check for target-exists-without-force lives
+    # at the caller (``_cmd_export``). The install step below is the
+    # authoritative no-clobber barrier for the TOCTOU-race case and
+    # relies on ``os.link`` / ``os.rename`` to raise FileExistsError
+    # atomically, so there is nothing to pre-check here.
 
     header = {
         "schema_version": SCHEMA_VERSION,
@@ -584,15 +622,12 @@ async def _write_jsonl_export(
         "count": len(memories),
     }
 
-    tmp_path: str | None = None
-    replaced = False
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".memory_export.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
     try:
-        fd, tmp_name = tempfile.mkstemp(
-            prefix=".memory_export.",
-            suffix=".tmp",
-            dir=str(path.parent),
-        )
-        tmp_path = tmp_name
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(json.dumps(header, ensure_ascii=False, separators=(",", ":")) + "\n")
             for memory in memories:
@@ -612,14 +647,64 @@ async def _write_jsonl_export(
             # posture. Windows is a no-op (NTFS uses ACLs; the
             # agent/paths.py 0o700 parent dir carries the guarantee).
             os.chmod(tmp_path, 0o600)
-        os.replace(tmp_path, path)
-        replaced = True
-    finally:
-        if tmp_path is not None and not replaced:
+
+        if force:
+            # Unconditional overwrite per the user's --force intent.
+            # os.replace removes the source entry on success, so the
+            # finally-block unlink below hits FileNotFoundError and
+            # suppresses — one cleanup site handles every path.
+            os.replace(tmp_path, path)
+        else:
+            # No-clobber install: close the TOCTOU window that would
+            # otherwise let a mid-write writer get silently overwritten
+            # after the pre-check cleared.
             try:
-                Path(tmp_path).unlink(missing_ok=True)
-            except OSError:
-                # Best-effort cleanup — the original failure has
-                # already been raised; a tempfile-unlink failure on
-                # top of it would mask the real cause.
-                pass
+                if sys.platform == "win32":
+                    # 3.11+ Windows os.rename raises FileExistsError on
+                    # existing destination (unlike POSIX rename which
+                    # overwrites silently). Moves the source — no
+                    # leftover tempfile.
+                    os.rename(tmp_path, path)
+                else:
+                    # os.link is atomic and raises FileExistsError if
+                    # path exists at link time. The source entry stays,
+                    # so the finally-block cleanup unlinks it.
+                    os.link(tmp_path, path)
+            except FileExistsError as exc:
+                # Race: another writer created `path` between the
+                # pre-check in _cmd_export and here. Re-raise with a
+                # message that points the user at --force; the outer
+                # handler in _cmd_export surfaces it as "export failed:
+                # ...".
+                raise FileExistsError(
+                    f"export target {path} was created mid-write; re-run with --force to overwrite."
+                ) from exc
+            except OSError as exc:
+                # POSIX-only: hard links unsupported on the target
+                # filesystem (FAT, exFAT, some network mounts). Surface
+                # a clear remedy pointing at --force rather than
+                # silently falling back to os.replace, which would
+                # defeat the no-clobber invariant this branch exists
+                # to uphold.
+                if sys.platform != "win32" and exc.errno in (
+                    errno.EPERM,
+                    errno.EOPNOTSUPP,
+                    errno.ENOSYS,
+                ):
+                    raise OSError(
+                        f"destination filesystem does not support hard "
+                        f"links (errno={exc.errno}); re-run with --force "
+                        f"to use unconditional rename, or export to a "
+                        f"different filesystem."
+                    ) from exc
+                raise
+    finally:
+        # Unconditional tempfile cleanup. Handles all three cases:
+        #   os.replace success — tempfile already moved → FileNotFound
+        #     → suppressed.
+        #   os.link success — tempfile still on disk alongside target
+        #     → unlinked here.
+        #   Any exception path — tempfile may or may not exist →
+        #     unlinked or FileNotFound-suppressed.
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_path)

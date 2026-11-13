@@ -613,8 +613,13 @@ async def test_export_writer_oserror_surfaces_as_export_failed_exit_1(
     """A filesystem error inside the writer path surfaces as
     ``"export failed: ..."`` on stderr + exit 1 (operational failure).
     Also exercises the tempfile-cleanup finally branch — mkstemp
-    succeeds, then os.replace raises, so the ``.tmp`` file must be
-    unlinked to avoid leaking residue in the user's data dir."""
+    succeeds, then ``os.replace`` raises, so the ``.tmp`` file must be
+    unlinked to avoid leaking residue in the user's data dir.
+
+    Uses ``--force`` so the install step actually hits ``os.replace``
+    (post-CR-R2-F3 the no-force path uses ``os.link`` / ``os.rename``
+    instead; this test specifically exercises the force-overwrite
+    branch)."""
     isolate_db(populated_db)
     target = tmp_path / "out.jsonl"
 
@@ -628,7 +633,7 @@ async def test_export_writer_oserror_surfaces_as_export_failed_exit_1(
 
     monkeypatch.setattr("agent.memory_cli.os.replace", fake_replace)
 
-    rc = await _run_cli(["memory", "export", str(target)])
+    rc = await _run_cli(["memory", "export", str(target), "--force"])
     captured = capsys.readouterr()
     assert rc == 1
     assert "export failed" in captured.err
@@ -638,9 +643,9 @@ async def test_export_writer_oserror_surfaces_as_export_failed_exit_1(
     residues = list(target.parent.glob(".memory_export.*.tmp"))
     assert residues == [], f"tempfile leaked: {residues!r}"
 
-    # Sanity: with a real os.replace, the same export now succeeds.
+    # Sanity: with a real os.replace, the same --force export now succeeds.
     monkeypatch.setattr("agent.memory_cli.os.replace", real_replace)
-    rc2 = await _run_cli(["memory", "export", str(target)])
+    rc2 = await _run_cli(["memory", "export", str(target), "--force"])
     assert rc2 == 0
 
 
@@ -849,3 +854,151 @@ async def test_forget_preview_sanitizes_ansi_in_content(
     assert "?" in prompt
     # The surviving literal body stays recognizable in the preview.
     assert "benign body" in prompt
+
+
+# =================================================================
+# CR R2 F3 — no-clobber export install closes the TOCTOU window
+# =================================================================
+
+
+async def test_export_detects_race_between_precheck_and_install(
+    populated_db, isolate_db, tmp_path, monkeypatch, capsys
+):
+    """Simulate a mid-write race: ``path.exists()`` returns False at
+    the pre-check, but by the time :func:`_write_jsonl_export` tries
+    to install (``os.link`` on POSIX, ``os.rename`` on Windows), the
+    target exists. The no-clobber install step raises
+    :class:`FileExistsError` instead of silently overwriting; the
+    outer ``_cmd_export`` surfaces it + exits 1. Tempfile cleanup
+    runs regardless so no residue leaks."""
+    isolate_db(populated_db)
+    target = tmp_path / "out.jsonl"
+
+    # Patch the platform's install call to simulate the race:
+    # the ``path`` arg exists by the time we get here (as if another
+    # writer slipped in between the pre-check and this call).
+    attr = "rename" if sys.platform == "win32" else "link"
+
+    def fake_install(src, dst):
+        raise FileExistsError(f"{dst} exists")
+
+    monkeypatch.setattr(f"agent.memory_cli.os.{attr}", fake_install)
+
+    rc = await _run_cli(["memory", "export", str(target)])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "created mid-write" in captured.err
+    assert "--force" in captured.err
+    # Tempfile residue zero.
+    residues = list(tmp_path.glob(".memory_export.*.tmp"))
+    assert residues == [], f"tempfile leaked: {residues!r}"
+    # Target was not created (the install step raised before any
+    # overwrite could happen, and we never cleared pre-check so the
+    # target doesn't exist here either).
+    assert not target.exists()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="hard-link unsupported-filesystem path is POSIX-only",
+)
+async def test_export_hardlink_unavailable_filesystem_surfaces_clear_error(
+    populated_db, isolate_db, tmp_path, monkeypatch, capsys
+):
+    """FAT/exFAT and some network mounts don't support hard links;
+    :func:`os.link` raises :class:`OSError` with ``errno=EPERM`` or
+    similar. The no-clobber branch surfaces a clear "re-run with
+    --force" remedy rather than silently falling back to
+    :func:`os.replace` (which would defeat the invariant that this
+    branch exists to uphold)."""
+    import errno as _errno
+
+    isolate_db(populated_db)
+    target = tmp_path / "out.jsonl"
+
+    def fake_link(src, dst):
+        raise OSError(_errno.EPERM, "operation not permitted")
+
+    monkeypatch.setattr("agent.memory_cli.os.link", fake_link)
+
+    rc = await _run_cli(["memory", "export", str(target)])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "does not support hard links" in captured.err
+    assert "--force" in captured.err
+    residues = list(tmp_path.glob(".memory_export.*.tmp"))
+    assert residues == [], f"tempfile leaked: {residues!r}"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.link leaves the source entry behind; Windows uses os.rename "
+    "which moves the file, so this leak case is POSIX-only",
+)
+async def test_export_tempfile_cleaned_up_on_link_success_posix(
+    populated_db, isolate_db, tmp_path, capsys
+):
+    """POSIX-only: :func:`os.link` leaves the source entry behind on
+    success (unlike :func:`os.rename` / :func:`os.replace` which move).
+    The ``finally`` block must unlink the tempfile; otherwise every
+    successful no-force export would leak a ``.memory_export.*.tmp``
+    residue in the user's data dir."""
+    isolate_db(populated_db)
+    target = tmp_path / "out.jsonl"
+    rc = await _run_cli(["memory", "export", str(target)])
+    assert rc == 0
+    assert target.exists()
+    residues = list(tmp_path.glob(".memory_export.*.tmp"))
+    assert residues == [], f"tempfile leaked after link success: {residues!r}"
+
+
+async def test_export_force_still_overwrites_existing(populated_db, isolate_db, tmp_path, capsys):
+    """Invariant: ``--force`` continues to overwrite an existing target
+    cleanly after the R2 F3 platform-split refactor. Pre-create the
+    target with sentinel bytes, run with ``--force``, assert the
+    sentinel is gone + exit 0."""
+    isolate_db(populated_db)
+    target = tmp_path / "out.jsonl"
+    target.write_text("OLD SENTINEL CONTENT", encoding="utf-8")
+    rc = await _run_cli(["memory", "export", str(target), "--force"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Exported 3 memories" in captured.out
+    new_contents = target.read_text(encoding="utf-8")
+    assert "OLD SENTINEL CONTENT" not in new_contents
+    header = json.loads(new_contents.splitlines()[0])
+    assert header["count"] == 3
+    residues = list(tmp_path.glob(".memory_export.*.tmp"))
+    assert residues == [], f"tempfile leaked after force overwrite: {residues!r}"
+
+
+async def test_export_os_replace_success_does_not_double_unlink_tempfile(
+    populated_db, isolate_db, tmp_path, monkeypatch, capsys
+):
+    """``--force`` path uses :func:`os.replace`, which removes the
+    source tempfile on success. The ``finally`` block's unlink hits
+    :class:`FileNotFoundError` and must suppress it — otherwise a
+    successful force-export would raise on cleanup. Exercises the
+    ``contextlib.suppress(FileNotFoundError)`` guard explicitly."""
+    isolate_db(populated_db)
+    target = tmp_path / "out.jsonl"
+
+    real_unlink = os.unlink
+    unlink_calls: list[str] = []
+
+    def tracking_unlink(path_arg):
+        unlink_calls.append(str(path_arg))
+        return real_unlink(path_arg)
+
+    monkeypatch.setattr("agent.memory_cli.os.unlink", tracking_unlink)
+
+    rc = await _run_cli(["memory", "export", str(target), "--force"])
+    assert rc == 0
+    assert target.exists()
+    # Exactly one unlink attempt on a .memory_export tempfile (the
+    # finally-block cleanup), and FileNotFoundError was suppressed
+    # because os.replace already removed it.
+    tempfile_unlinks = [p for p in unlink_calls if ".memory_export." in p]
+    assert len(tempfile_unlinks) == 1, (
+        f"expected exactly one tempfile unlink, got {tempfile_unlinks!r}"
+    )
