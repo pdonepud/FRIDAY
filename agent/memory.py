@@ -43,6 +43,22 @@ Schema v2 (FTS5 keyword retrieval; #77):
     -- backfill existing rows (v1 → v2 upgrade; no-op on fresh install)
     INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
 
+Schema v3 (Porter stemming + OR retrieval; #109):
+
+.. code-block:: sql
+
+    -- Drop v2 triggers and virtual table, recreate with porter+unicode61,
+    -- recreate the three triggers (copied verbatim from v2 on purpose —
+    -- already-applied migrations must never change), then rebuild.
+    DROP TRIGGER memories_au; DROP TRIGGER memories_ad; DROP TRIGGER memories_ai;
+    DROP TABLE memories_fts;
+    CREATE VIRTUAL TABLE memories_fts USING fts5(
+        content, content='memories', content_rowid='id',
+        tokenize='porter unicode61'
+    );
+    -- triggers identical to v2
+    INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
+
 ## FTS5 capability
 
 FTS5 is a SQLite build-time flag — most mainstream Python distributions
@@ -209,6 +225,58 @@ _MIGRATIONS: Final[list[tuple[int, list[str]]]] = [
             "INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')",
         ],
     ),
+    (
+        3,
+        [
+            # #109: recreate memories_fts with the porter stemmer so a
+            # query for ``name`` matches a row stored with ``named``.
+            # Drops the v2 index + triggers and recreates them with
+            # porter+unicode61. The trigger DDL below is a verbatim
+            # COPY of v2's trigger DDL (NOT a shared constant), per the
+            # migration-immutability rule: once a migration has shipped
+            # its exact SQL may not change. Factoring these into a
+            # shared constant would couple v2's applied-state semantics
+            # to v3's recreate-state semantics — a future v4 that
+            # tweaks the trigger shape would silently rewrite v2 on
+            # replay. Duplication is deliberate.
+            "DROP TRIGGER IF EXISTS memories_au",
+            "DROP TRIGGER IF EXISTS memories_ad",
+            "DROP TRIGGER IF EXISTS memories_ai",
+            "DROP TABLE IF EXISTS memories_fts",
+            # Porter is a wrapper tokenizer applied on top of unicode61:
+            # unicode61 tokenizes, porter stems each token. Query terms
+            # are stemmed identically at MATCH time, so ``"name"`` in
+            # the query hits content containing ``named``.
+            "CREATE VIRTUAL TABLE memories_fts "
+            "USING fts5(content, content='memories', content_rowid='id', "
+            "tokenize='porter unicode61')",
+            """
+            CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+              INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+            END
+            """,
+            """
+            CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
+              INSERT INTO memories_fts(memories_fts, rowid, content)
+                VALUES ('delete', old.id, old.content);
+            END
+            """,
+            """
+            CREATE TRIGGER memories_au AFTER UPDATE ON memories
+            WHEN NEW.content IS NOT OLD.content BEGIN
+              INSERT INTO memories_fts(memories_fts, rowid, content)
+                VALUES ('delete', old.id, old.content);
+              INSERT INTO memories_fts(rowid, content)
+                VALUES (new.id, new.content);
+            END
+            """,
+            # Backfill the freshly-created porter-stemmed index from
+            # the (unchanged) base table. On a fresh install this is a
+            # no-op; on a v2→v3 upgrade it reindexes every surviving
+            # row so porter stems are applied retroactively.
+            "INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')",
+        ],
+    ),
 ]
 
 #: Highest schema version the code knows how to produce. Derived from
@@ -222,6 +290,126 @@ _LOG_TRUNCATE: Final[int] = 200
 #: Default k for :func:`search_memories`. ADR-0006 Implementation Notes
 #: pins this to 5; context assembly (ADR-0007 / #79) may override.
 _FTS_TOPK_DEFAULT: Final[int] = 5
+
+#: English stopword list dropped from the normalized query terms in
+#: :func:`search_memories` (#109). Short and English-only by design: the
+#: ADR-0006 §Retriever amendment (2026-11-13) describes why. Covers
+#: articles, copula + aux verbs, pronouns, demonstratives, wh-words,
+#: common prepositions, a handful of conversational fillers FRIDAY hears
+#: often (``tell``, ``about``, ``please``), common modal auxiliaries
+#: (``can``, ``could``, ``would``, ``will``), the contraction residues
+#: that Step 1's ``[\W_]+`` strip leaves behind (``what's`` → ``what``
+#: + ``s``), and the FTS5 operator keywords as belt-and-suspenders in
+#: case Step 2's whole-word strip is ever bypassed. Deliberately does
+#: NOT include content words (``dog``, ``name``, ``memory``, …).
+_STOPWORDS: Final[frozenset[str]] = frozenset(
+    {
+        # articles
+        "a",
+        "an",
+        "the",
+        # copula + aux
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "am",
+        "do",
+        "does",
+        "did",
+        "have",
+        "has",
+        "had",
+        # modal auxiliaries
+        "can",
+        "could",
+        "would",
+        "will",
+        "should",
+        "may",
+        "might",
+        "must",
+        # pronouns
+        "i",
+        "me",
+        "my",
+        "mine",
+        "we",
+        "us",
+        "our",
+        "ours",
+        "you",
+        "your",
+        "yours",
+        "he",
+        "him",
+        "his",
+        "she",
+        "her",
+        "hers",
+        "it",
+        "its",
+        "they",
+        "them",
+        "their",
+        "theirs",
+        # demonstratives
+        "this",
+        "that",
+        "these",
+        "those",
+        # wh-words
+        "what",
+        "which",
+        "who",
+        "whom",
+        "whose",
+        "where",
+        "when",
+        "why",
+        "how",
+        # common prepositions
+        "of",
+        "to",
+        "in",
+        "on",
+        "at",
+        "for",
+        "with",
+        "about",
+        "from",
+        "by",
+        "as",
+        "into",
+        "like",
+        # conversational fillers / politeness markers
+        "tell",
+        "say",
+        "know",
+        "please",
+        # contraction residues left by step-1's non-word strip
+        # (e.g. "what's" -> "what s", "we'll" -> "we ll")
+        "s",
+        "t",
+        "re",
+        "ll",
+        "ve",
+        "d",
+        "m",
+        # FTS5 operator keywords (also stripped by Step 2; defense in
+        # depth — if a term survives Step 2 it still gets dropped here
+        # before it can reach MATCH as a bareword).
+        "and",
+        "or",
+        "not",
+        "but",
+        "if",
+        "near",
+    }
+)
 
 #: Marker substring in the ``sqlite3.OperationalError`` message raised
 #: when the running SQLite build lacks FTS5. Case-folded during probe
@@ -624,45 +812,52 @@ async def search_memories(
     query: str,
     k: int = _FTS_TOPK_DEFAULT,
 ) -> list[Memory]:
-    """Rank the top-``k`` memories matching ``query`` via FTS5.
+    r"""Rank the top-``k`` memories matching ``query`` via FTS5.
 
-    Governing spec: **ADR-0006 §Retriever**. Normalizes raw
-    conversational text into FTS5-safe search terms:
+    Governing spec: **ADR-0006 §Retriever** (2026-11-13 amendment).
+    Normalizes raw conversational text into FTS5-safe search terms:
 
     1. Replaces every non-word character (operator punctuation,
        conversational punctuation ``, . ? ' ! ;``, and underscores)
-       with a single space, collapsing runs. This is Unicode-aware,
-       so non-ASCII letters (``café``) survive. Running this step
-       FIRST exposes operator keywords that were glued by non-word
-       characters (e.g. ``coffee_OR_tea``, ``coffee(AND)tea``) so
-       step 2 catches them — otherwise ``\b`` word boundaries would
-       miss ``_OR_`` and the keyword would leak into ``MATCH`` as an
-       FTS5 operator, violating the implicit-AND guarantee.
+       with a single space, collapsing runs. Unicode-aware — non-ASCII
+       letters (``café``) survive. Running this step FIRST exposes
+       operator keywords glued by non-word characters (e.g.
+       ``coffee_OR_tea``, ``coffee(AND)tea``) so Step 2 catches them.
     2. Strips the FTS5 operator keywords ``AND`` / ``OR`` / ``NOT`` /
        ``NEAR`` (whole-word, case-insensitive). ``\b`` boundaries are
-       now correct because step 1 already replaced non-word glue with
-       spaces. ``"ANDROID sales"`` still keeps ``ANDROID`` intact —
-       the inner letters are word characters so ``\b`` doesn't match
-       mid-identifier.
-    3. Collapses any residual double spaces introduced by step 2's
-       substitutions and strips ends.
-    4. If the result is empty (e.g. a pure-noise query), returns ``[]``
+       correct after Step 1. ``ANDROID`` still survives — mid-identifier
+       letters are word characters.
+    3. Collapses whitespace, strips ends, lowercases, splits on space.
+    4. Drops any term in :data:`_STOPWORDS` and dedupes while preserving
+       first-seen order.
+    5. If no terms remain (pure noise, or all-stopwords), returns ``[]``
        WITHOUT opening the DB.
-    5. Binds the normalized terms as a BARE ``MATCH`` string (not a
-       quoted phrase) — FTS5's implicit-AND over the bag of terms.
+    6. Builds the ``MATCH`` expression as ``"t1" OR "t2" OR …`` — each
+       term double-quoted. Injection-safe because every term is ``\w+``
+       after Step 1; quoting also neutralizes any operator keyword that
+       slipped past Step 2 (a quoted ``"or"`` is a phrase token, not
+       the FTS5 operator).
 
-    Semantics note: ADR-0006:78 contains contradictory wording
-    ("bag-of-terms keyword query" vs "quoted phrase match"). Shipped
-    behavior matches the bag-of-terms intent — all terms must appear
-    in the matched row, adjacency not required. A separate ADR
-    correction tracks the wording fix.
+    Semantics: OR of stemmed terms. Porter stemming is applied by the
+    ``memories_fts`` table's ``tokenize='porter unicode61'`` (schema v3)
+    to BOTH stored content and query terms at MATCH time — so ``"name"``
+    hits a row whose content was ``named``.
 
     Results are ordered by FTS5's ``rank`` column (bm25 by default
-    since SQLite 3.20); smaller is more relevant, so natural
-    ascending order yields best-first.
+    since SQLite 3.20); smaller is more relevant. bm25 weighs term
+    frequency, term rarity, and memory length, so a memory matching
+    more query terms *tends* to rank higher — especially among short
+    facts of similar length, which is what FRIDAY stores — but this
+    is not guaranteed: a short single-term match can outrank a long
+    multi-term match.
+
+    This reverses the implicit-AND decision from #77 / PR #100 / PR #103
+    based on the 2026-11-13 E2E evidence (see #109): implicit-AND over
+    natural-language turns failed every query that included a filler
+    word, which was all of them.
 
     ``k`` must be a positive int. ``True`` is rejected despite
-    ``isinstance(True, int)`` — this mirrors :mod:`agent.session`'s
+    ``isinstance(True, int)`` — mirrors :mod:`agent.session`'s
     strict-int version check.
 
     Raises:
@@ -673,44 +868,33 @@ async def search_memories(
     if not isinstance(k, int) or isinstance(k, bool) or k <= 0:
         raise ValueError(f"k must be a positive int; got {k!r}")
 
-    # Step 1: strip ALL non-word characters AND underscores, collapsing
-    # runs into a single space. Running this FIRST exposes operator
-    # keywords that were glued by underscores or other non-word
-    # characters (e.g. ``coffee_OR_tea``, ``coffee(AND)tea``) so Step 2
-    # can strip them as whole words. Previously, Step 2 would miss
-    # these because ``_`` and ``(`` are not word boundaries for ``\b``,
-    # and the subsequent strip would then expose the operator to FTS5
-    # as an OR/AND token — leaking those semantics into what the ADR
-    # promises as implicit-AND.
-    # This regex also handles:
-    #   (a) FTS5 operator punctuation (``* " ( ) : - ^``).
-    #   (b) conversational punctuation (``, . ? ' ! ;`` and friends),
-    #       which FTS5 either rejects as a parse error outside a
-    #       quoted phrase or the unicode61 tokenizer treats as token
-    #       glue (``coffee, tea`` → phantom adjacency).
-    #   (c) underscores, which unicode61 treats as a token separator
-    #       (``machine_learning`` → ``machine`` + ``learning``).
-    # ``\W`` is Unicode-aware in Python 3, so letters in non-ASCII
-    # scripts (e.g. ``café``) survive.
+    # Step 1: strip non-word chars + underscores (see docstring).
     normalized = re.sub(r"[\W_]+", " ", query).strip()
-    # Step 2: whole-word operator keywords. Now runs AFTER the non-word
-    # strip so underscore-exposed operators are caught. Case-insensitive
-    # via re.I; ``\b`` boundaries protect mid-identifier letters
-    # (``ANDROID`` still survives).
+    # Step 2: whole-word operator-keyword strip.
     normalized = re.sub(
         r"\b(?:AND|OR|NOT|NEAR)\b",
         " ",
         normalized,
         flags=re.IGNORECASE,
     )
-    # Collapse the whitespace Step 2 may have introduced when an
-    # operator keyword sat between two bare terms (``coffee OR tea`` →
-    # ``coffee  tea`` after Step 2 → ``coffee tea`` here).
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-
-    # Step 3: short-circuit on noise — no DB call, no log.
+    # Step 3: collapse whitespace + lowercase + split.
+    normalized = re.sub(r"\s+", " ", normalized).strip().lower()
     if not normalized:
         return []
+
+    # Step 4: drop stopwords and dedupe preserving first-seen order.
+    # ``dict.fromkeys`` is Python's idiomatic order-preserving dedupe.
+    terms: list[str] = [t for t in normalized.split(" ") if t and t not in _STOPWORDS]
+    terms = list(dict.fromkeys(terms))
+
+    # Step 5: short-circuit on empty — no DB call, no log.
+    if not terms:
+        return []
+
+    # Step 6: build MATCH as OR of double-quoted terms. Each term is
+    # ``\w+`` after Step 1 so this cannot inject FTS5 syntax; quoting
+    # also neutralizes any surviving operator keyword.
+    match_expr = " OR ".join(f'"{t}"' for t in terms)
 
     async with aiosqlite.connect(db_path, isolation_level=None) as db:
         db.row_factory = aiosqlite.Row
@@ -723,7 +907,7 @@ async def search_memories(
             ORDER BY f.rank
             LIMIT ?
             """,
-            (normalized, k),
+            (match_expr, k),
         ) as cur:
             rows = await cur.fetchall()
 

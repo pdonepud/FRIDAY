@@ -31,7 +31,7 @@ from agent.memory import (
 
 @pytest.fixture
 async def bootstrapped_db(tmp_path: Path) -> Path:
-    """A ready-to-use memory.db with v1 schema in place."""
+    """A ready-to-use memory.db bootstrapped to the latest schema (no rows)."""
     path = tmp_path / "memory.db"
     await bootstrap_db(path)
     return path
@@ -514,34 +514,41 @@ async def test_ensure_fts5_available_raises_on_missing_fts5(monkeypatch):
 # -----------------------------------------------------------------
 
 
-async def test_bootstrap_db_applies_v2_migration_from_fresh(tmp_path):
-    """Fresh DB bootstraps to v2: memories_fts virtual table + three
-    triggers exist, schema_version row == 2."""
+async def test_bootstrap_db_applies_v3_migration_from_fresh(tmp_path):
+    """Fresh DB bootstraps to v3: memories_fts virtual table + three
+    triggers exist, schema_version row == 3, and memories_fts is
+    created with ``tokenize='porter unicode61'`` so porter stemming
+    is active on both stored content and query terms (#109)."""
     path = tmp_path / "memory.db"
     await bootstrap_db(path)
 
     async with aiosqlite.connect(path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'trigger') "
+            "SELECT name, type, sql FROM sqlite_master WHERE type IN ('table', 'trigger') "
             "ORDER BY type, name"
         ) as cur:
-            items = [(r["name"], r["type"]) for r in await cur.fetchall()]
+            items = [(r["name"], r["type"], r["sql"]) for r in await cur.fetchall()]
         async with db.execute("SELECT version FROM schema_version") as cur:
             versions = [r["version"] for r in await cur.fetchall()]
 
-    names = {name for name, _ in items}
-    triggers = {name for name, typ in items if typ == "trigger"}
+    names = {name for name, _, _ in items}
+    triggers = {name for name, typ, _ in items if typ == "trigger"}
+    fts_sql = next(sql for name, _, sql in items if name == "memories_fts")
     assert "memories_fts" in names
     assert triggers == {"memories_ai", "memories_ad", "memories_au"}
     assert versions == [SCHEMA_VERSION]
-    assert SCHEMA_VERSION == 2
+    assert SCHEMA_VERSION == 3
+    # Porter stemming must be baked into the virtual table's declared
+    # schema — the CREATE VIRTUAL TABLE SQL is the authoritative source.
+    assert "porter unicode61" in fts_sql.lower().replace("'", "").replace('"', "")
 
 
-async def test_bootstrap_db_upgrades_v1_to_v2(tmp_path, monkeypatch):
+async def test_bootstrap_db_upgrades_v1_to_latest(tmp_path, monkeypatch):
     """A DB bootstrapped under v1-only (no FTS) then re-bootstrapped
-    under the real v1+v2 migrations ends up at v2 with the FTS index
-    populated from the pre-existing rows. Proves ``'rebuild'`` ran."""
+    under the full migration set ends up at SCHEMA_VERSION with the
+    porter-stemmed FTS index populated from the pre-existing rows.
+    Proves the full v1→v3 upgrade path and that ``'rebuild'`` ran."""
     from agent import memory as memory_mod
 
     v1_only = [memory_mod._MIGRATIONS[0]]
@@ -563,7 +570,7 @@ async def test_bootstrap_db_upgrades_v1_to_v2(tmp_path, monkeypatch):
         async with db.execute("SELECT version FROM schema_version") as cur:
             (version,) = await cur.fetchone()
     assert version == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 2
+    assert SCHEMA_VERSION == 3
 
     # rebuild populated the FTS index from existing rows.
     hits = await search_memories(path, "pumpkin")
@@ -571,8 +578,60 @@ async def test_bootstrap_db_upgrades_v1_to_v2(tmp_path, monkeypatch):
     assert "pumpkin" in hits[0].content
 
 
-async def test_bootstrap_db_v2_is_idempotent_on_up_to_date_db(bootstrapped_db):
-    """Bootstrap twice; v2 migration does not re-run (no duplicate
+async def test_bootstrap_db_upgrades_v2_to_v3_with_porter(tmp_path, monkeypatch):
+    """A DB bootstrapped under v1+v2 only (unicode61, no stemming) with
+    pre-seeded rows upgrades cleanly to v3 (porter unicode61). Post-
+    upgrade, (a) the schema_version row is 3, (b) the pre-existing
+    rows are still searchable, (c) a query for ``name`` now hits a
+    row stored with ``named`` — proving the v3 'rebuild' reindexed
+    the base rows under the porter-stemmed tokenizer."""
+    from agent import memory as memory_mod
+
+    path = tmp_path / "memory.db"
+
+    # Scope the v2-only patches to the v2 bootstrap+seed phase. Using
+    # ``monkeypatch.context()`` instead of ``monkeypatch.undo()`` keeps
+    # any other autouse patches (e.g. conftest's claude-client reset)
+    # in place for the second ``bootstrap_db`` call below.
+    with monkeypatch.context() as m:
+        v1_and_v2 = memory_mod._MIGRATIONS[:2]
+        m.setattr("agent.memory._MIGRATIONS", v1_and_v2)
+        m.setattr("agent.memory.SCHEMA_VERSION", 2)
+
+        await bootstrap_db(path)
+
+        # Pre-existing v2 rows, indexed under unicode61 (no stemming).
+        await add_memory(path, kind="fact", content="the user's dog is named Levi")
+        await add_memory(path, kind="fact", content="Levi is Ayesha's best friend")
+
+        # Under v2, "name" alone must NOT hit "named" — this guards the
+        # pre-upgrade baseline. If this ever fails, the v2 migration grew
+        # stemming behind our back and the upgrade test below no longer
+        # proves anything new.
+        pre_upgrade_hits = await search_memories(path, "name")
+        assert pre_upgrade_hits == []
+
+    await bootstrap_db(path)
+
+    async with aiosqlite.connect(path) as db:
+        async with db.execute("SELECT version FROM schema_version") as cur:
+            (version,) = await cur.fetchone()
+    assert version == SCHEMA_VERSION == 3
+
+    # Rows still exist.
+    async with aiosqlite.connect(path) as db:
+        async with db.execute("SELECT COUNT(*) FROM memories") as cur:
+            (count,) = await cur.fetchone()
+    assert count == 2
+
+    # Porter stemming is live: "name" hits the "named" row.
+    post_upgrade_hits = await search_memories(path, "name")
+    assert len(post_upgrade_hits) == 1
+    assert "named" in post_upgrade_hits[0].content
+
+
+async def test_bootstrap_db_v3_is_idempotent_on_up_to_date_db(bootstrapped_db):
+    """Bootstrap twice; the v3 migration does not re-run (no duplicate
     triggers, no duplicate virtual tables)."""
     await bootstrap_db(bootstrapped_db)  # second bootstrap, must not raise
 
@@ -586,6 +645,46 @@ async def test_bootstrap_db_v2_is_idempotent_on_up_to_date_db(bootstrapped_db):
     fts_tables = [n for t, n in items if t == "table" and n == "memories_fts"]
     assert sorted(triggers) == ["memories_ad", "memories_ai", "memories_au"]
     assert len(fts_tables) == 1
+
+
+async def test_v3_triggers_keep_fts_in_sync(bootstrapped_db):
+    """v3 recreated the three insert/update/delete triggers verbatim
+    from v2; this is the regression that proves they survived the
+    drop-and-recreate and still keep ``memories_fts`` in sync with
+    ``memories`` under porter stemming.
+
+    (a) add_memory fires AFTER INSERT — search finds the row by a
+        content term.
+    (b) raw UPDATE fires AFTER UPDATE (content changed) — the old
+        term misses, the new term hits, and a porter-stemmed variant
+        of the new term also hits (end-to-end stemming via trigger).
+    (c) delete_memory fires AFTER DELETE — row is gone from the
+        index."""
+    # (a) insert trigger path.
+    new_id = await add_memory(bootstrapped_db, kind="fact", content="apples are crisp")
+    hits = await search_memories(bootstrapped_db, "apples")
+    assert len(hits) == 1
+    assert hits[0].id == new_id
+
+    # (b) update trigger path — old misses, new hits, stem of new hits.
+    now_iso = datetime.now(UTC).isoformat()
+    async with aiosqlite.connect(bootstrapped_db) as db:
+        await db.execute(
+            "UPDATE memories SET content = ?, updated_at = ? WHERE id = ?",
+            ("the user is running daily", now_iso, new_id),
+        )
+        await db.commit()
+    assert await search_memories(bootstrapped_db, "apples") == []
+    assert len(await search_memories(bootstrapped_db, "running")) == 1
+    # Porter-stemmed query — "run" must hit "running" after the update
+    # replayed through the porter-tokenized index.
+    stem_hits = await search_memories(bootstrapped_db, "run")
+    assert len(stem_hits) == 1
+    assert stem_hits[0].id == new_id
+
+    # (c) delete trigger path.
+    assert await delete_memory(bootstrapped_db, new_id) is True
+    assert await search_memories(bootstrapped_db, "running") == []
 
 
 # -----------------------------------------------------------------
@@ -644,7 +743,8 @@ async def test_search_memories_returns_empty_list_on_empty_db(bootstrapped_db):
 
 async def test_search_memories_normalizes_operator_keywords(bootstrapped_db):
     """Operator keywords AND/OR are stripped; the remaining terms
-    find a row that contains all of them under implicit-AND."""
+    are OR'd and ranked by bm25, and a row that mentions any of them
+    is returned (#109)."""
     await add_memory(
         bootstrapped_db,
         kind="fact",
@@ -758,13 +858,14 @@ async def test_search_memories_whole_word_operator_stripping(bootstrapped_db):
     assert "ANDROID" in hits[0].content
 
 
-async def test_search_memories_implicit_and_requires_all_terms(bootstrapped_db):
-    """Implicit-AND MATCH: every term in the bag must appear in the
-    row. One missing term → no hit. If MATCH ever drifts to OR
-    semantics, this test catches it."""
+async def test_search_memories_or_semantics_returns_partial_matches(bootstrapped_db):
+    """OR semantics (#109): a query term that matches a row returns
+    that row even when the row misses other query terms. Reverses the
+    implicit-AND decision locked by #77 / PR #100 / PR #103."""
     await add_memory(bootstrapped_db, kind="fact", content="coffee and tea")
     hits = await search_memories(bootstrapped_db, "coffee elephant")
-    assert hits == []
+    assert len(hits) == 1
+    assert "coffee" in hits[0].content
 
 
 async def test_search_memories_handles_conversational_punctuation(bootstrapped_db):
@@ -772,11 +873,9 @@ async def test_search_memories_handles_conversational_punctuation(bootstrapped_d
     and the unicode61 tokenizer treats ``,`` as token glue creating
     phantom adjacency requirements. The ``[\\W_]+`` strip handles both
     — a typical conversational query round-trips cleanly to a bareword
-    MATCH with no parse error. Seed content mirrors the conversational
-    query's word bag so the implicit-AND invariant (every token must
-    appear) is satisfied — the fix is about avoiding the FTS5 parse
-    error and avoiding phantom adjacency from comma-glue, not about
-    relaxing the implicit-AND semantics."""
+    MATCH with no parse error. Under #109's OR semantics, any of the
+    content words is enough to hit the seed row; this test asserts
+    the parse-safety invariant, not the ranking contract."""
     await add_memory(
         bootstrapped_db,
         kind="fact",
@@ -807,24 +906,152 @@ async def test_search_memories_strips_underscores(bootstrapped_db):
 
 async def test_search_memories_normalizes_underscore_glued_operator(bootstrapped_db):
     """Underscore-glued operator keywords (e.g. ``coffee_OR_tea``) are
-    stripped after the non-word strip exposes them, keeping implicit-AND
-    semantics. Previously, the operator-keyword strip ran first with
-    ``\\b`` boundaries that didn't match ``_OR_``, then the underscore
-    strip exposed ``OR`` to FTS5 as an operator — leaking OR semantics
-    into what the ADR promises as implicit-AND."""
+    stripped after the non-word strip exposes them. Under #109's OR
+    semantics, ``coffee_OR_tea`` normalizes to terms ``coffee`` and
+    ``tea``, OR'd — so a row mentioning either hits. This test proves
+    the keyword did NOT leak into MATCH as an FTS5 operator (that
+    would be an unquoted ``OR``, which would still be fine under OR
+    semantics but changes the parse — the real regression here is
+    that the ``_OR_`` glue doesn't survive)."""
     await add_memory(bootstrapped_db, kind="fact", content="only coffee here")
-    # Pre-fix: this query returned the row (OR semantics, matched "coffee").
-    # Post-fix: "coffee_OR_tea" normalizes to "coffee tea" and the seed row
-    # doesn't contain "tea", so implicit-AND correctly rejects it.
-    hits = await search_memories(bootstrapped_db, "coffee_OR_tea")
-    assert hits == []
-
-    # Positive control: a seed that contains BOTH terms matches after
-    # the operator-keyword strip runs on the exposed ``OR``.
-    await add_memory(bootstrapped_db, kind="fact", content="coffee and tea together")
     hits = await search_memories(bootstrapped_db, "coffee_OR_tea")
     assert len(hits) == 1
-    assert hits[0].content == "coffee and tea together"
+    assert hits[0].content == "only coffee here"
+
+    await add_memory(bootstrapped_db, kind="fact", content="only tea here")
+    hits = await search_memories(bootstrapped_db, "coffee_OR_tea", k=5)
+    contents = sorted(h.content for h in hits)
+    assert contents == ["only coffee here", "only tea here"]
+
+
+# -----------------------------------------------------------------
+# #109: OR + stopwords + porter retrieval
+# -----------------------------------------------------------------
+
+
+async def test_search_memories_stopwords_only_short_circuits_without_db_access(
+    bootstrapped_db, monkeypatch
+):
+    """A query that is nothing but stopwords (e.g. ``what is my``)
+    normalizes to zero terms and returns [] without opening the DB.
+    Same connect-tracking pattern as the pure-noise-query test
+    (#109)."""
+    real_connect = aiosqlite.connect
+    connect_called = False
+
+    def tracking_connect(*args, **kwargs):
+        nonlocal connect_called
+        connect_called = True
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr("agent.memory.aiosqlite.connect", tracking_connect)
+
+    result = await search_memories(bootstrapped_db, "what is my")
+    assert result == []
+    assert connect_called is False
+
+
+async def test_search_memories_stopword_dropping_recovers_natural_language(bootstrapped_db):
+    """A conversational query like ``tell me about levi`` must return
+    the ``Levi`` row. Under the pre-#109 implicit-AND semantics every
+    term (``tell``, ``me``, ``about``, ``levi``) had to appear and no
+    row did. Under #109 the stopword list drops the fillers and the
+    remaining single term hits (#109 AC bullet 2)."""
+    await add_memory(bootstrapped_db, kind="fact", content="The user's dog is named Levi.")
+    hits = await search_memories(bootstrapped_db, "tell me about levi")
+    assert len(hits) == 1
+    assert "Levi" in hits[0].content
+
+
+async def test_search_memories_porter_stems_name_to_named(bootstrapped_db):
+    """Porter stemming (schema v3) maps ``name`` ↔ ``named``. A query
+    for ``dog name`` hits a row stored with ``named``. This is the
+    other half of the #109 fix: without porter, ``name`` and
+    ``named`` are distinct tokens in unicode61 and the query misses
+    (#109 AC bullet 1 / bullet 3)."""
+    await add_memory(bootstrapped_db, kind="fact", content="The user's dog is named Levi.")
+    hits = await search_memories(bootstrapped_db, "dog name")
+    assert len(hits) == 1
+    assert "named" in hits[0].content
+
+
+async def test_search_memories_bm25_prefers_multi_term_matches(bootstrapped_db):
+    """bm25 tends to rank a row matching N query terms above a row
+    matching M<N query terms under OR semantics when the rows are
+    short facts of comparable length — the typical case for #109 and
+    for what FRIDAY stores. It is NOT a general guarantee: bm25 also
+    weighs term frequency, term rarity, and document length, so a
+    short single-term match can outrank a long multi-term match in
+    other shapes of data.
+
+    Seeds three rows of comparable length: one has both terms (dog +
+    name), one has only ``dog``, one has only ``name``. Query ``dog
+    name`` returns the both-terms row first; the one-term rows follow
+    (if at all)."""
+    both_id = await add_memory(
+        bootstrapped_db,
+        kind="fact",
+        content="the user's dog is named Levi",
+    )
+    await add_memory(bootstrapped_db, kind="fact", content="the user has a dog")
+    await add_memory(bootstrapped_db, kind="fact", content="the project is named HelloWorld")
+
+    hits = await search_memories(bootstrapped_db, "dog name", k=5)
+    assert len(hits) >= 1
+    assert hits[0].id == both_id
+
+
+async def test_search_memories_operator_keywords_cannot_leak_into_match_quoted(bootstrapped_db):
+    """Regression: a user typing literal FTS5 operator syntax must
+    not alter query semantics or raise a parse error. Terms are
+    double-quoted before building MATCH, so any surviving operator
+    keyword is a phrase token (not an operator)."""
+    await add_memory(bootstrapped_db, kind="fact", content="coffee and tea together")
+    # Punctuation strip first produces ``OR with AND``; operator-keyword
+    # strip produces `` with ``; stopword strip produces []. Short-
+    # circuit to [] — no FTS5 parse error either way.
+    assert await search_memories(bootstrapped_db, '"OR" with (AND)') == []
+
+
+async def test_search_memories_109_e2e_scenarios(bootstrapped_db):
+    """The three E2E queries from the 2026-11-13 manual run (#109
+    acceptance criteria), end-to-end against the real porter+OR
+    pipeline and a DB seeded with the exact two E2E rows.
+
+    AC 1: ``what's my dog's name`` ranks the dog fact first.
+    AC 2: ``tell me about levi`` returns both rows.
+    AC 3: ``dog name`` returns the dog fact.
+    C1:   ``tell me about levi`` reduces to exactly ['levi'] after
+          stopword filtering (asserted via the # of returned rows —
+          both rows mention Levi only). If the stopword list regresses
+          and ``about`` or ``tell`` survives, neither row would match
+          AND the assertion would fail."""
+    dog_id = await add_memory(
+        bootstrapped_db,
+        kind="fact",
+        content="The user's dog is named Levi.",
+    )
+    friend_id = await add_memory(
+        bootstrapped_db,
+        kind="fact",
+        content="Levi is Ayesha's best friend.",
+    )
+
+    # AC 1: dog's name ranks the dog fact first.
+    hits = await search_memories(bootstrapped_db, "what's my dog's name")
+    assert len(hits) >= 1
+    assert hits[0].id == dog_id
+
+    # AC 2: tell me about levi returns both rows (any order).
+    hits = await search_memories(bootstrapped_db, "tell me about levi", k=5)
+    ids = {h.id for h in hits}
+    assert ids == {dog_id, friend_id}
+
+    # AC 3: dog name returns the dog fact as the top hit (porter
+    # stems ``name`` to the stored ``named``).
+    hits = await search_memories(bootstrapped_db, "dog name")
+    assert len(hits) >= 1
+    assert hits[0].id == dog_id
 
 
 # =================================================================
