@@ -82,7 +82,7 @@ The two paths co-exist. Explicit cues always write. Classifier writes are additi
   4. If no terms remain, returns `[]` without opening the DB.
   5. Builds the `MATCH` expression as `"t1" OR "t2" OR …` with each term double-quoted (injection-safe because every term is `\w+` after step 1; quoting also neutralizes any operator keyword that slipped past step 2).
   6. `memories_fts` uses `tokenize='porter unicode61'` (schema v3); porter stemming is applied to both stored and query terms, so `name` ↔ `named`.
-  7. Results are ordered by bm25 `rank`; a memory matching multiple query terms ranks above a memory matching a single term, which keeps precision high enough at k=5 that a single-term hit against a common word cannot push a multi-term hit out of the top-K.
+  7. Results are ordered by bm25 `rank` (smaller is more relevant). bm25 weighs term frequency, term rarity, and memory length, so a memory matching more query terms *tends* to rank higher — especially among short facts of similar length, which is what FRIDAY stores — but this is not guaranteed: a short single-term match can outrank a long multi-term match.
 - Returns top-k ranked results. k is tunable.
 - Vector embeddings are **deferred**. If keyword retrieval produces visibly poor results during real use, a follow-up ADR introduces embeddings (likely `sentence-transformers` local, or a hosted embedding model) and extends the schema.
 

@@ -844,10 +844,12 @@ async def search_memories(
     hits a row whose content was ``named``.
 
     Results are ordered by FTS5's ``rank`` column (bm25 by default
-    since SQLite 3.20); smaller is more relevant. A memory matching
-    multiple query terms ranks above a memory matching only one, which
-    keeps precision high enough at k=5 that a single-term hit against
-    a common word cannot push a multi-term hit out of the top-K.
+    since SQLite 3.20); smaller is more relevant. bm25 weighs term
+    frequency, term rarity, and memory length, so a memory matching
+    more query terms *tends* to rank higher — especially among short
+    facts of similar length, which is what FRIDAY stores — but this
+    is not guaranteed: a short single-term match can outrank a long
+    multi-term match.
 
     This reverses the implicit-AND decision from #77 / PR #100 / PR #103
     based on the 2026-11-13 E2E evidence (see #109): implicit-AND over

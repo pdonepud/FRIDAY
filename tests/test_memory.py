@@ -587,25 +587,30 @@ async def test_bootstrap_db_upgrades_v2_to_v3_with_porter(tmp_path, monkeypatch)
     the base rows under the porter-stemmed tokenizer."""
     from agent import memory as memory_mod
 
-    v1_and_v2 = memory_mod._MIGRATIONS[:2]
-    monkeypatch.setattr("agent.memory._MIGRATIONS", v1_and_v2)
-    monkeypatch.setattr("agent.memory.SCHEMA_VERSION", 2)
-
     path = tmp_path / "memory.db"
-    await bootstrap_db(path)
 
-    # Pre-existing v2 rows, indexed under unicode61 (no stemming).
-    await add_memory(path, kind="fact", content="the user's dog is named Levi")
-    await add_memory(path, kind="fact", content="Levi is Ayesha's best friend")
+    # Scope the v2-only patches to the v2 bootstrap+seed phase. Using
+    # ``monkeypatch.context()`` instead of ``monkeypatch.undo()`` keeps
+    # any other autouse patches (e.g. conftest's claude-client reset)
+    # in place for the second ``bootstrap_db`` call below.
+    with monkeypatch.context() as m:
+        v1_and_v2 = memory_mod._MIGRATIONS[:2]
+        m.setattr("agent.memory._MIGRATIONS", v1_and_v2)
+        m.setattr("agent.memory.SCHEMA_VERSION", 2)
 
-    # Under v2, "name" alone must NOT hit "named" — this guards the
-    # pre-upgrade baseline. If this ever fails, the v2 migration grew
-    # stemming behind our back and the upgrade test below no longer
-    # proves anything new.
-    pre_upgrade_hits = await search_memories(path, "name")
-    assert pre_upgrade_hits == []
+        await bootstrap_db(path)
 
-    monkeypatch.undo()
+        # Pre-existing v2 rows, indexed under unicode61 (no stemming).
+        await add_memory(path, kind="fact", content="the user's dog is named Levi")
+        await add_memory(path, kind="fact", content="Levi is Ayesha's best friend")
+
+        # Under v2, "name" alone must NOT hit "named" — this guards the
+        # pre-upgrade baseline. If this ever fails, the v2 migration grew
+        # stemming behind our back and the upgrade test below no longer
+        # proves anything new.
+        pre_upgrade_hits = await search_memories(path, "name")
+        assert pre_upgrade_hits == []
+
     await bootstrap_db(path)
 
     async with aiosqlite.connect(path) as db:
@@ -971,14 +976,18 @@ async def test_search_memories_porter_stems_name_to_named(bootstrapped_db):
 
 
 async def test_search_memories_bm25_prefers_multi_term_matches(bootstrapped_db):
-    """bm25 ranks a row matching N query terms above a row matching
-    M<N query terms under OR semantics. This is the precision guard
-    for #109 — without it, a single-term match against a common word
-    could outrank a multi-term match.
+    """bm25 tends to rank a row matching N query terms above a row
+    matching M<N query terms under OR semantics when the rows are
+    short facts of comparable length — the typical case for #109 and
+    for what FRIDAY stores. It is NOT a general guarantee: bm25 also
+    weighs term frequency, term rarity, and document length, so a
+    short single-term match can outrank a long multi-term match in
+    other shapes of data.
 
-    Seeds three rows: one has both terms (dog + name), one has only
-    ``dog``, one has only ``name``. Query ``dog name`` must return
-    the both-terms row first; the one-term rows follow (if at all)."""
+    Seeds three rows of comparable length: one has both terms (dog +
+    name), one has only ``dog``, one has only ``name``. Query ``dog
+    name`` returns the both-terms row first; the one-term rows follow
+    (if at all)."""
     both_id = await add_memory(
         bootstrapped_db,
         kind="fact",
