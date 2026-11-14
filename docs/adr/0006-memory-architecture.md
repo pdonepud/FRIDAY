@@ -1,6 +1,6 @@
 # ADR 0006 — Memory architecture
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-10-05
 
 ## Context
@@ -75,7 +75,14 @@ The two paths co-exist. Explicit cues always write. Classifier writes are additi
 ### Retriever: FTS5 keyword, k=5 default
 
 - Called by context assembly (ADR-0007) with the user's current turn as the query.
-- `search_memories` accepts raw conversational text — context assembly does NOT need to know FTS5 syntax. Internally, `search_memories` normalizes the input before passing to `MATCH`: (1) strips the FTS5 operator keywords `AND`, `OR`, `NOT`, `NEAR` (whole-word, case-insensitive); (2) replaces every non-word character — both operator punctuation (`*`, `"`, `(`, `)`, `:`, `-`, `^`) and conversational punctuation (`,` `.` `?` `'` `!` `;`) — and underscores with spaces, collapsing runs into single spaces; then binds the normalized terms as a bareword `MATCH` expression (NOT a quoted phrase). FTS5 interprets this as implicit-AND over the bag of terms, which is the retriever's intended semantics. If the normalized result is empty (user turn was pure punctuation / operator noise), `search_memories` returns an empty list without calling `MATCH`. Rationale for the non-word-character strip: FTS5 rejects bare conversational punctuation in `MATCH` expressions (`sqlite3.OperationalError`), and its `unicode61` tokenizer treats commas as adjacency glue and underscores as separators — all three are handled by the one normalization pass.
+- `search_memories` accepts raw conversational text — context assembly does NOT need to know FTS5 syntax. Internally, `search_memories` normalizes the input before passing to `MATCH`:
+  1. Replaces every non-word character (operator punctuation, conversational punctuation, underscores) with a single space (Unicode-aware; preserves non-ASCII letters like `café`).
+  2. Strips the FTS5 operator keywords `AND`/`OR`/`NOT`/`NEAR` as whole words, case-insensitive.
+  3. Collapses whitespace, lowercases, splits into terms, drops a module-level English stopword list (articles, copulas, pronouns, wh-words, common prepositions, modal auxiliaries, conversational fillers like `tell`/`about`/`please`, and contraction residues left by step 1), dedupes while preserving first-seen order.
+  4. If no terms remain, returns `[]` without opening the DB.
+  5. Builds the `MATCH` expression as `"t1" OR "t2" OR …` with each term double-quoted (injection-safe because every term is `\w+` after step 1; quoting also neutralizes any operator keyword that slipped past step 2).
+  6. `memories_fts` uses `tokenize='porter unicode61'` (schema v3); porter stemming is applied to both stored and query terms, so `name` ↔ `named`.
+  7. Results are ordered by bm25 `rank`; a memory matching multiple query terms ranks above a memory matching a single term, which keeps precision high enough at k=5 that a single-term hit against a common word cannot push a multi-term hit out of the top-K.
 - Returns top-k ranked results. k is tunable.
 - Vector embeddings are **deferred**. If keyword retrieval produces visibly poor results during real use, a follow-up ADR introduces embeddings (likely `sentence-transformers` local, or a hosted embedding model) and extends the schema.
 
@@ -162,6 +169,10 @@ Rejected for the write path — adds latency to every turn even when nothing is 
 - Classifier model selection: smallest Claude that reliably extracts facts. Decide at implementation time; keep it swappable.
 - Should the classifier see the full recent buffer or just the latest turn? Starting assumption: latest turn + prior assistant turn for context. Revisit.
 - What happens to memories when the user says "forget everything about X"? Current plan: `search_memories("X")` → confirm count with the user → bulk delete. The confirmation flow may want to wait for Tier 7's confirmation gate rather than hand-rolling it in Tier 4.
+
+## Amendments
+
+**2026-11-13 — Retriever semantics (via #109):** replaces implicit-AND with OR of stopword-filtered terms, ranked by bm25. Schema v3 migrates `memories_fts` to `tokenize='porter unicode61'` so stored and query terms share the same stemmer (`name` ↔ `named`). Reverses the implicit-AND decision from #77 / PR #100 / PR #103 based on the 2026-11-13 E2E evidence: implicit-AND over a natural-language turn fails on every filler word, and conversational turns include several filler words every time. See the §Retriever rewrite above for the shipped pipeline. Status moves Proposed → Accepted now that Tier 4 is complete and validated against real use.
 
 ## References
 

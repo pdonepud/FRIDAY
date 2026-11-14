@@ -23,7 +23,7 @@ from agent.memory import add_memory, bootstrap_db, get_memory
 
 @pytest.fixture
 async def bootstrapped_db(tmp_path: Path) -> Path:
-    """A ready-to-use memory.db with v2 schema in place (no rows)."""
+    """A ready-to-use memory.db bootstrapped to the latest schema (no rows)."""
     path = tmp_path / "memory.db"
     await bootstrap_db(path)
     return path
@@ -339,7 +339,7 @@ async def test_export_writes_jsonl_file_with_header_and_data_lines(
     lines = target.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 4  # header + 3 data rows
     header = json.loads(lines[0])
-    assert header["schema_version"] == 2
+    assert header["schema_version"] == 3
     assert header["count"] == 3
     # exported_at parses as tz-aware ISO 8601.
     parsed_ts = datetime.fromisoformat(header["exported_at"])
@@ -371,7 +371,7 @@ async def test_export_empty_db_writes_header_only_with_count_0(
     assert len(lines) == 1
     header = json.loads(lines[0])
     assert header["count"] == 0
-    assert header["schema_version"] == 2
+    assert header["schema_version"] == 3
 
 
 async def test_export_refuses_existing_target_without_force_exit_1(
